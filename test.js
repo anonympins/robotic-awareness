@@ -2011,7 +2011,7 @@ export class RobotActuator {
         this.sensorId = config.sensorId || null; // Capteur tactile associé
 
         // Lissage (Low-pass filter)
-        this.filtering = config.filtering || { alpha: 0.15 };
+        this.filtering = config.filtering || { alpha: 0.05 }; // Plus doux pour éviter les sauts
         this.filteredTarget = (this.max + this.min) / 2;
 
         this.collisionBox = null; // Donnée locale AABB
@@ -2035,6 +2035,9 @@ export class RobotActuator {
         this.currentValue = (this.max + this.min) / 2;
         this.currentOrientation = new Quaternion();
         this.velocity = 0;
+        this.lastPos = this.currentValue;
+        this.filteredDerivative = 0;
+        this._oscillationCounter = 0; // Pour le diagnostic
     }
 
     /**
@@ -2060,10 +2063,12 @@ export class RobotActuator {
 
         // 2. Réaction Immédiate : Sécurité ou Complaisance
         if (!canMove || this.isCompliant) {
+            this.integralError = 0; // Reset pour éviter les sursauts au déblocage
             // Retrait Actif : si bloqué, on applique une petite force inverse
             if (this.isCompliant) {
                 const withdrawalStep = (this.max - this.min) * 0.01;
                 this.currentValue -= withdrawalStep;
+                this.filteredTarget = this.currentValue; // Aligne le filtre sur la position de retrait
             }
 
             this.velocity *= 0.5;
@@ -2093,8 +2098,10 @@ export class RobotActuator {
         } else {
             // Utilisation de la logique géométrique (Seeker) uniquement si pas de cible directe
             const alignment = this.seeker.predict(globalTarget);
-            const error = 1.0 - alignment;
-            this.seeker.update(globalTarget, error, this.speed);
+            if (alignment < 0.999) { // NOUVEAU : Deadzone pour le neurone seeker
+                const error = 1.0 - alignment;
+                this.seeker.update(globalTarget, error, this.speed);
+            }
             this.currentOrientation = this.seeker.orientation;
 
             const q = this.currentOrientation;
@@ -2109,30 +2116,63 @@ export class RobotActuator {
             }
         }
 
-        // 4. Fusion Adaptative : Spatiale vs Environnementale (Apprise)
+        // 4. Fusion et Filtrage
         const finalTarget = learnedTarget !== null ? (effectiveTargetValue * (1 - this.proprioceptionRatio)) + (learnedTarget * this.proprioceptionRatio) : effectiveTargetValue;
             
-        // 4.1 Lissage de la commande (Low-Pass Filter)
+        // Sauvegarde de l'ancienne cible pour le Feed-forward avant mise à jour
+        const previousFilteredTarget = this.filteredTarget;
+
+        // Lissage de la commande (Low-Pass Filter)
         this.filteredTarget = (this.filtering.alpha * finalTarget) + (1 - this.filtering.alpha) * this.filteredTarget;
 
-        // 5. Calcul PID
+        // 5. Calcul PID stabilisé (D-on-PV + Filtering)
         const errorPID = this.filteredTarget - this.currentValue;
         
-        // Intégrale avec Anti-Windup (clamping pour éviter l'emballement)
-        this.integralError = Math.max(-10, Math.min(10, this.integralError + errorPID * deltaTime));
+        // Anti-Windup et décharge intégrale progressive
+        const isAtMin = this.currentValue <= this.min + 0.1;
+        const isAtMax = this.currentValue >= this.max - 0.1;
+        if (!(isAtMin && errorPID < 0) && !(isAtMax && errorPID > 0)) {
+            this.integralError = Math.max(-5, Math.min(5, this.integralError + errorPID * deltaTime));
+            if (Math.abs(errorPID) < 0.2) this.integralError *= 0.5; 
+        } else {
+            this.integralError *= 0.5; // Décharge rapide aux limites
+        }
         
-        const derivative = (errorPID - this.lastError) / deltaTime;
+        // Calcul de la dérivée sur la position (D-on-PV) pour éviter les sursauts de consigne
+        const deltaPos = (this.currentValue - this.lastPos) / deltaTime;
+        this.lastPos = this.currentValue;
         
-        // Calcul du Feed-forward basé sur la différence entre la cible actuelle et la précédente
-        const feedForward = (this.filteredTarget - (this.lastTarget || this.currentValue)) * this.kf;
+        // Filtre passe-bas sur la dérivée (alpha=0.2) pour supprimer le jitter
+        this.filteredDerivative = (0.2 * -deltaPos) + (0.8 * this.filteredDerivative);
+        const derivative = this.filteredDerivative;
         
-        // Somme PID + FF
-        const pidOutput = (adaptiveKp * errorPID) + (this.ki * this.integralError) + (this.kd * derivative) + feedForward;
+        // Feed-forward basé sur la cinématique de la consigne
+        const feedForward = (this.filteredTarget - previousFilteredTarget) * this.kf;
+        
+        const pidOutput = ((adaptiveKp * errorPID) + (this.ki * this.integralError) + (this.kd * derivative) + feedForward) * deltaTime * 50;
         this.lastError = errorPID;
-        this.lastTarget = this.filteredTarget;
 
-        // Application avec limite de vitesse et scaling de sécurité
-        const maxStep = this.speed * movementScale;
+        // DIAGNOSTIC : Détection d'oscillation haute fréquence
+        const currentSign = Math.sign(pidOutput);
+        if (this.lastSign && currentSign !== this.lastSign && Math.abs(errorPID) > 0.05) {
+            this._oscillationCounter++;
+            if (this._oscillationCounter > 10) {
+                console.warn(`[JITTER_DETECT] ${this.name} oscille ! Error: ${errorPID.toFixed(4)}, PID: ${pidOutput.toFixed(4)}`);
+                this._oscillationCounter = 0;
+            }
+        }
+        this.lastSign = currentSign;
+
+        // Zone morte : On ne bouge QUE si l'erreur est significative.
+        // Si l'erreur est minuscule, on fige la position pour éviter le tremblement.
+        const deadZone = 0.05; 
+        if (Math.abs(errorPID) < deadZone) {
+            this.integralError *= 0.8; // Décharge lente de l'intégrale
+            this.velocity = 0;
+            return this.currentValue;
+        }
+
+        const maxStep = this.speed * movementScale * deltaTime * 60;
         this.currentValue += Math.max(-maxStep, Math.min(maxStep, pidOutput));
         this.currentValue = Math.max(this.min, Math.min(this.max, this.currentValue)); // Clamp final value
         this.ikTarget = null; // Reset temporary IK target for next frame
@@ -2394,9 +2434,16 @@ export class KinematicChain {
             ? allActuatorList.filter(a => movableGroups.includes(a.group))
             : allActuatorList;
 
+        // Seuil de tolérance : si l'effecteur est déjà à moins de 0.5mm, on ne recalcule rien.
+        const convergenceThreshold = 0.0005; 
+
         for (let iter = 0; iter < iterations; iter++) {
-            // FK actuelle basée sur currentValue + ikTarget si déjà calculé dans cette boucle
-            const currentJointValues = new Map(allActuatorList.map(a => [a.name, a.ikTarget !== null ? a.ikTarget : a.currentValue]));
+            // STABILISATION : On utilise filteredTarget (la cible théorique stable) 
+            // plutôt que currentValue (la position physique actuelle qui peut osciller).
+            const currentJointValues = new Map(allActuatorList.map(a => [
+                a.name, 
+                a.ikTarget !== null ? a.ikTarget : a.filteredTarget
+            ]));
             
             // On remonte la chaîne de l'effecteur vers la base
             for (let i = movableActuators.length - 1; i >= 0; i--) {
@@ -2405,27 +2452,39 @@ export class KinematicChain {
                 const currentEE = fk.position;
                 const currentVal = currentJointValues.get(actuator.name);
                 
-                if (currentEE.distanceTo(targetPos) < 0.0001) return; // Convergence
+                const distToTarget = currentEE.distanceTo(targetPos);
+                if (distToTarget < convergenceThreshold) return; // Sortie anticipée "propre"
 
                 const link = this.links.get(actuator.name);
                 const jointOrigin = link.currentPosition;
 
                 if (actuator.kinematics.type === 'revolute') {
-                    // Vecteurs Joint->Effecteur et Joint->Cible
+                    // Sécurité : on ignore le calcul si l'articulation est sur la cible (évite les sauts de 90°)
+                    const distEE = currentEE.distanceTo(jointOrigin);
+                    const distTarget = targetPos.distanceTo(jointOrigin);
+                    if (distEE < 0.001 || distTarget < 0.001) continue;
+
+                    // Vecteurs Joint->Effecteur et Joint->Cible normalisés
                     const vEE = currentEE.sub(jointOrigin).normalize();
                     const vTarget = targetPos.sub(jointOrigin).normalize();
 
                     // Calcul de l'angle nécessaire (produit scalaire)
                     let dot = vEE.dot(vTarget);
                     dot = Math.max(-1, Math.min(1, dot));
-                    let angleDiff = Math.acos(dot) * (180 / Math.PI);
+                    const angleDiff = Math.acos(dot) * (180 / Math.PI);
                     
+                    // Zone morte angulaire : on ignore les corrections inférieures à 0.1 degré
+                    if (angleDiff < 0.1) continue;
+
                     // Calcul de la direction via le produit vectoriel
                     const cross = vEE.cross(vTarget);
                     const sign = cross.dot(link.jointAxis) > 0 ? 1 : -1;
 
-                    // Amortissement pour éviter les oscillations aux singularités
-                    actuator.ikTarget = currentVal + (angleDiff * sign * damping); 
+                    // Amortissement plus agressif près de la cible pour éviter les dépassements (overshoot)
+                    const adaptiveDamping = distToTarget < 0.02 ? damping * 0.1 : damping;
+                    
+                    actuator.ikTarget = currentVal + (angleDiff * sign * adaptiveDamping); 
+                    if (isNaN(actuator.ikTarget)) actuator.ikTarget = currentVal;
                 }
                 else if (actuator.kinematics.type === 'prismatic') {
                     const dir = targetPos.sub(currentEE).dot(link.jointAxis);

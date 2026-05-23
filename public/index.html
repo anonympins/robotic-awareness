@@ -143,6 +143,7 @@
         let isRunning = false;
         let simStep = 0;
         let graspTimer = 0;
+        let logicalState = "OPEN"; // État stable pour éviter le jitter
         const sensorMeshValues = {}; // Stocke la pression par ID (idx_p1, maj_p1, etc.)
 
         async function start() {
@@ -256,11 +257,20 @@
         }
 
         function simulationLoop() {
+            // Log de pulsation pour confirmer que le script tourne
+            if (simStep % 100 === 0) {
+                console.log(`[System] Loop heartbeat - Step: ${simStep}, Running: ${isRunning}`);
+            }
+
             if (isRunning && robotInstance) {
                 const { actuators, hub, sensorMapper, varMap } = robotInstance;
                 // 1. Calcul de la pression moyenne d'abord
                 const averageContact = Object.values(sensorMeshValues).reduce((a, b) => a + b, 0) / 
                                      (Object.keys(sensorMeshValues).length || 1);
+
+                if (simStep % 60 === 0) {
+                    console.log(`[Logic] State: ${logicalState}, Contact: ${averageContact.toFixed(2)}, Timer: ${graspTimer}`);
+                }
 
                 // 2. Préparation des entrées binaires pour les réseaux de neurones
                 const inputs = new Uint8Array(varMap ? Object.keys(varMap).length : 0).fill(0);
@@ -288,7 +298,24 @@
 
                 } else {
                     // --- LOGIQUE AUTOMATIQUE PAR CAPTEUR ---
-                    if (averageContact > 0.4) {
+                    // Application d'une Hystérésis pour stabiliser la décision
+                    const highThreshold = 0.45;
+                    const lowThreshold = 0.30;
+                    const oldState = logicalState;
+
+                    if (logicalState === "OPEN" && averageContact > highThreshold) {
+                        logicalState = "GRAB";
+                    } else if (logicalState !== "OPEN" && averageContact < lowThreshold) {
+                        logicalState = "OPEN";
+                        graspTimer = 0;
+                    }
+
+                    if (oldState !== logicalState) {
+                        console.log(`%c[Logic] Transition: ${oldState} -> ${logicalState} (Contact: ${averageContact.toFixed(2)})`, 
+                                    "background: #222; color: #bada55; padding: 2px; border-radius: 4px;");
+                    }
+
+                    if (logicalState !== "OPEN") {
                         graspTimer++;
                         const stage = graspTimer > 80 ? "MAX_GRIP" : "GRAB";
                         
@@ -323,7 +350,13 @@
                     }
 
                     const pressure = a.sensorId ? (sensorMeshValues[a.sensorId] || 0) : 0;
+                    const oldVal = a.currentValue;
                     a.update(inputs, state.orientation, 0.5, globalCanMove, null, 0.02, pressure);
+                    
+                    // Debug Jitter : Si un joint bouge de façon suspecte alors qu'il devrait être fixe
+                    if (averageContact === 0 && Math.abs(a.currentValue - oldVal) > 0.01 && Math.abs(a.currentValue - oldVal) < 0.5) {
+                        console.warn(`[Jitter] ${a.name} vibrant: diff=${(a.currentValue - oldVal).toFixed(4)}`);
+                    }
                 });
 
                 // Mise à jour du viewer 3D
