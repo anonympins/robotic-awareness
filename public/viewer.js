@@ -10,12 +10,21 @@ import { OBJLoader } from 'three/addons/loaders/OBJLoader.js';
 import { FBXLoader } from 'three/addons/loaders/FBXLoader.js';
 import * as fflate from 'https://cdn.jsdelivr.net/npm/fflate@0.8.2/+esm';
 
+const LOD_LEVELS = {
+    high: { segments: 1.0, anisotropy: 16, shadows: true, filter: THREE.LinearMipmapLinearFilter },
+    medium: { segments: 0.5, anisotropy: 4, shadows: true, filter: THREE.LinearFilter },
+    low: { segments: 0.25, anisotropy: 1, shadows: false, filter: THREE.NearestFilter }
+};
+
 export class GLBViewer {
     constructor(containerId) {
         this.container = document.getElementById(containerId);
         if (!this.container) {
             throw new Error(`Le container #${containerId} est introuvable.`);
         }
+
+        this.container.style.position = 'relative'; // Indispensable pour l'UI absolue
+        this.quality = 'high'; // Niveau par défaut
 
         // 1. Initialisation de la Scène
         this.scene = new THREE.Scene();
@@ -34,6 +43,7 @@ export class GLBViewer {
         this.renderer.setSize(this.container.clientWidth, this.container.clientHeight);
         this.renderer.setPixelRatio(window.devicePixelRatio);
         this.renderer.outputColorSpace = THREE.SRGBColorSpace;
+        this.renderer.shadowMap.enabled = true;
         this.container.appendChild(this.renderer.domElement);
 
         // 4. Contrôles
@@ -53,17 +63,87 @@ export class GLBViewer {
         window.addEventListener('resize', () => this.onResize());
         this.meshes = new Map(); // Suivi des objets par nom
         this.initialQuaternions = new Map(); // Sauvegarde des poses de repos
+        this.initialPositions = new Map(); // Positions de repos pour la déformation
+        this.vertexWeights = new Map(); // Weights pour le "Neural Skinning"
         this.taxelMeshes = new Map(); // Suivi des capteurs par sensorId
         
         // Initialisation pour la calibration (Tare)
         this.sensorConfigs = new Map();
         this.isCalibrating = false;
         this.calibrationBuffer = new Map(); // { sensorId: [values] }
+
+        // Initialisation de l'interface de contrôle
+        this.createUI();
     }
 
     /**
      * Tente de charger un GLB, sinon génère les primitives
      */
+    setQuality(level) {
+        if (!LOD_LEVELS[level]) return;
+        this.quality = level;
+        const config = LOD_LEVELS[level];
+
+        // Mise à jour du renderer
+        this.renderer.shadowMap.enabled = config.shadows;
+
+        // Mise à jour des textures existantes
+        this.scene.traverse(node => {
+            if (node.isMesh && node.material) {
+                this.applyLODToMaterial(node.material);
+                node.castShadow = config.shadows;
+                node.receiveShadow = config.shadows;
+            }
+        });
+
+        console.log(`[Viewer] Qualité réglée sur : ${level}`);
+    }
+
+    /**
+     * Génère l'interface de contrôle LOD en superposition
+     */
+    createUI() {
+        const ui = document.createElement('div');
+        ui.className = 'viewer-lod-controls';
+        ui.style.cssText = `
+            position: absolute;
+            top: 20px;
+            right: 20px;
+            background: rgba(10, 10, 10, 0.85);
+            border: 1px solid #00ffff;
+            padding: 12px;
+            border-radius: 8px;
+            color: #00ffff;
+            font-family: 'Segoe UI', Tahoma, sans-serif;
+            font-size: 11px;
+            z-index: 1000;
+            pointer-events: auto;
+            box-shadow: 0 0 15px rgba(0, 255, 255, 0.2);
+            backdrop-filter: blur(4px);
+        `;
+
+        const label = document.createElement('div');
+        label.innerText = "ENGINE PRECISION";
+        label.style.cssText = "font-weight: bold; margin-bottom: 8px; letter-spacing: 1px; color: #fff; border-bottom: 1px solid #00ffff44; padding-bottom: 4px;";
+        ui.appendChild(label);
+
+        const select = document.createElement('select');
+        select.style.cssText = "width: 100%; background: #000; color: #00ffff; border: 1px solid #00ffff; padding: 5px; cursor: pointer; outline: none; border-radius: 4px;";
+        
+        Object.keys(LOD_LEVELS).forEach(lvl => {
+            const opt = document.createElement('option');
+            opt.value = lvl;
+            opt.innerText = lvl.toUpperCase();
+            if (lvl === this.quality) opt.selected = true;
+            select.appendChild(opt);
+        });
+
+        select.addEventListener('change', (e) => this.setQuality(e.target.value));
+
+        ui.appendChild(select);
+        this.container.appendChild(ui);
+    }
+
     async initRobot(config) {
         // Priorité à l'URL extraite proactivement dans metadata
         const url = config.metadata?.model_url || config.visual?.model_url;
@@ -129,11 +209,16 @@ export class GLBViewer {
             }
 
             this.meshes.set(act.name, mesh);
+            // Sauvegarde de la pose initiale pour les primitives
+            this.initialQuaternions.set(act.name, mesh.quaternion.clone());
+            this.initialPositions.set(act.name, mesh.geometry.attributes.position.array.slice());
             actuatorMap.set(act.name, act);
 
             // Ajout d'un "Taxel" (Capteur de pression visuel) si un sensorId est défini
             if (act.config && act.config.sensorId) {
-                const taxelGeom = new THREE.SphereGeometry(0.004, 8, 8);
+                const lod = LOD_LEVELS[this.quality];
+                const seg = Math.max(4, Math.floor(8 * lod.segments));
+                const taxelGeom = new THREE.SphereGeometry(0.004, seg, seg);
                 const taxelMat = new THREE.MeshBasicMaterial({ color: 0x330000 });
                 const taxel = new THREE.Mesh(taxelGeom, taxelMat);
                 
@@ -161,11 +246,23 @@ export class GLBViewer {
         });
     }
 
+    applyLODToMaterial(material) {
+        const lod = LOD_LEVELS[this.quality];
+        if (material.map) {
+            material.map.minFilter = lod.filter;
+            material.map.magFilter = (this.quality === 'low') ? THREE.NearestFilter : THREE.LinearFilter;
+            material.map.anisotropy = lod.anisotropy;
+            material.map.needsUpdate = true;
+        }
+        material.needsUpdate = true;
+    }
+
     createPrimitive(data) {
         let geometry;
+        const lod = LOD_LEVELS[this.quality];
         const material = new THREE.MeshPhongMaterial({ 
             color: data.color || 0x888888, 
-            shininess: 100,
+            shininess: this.quality === 'low' ? 0 : 100,
             transparent: true,
             opacity: 0.9
         });
@@ -178,29 +275,35 @@ export class GLBViewer {
                 geometry.translate(0, size[1] / 2, 0);
                 break;
             case 'pyramid':
-                geometry = new THREE.CylinderGeometry(0, data.radius || 0.05, data.height || 0.1, 4);
+                geometry = new THREE.CylinderGeometry(0, data.radius || 0.05, data.height || 0.1, Math.max(4, Math.floor(8 * lod.segments)));
                 geometry.translate(0, (data.height || 0.1) / 2, 0);
                 break;
             case 'cylinder':
-                geometry = new THREE.CylinderGeometry(data.radiusTop || data.radius || 0.05, data.radiusBottom || data.radius || 0.05, data.height || 0.1, 8);
+                const radSeg = Math.max(6, Math.floor(16 * lod.segments));
+                geometry = new THREE.CylinderGeometry(data.radiusTop || data.radius || 0.05, data.radiusBottom || data.radius || 0.05, data.height || 0.1, radSeg);
                 geometry.translate(0, (data.height || 0.1) / 2, 0);
                 break;
             case 'tube':
                 if (data.path) {
                     const points = data.path.map(p => new THREE.Vector3(...p));
                     const curve = new THREE.CatmullRomCurve3(points);
-                    geometry = new THREE.TubeGeometry(curve, 20, data.radius || 0.01, 8, false);
+                    const tubularSeg = Math.max(8, Math.floor(40 * lod.segments));
+                    const radialSeg = Math.max(4, Math.floor(8 * lod.segments));
+                    geometry = new THREE.TubeGeometry(curve, tubularSeg, data.radius || 0.01, radialSeg, false);
                 }
                 break;
             case 'torus':
-                geometry = new THREE.TorusGeometry(data.radius || 0.05, data.tube || 0.01, 16, 100);
+                const tSeg = Math.max(8, Math.floor(16 * lod.segments));
+                const rSeg = Math.max(12, Math.floor(32 * lod.segments));
+                geometry = new THREE.TorusGeometry(data.radius || 0.05, data.tube || 0.01, tSeg, rSeg);
                 break;
             case 'multigone': // Polyèdre irrégulier
                 const vertices = data.vertices.flat();
                 geometry = new THREE.PolyhedronGeometry(vertices, data.indices || [0,1,2], data.radius || 1);
                 break;
             default:
-                geometry = new THREE.SphereGeometry(0.02);
+                const sSeg = Math.max(6, Math.floor(16 * lod.segments));
+                geometry = new THREE.SphereGeometry(0.02, sSeg, sSeg);
         }
 
         return new THREE.Mesh(geometry, material);
@@ -215,25 +318,72 @@ export class GLBViewer {
             const mesh = this.meshes.get(act.name);
             if (!mesh) return;
 
+            // Support des Bones (SkinnedMesh) ET des Nodes standards
+            const target = mesh; 
+
+            const axis = new THREE.Vector3(...act.kinematics.axis).normalize();
+            const angleRad = act.currentValue * (Math.PI / 180);
+            const q = new THREE.Quaternion().setFromAxisAngle(axis, angleRad);
+            const initialQ = this.initialQuaternions.get(act.name) || new THREE.Quaternion();
+
             if (act.kinematics.type === 'revolute') {
-                // Conversion de l'angle (degrés) en Quaternion local sur l'axe défini
-                const axis = new THREE.Vector3(...act.kinematics.axis);
-                const angleRad = act.currentValue * (Math.PI / 180);
-                
-                const q = new THREE.Quaternion().setFromAxisAngle(axis, angleRad);
-                const initialQ = this.initialQuaternions.get(act.name) || new THREE.Quaternion();
-                mesh.quaternion.copy(initialQ).multiply(q);
-            } 
-            else if (act.kinematics.type === 'prismatic') {
-                // Déplacement linéaire le long de l'axe
-                const axis = new THREE.Vector3(...act.kinematics.axis);
-                const dist = act.currentValue / 1000; // mm to m
-                
-                // On repart de l'offset initial (stocké dans mesh.position à la création)
-                // Pour simplifier ici, on ajoute le déplacement à l'offset de base
+                target.quaternion.copy(initialQ).multiply(q);
+            } else if (act.kinematics.type === 'prismatic') {
+                const dist = act.currentValue / 1000;
                 const offset = new THREE.Vector3(...(act.offset || [0,0,0]));
-                mesh.position.copy(offset).add(axis.multiplyScalar(dist));
+                target.position.copy(offset).add(axis.multiplyScalar(dist));
             }
+        });
+
+        // Application du "Neural Bending" sur les maillages monolithiques
+        this.applyNeuralDeformation(actuators);
+    }
+
+    /**
+     * Déformation dynamique des sommets pour les modèles non-riggés
+     */
+    applyNeuralDeformation(actuators) {
+        this.meshes.forEach((mesh, name) => {
+            if (!mesh.isMesh || mesh.isSkinnedMesh || !this.vertexWeights.has(name)) return;
+
+            const weights = this.vertexWeights.get(name);
+            const geometry = mesh.geometry;
+            const positionAttr = geometry.attributes.position;
+            const initialPos = this.initialPositions.get(name);
+
+            const tempPos = new THREE.Vector3();
+            const finalPos = new THREE.Vector3();
+            const worldMatrixInv = mesh.matrixWorld.clone().invert();
+
+            for (let i = 0; i < positionAttr.count; i++) {
+                finalPos.set(0, 0, 0);
+                tempPos.fromArray(initialPos, i * 3);
+                
+                // Passage en coordonnées monde pour calculer l'influence des joints
+                tempPos.applyMatrix4(mesh.matrixWorld);
+
+                let totalWeight = 0;
+                const vertexInfluence = weights[i]; // { jointName: weight }
+
+                for (const [jointName, weight] of Object.entries(vertexInfluence)) {
+                    const joint = this.meshes.get(jointName);
+                    if (!joint) continue;
+
+                    // On simule le mouvement du vertex comme s'il était attaché au joint
+                    const localToJoint = joint.worldToLocal(tempPos.clone());
+                    const movedPos = localToJoint.applyMatrix4(joint.matrixWorld);
+                    
+                    finalPos.addScaledVector(movedPos, weight);
+                    totalWeight += weight;
+                }
+
+                if (totalWeight > 0) {
+                    // Retour en coordonnées locales pour l'attribut de position
+                    finalPos.applyMatrix4(worldMatrixInv);
+                    positionAttr.setXYZ(i, finalPos.x, finalPos.y, finalPos.z);
+                }
+            }
+            positionAttr.needsUpdate = true;
         });
     }
 
@@ -345,13 +495,6 @@ export class GLBViewer {
         const isExtracted = url.includes('.glb');
         console.log(`[Viewer] ${isExtracted ? '🛡️ Modèle stabilisé' : '📦 Modèle brut'} chargé : ${url}`);
 
-        // Normalisation de l'orientation globale du modèle
-        // Si le FBX arrive "couché", on redresse le root ici
-        if (url.toLowerCase().includes('hand')) {
-            model.rotation.x = 0; // Ajuster si la main est à plat ou verticale
-            model.updateMatrixWorld(true);
-        }
-
         // Ajout d'un SkeletonHelper pour debugger le "pliage" (optionnel)
         const helper = new THREE.SkeletonHelper(model);
         helper.visible = false; // Activer pour voir les os
@@ -359,48 +502,27 @@ export class GLBViewer {
 
         model.traverse(node => {
             if (node.name) {
-                this.meshes.set(node.name, node);
-                this.initialQuaternions.set(node.name, node.quaternion.clone());
-                
-                // Si c'est un os, on peut attacher un repère visuel plus discret
-                if (node.isBone) {
-                    const axes = new THREE.AxesHelper(0.02);
-                    node.add(axes);
+                // Logique de sélection : Priorité aux Bones pour l'articulation
+                // Si un os et un mesh portent le même nom, on préfère l'os pour les contrôles
+                const existing = this.meshes.get(node.name);
+                if (!existing || (!existing.isBone && node.isBone)) {
+                    this.meshes.set(node.name, node);
+                    this.initialQuaternions.set(node.name, node.quaternion.clone());
                 }
 
                 if (node.isMesh) {
-                    node.castShadow = true;
-                    node.receiveShadow = true;
-                    
-                    // Si c'est un SkinnedMesh (modèle riggé), on active le skinning
+                    this.initialPositions.set(node.name, node.geometry.attributes.position.array.slice());
+                    node.castShadow = LOD_LEVELS[this.quality].shadows;
+                    node.receiveShadow = LOD_LEVELS[this.quality].shadows;
                     if (node.isSkinnedMesh) {
                         node.frustumCulled = false; // Évite que le mesh disparaisse quand il se déforme
-                        
-                        // Injection d'un Shader personnalisé pour accentuer le pliage
-                        node.material.onBeforeCompile = (shader) => {
-                            shader.uniforms.uFlexionColor = { value: new THREE.Color(0x00ffff) };
-                            shader.vertexShader = `
-                                varying float vSkinWeight;
-                                ${shader.vertexShader}
-                            `.replace(
-                                `#include <skinnormal_vertex>`,
-                                `#include <skinnormal_vertex>
-                                 // On détecte la transition entre deux os (pliage)
-                                 vSkinWeight = (skinWeight.x > 0.1 && skinWeight.y > 0.1) ? 1.0 : 0.0;
-                                `
-                            );
-                            shader.fragmentShader = `
-                                uniform vec3 uFlexionColor;
-                                varying float vSkinWeight;
-                                ${shader.fragmentShader}
-                            `.replace(
-                                `#include <color_fragment>`,
-                                `#include <color_fragment>
-                                 diffuseColor.rgb = mix(diffuseColor.rgb, uFlexionColor, vSkinWeight * 0.6);
-                                `
-                            );
-                        };
                     }
+                    if (node.material) this.applyLODToMaterial(node.material);
+                }
+
+                if (node.isBone) {
+                    const axes = new THREE.AxesHelper(0.02);
+                    node.add(axes);
                 }
             }
         });
@@ -409,11 +531,15 @@ export class GLBViewer {
         this.analyzeProactive(model);
 
         const box = new THREE.Box3().setFromObject(model);
-        const center = box.getCenter(new THREE.Vector3());
+        // On ne centre pas brutalement si on veut garder l'alignement avec les actuateurs
+        // On utilise le centre pour la caméra, mais on laisse le modèle là où il est défini
         const size = box.getSize(new THREE.Vector3());
+        const center = box.getCenter(new THREE.Vector3());
+        
         this.controls.target.copy(center);
         const maxDim = Math.max(size.x, size.y, size.z);
-        this.camera.position.set(center.x + maxDim, center.y + maxDim, center.z + maxDim);
+        // Alignement simplifié pour éviter le désaxage (Front-ish view)
+        this.camera.position.set(center.x, center.y + maxDim * 0.5, center.z + maxDim * 2);
         this.controls.update();
         console.log(`[Viewer] Modèle prêt (${url}) : ${this.meshes.size} nœuds indexés.`);
     }
@@ -435,8 +561,40 @@ export class GLBViewer {
             // 2. Détection d'îlots (segmentation de maillage fusionné)
             if (node.geometry.attributes.position && node.geometry.attributes.position.count > 100) {
                 this.detectGeometricIslands(node);
+                this.computeProximityWeights(node);
             }
         });
+    }
+
+    /**
+     * Calcule l'influence des articulations sur chaque vertex (Soft Rigging)
+     * C'est ici que l'approche "maillage de neurones" intervient.
+     */
+    computeProximityWeights(mesh) {
+        const position = mesh.geometry.attributes.position;
+        const weights = new Array(position.count);
+        const joints = Array.from(this.meshes.values()).filter(n => n.name !== mesh.name && (n.isBone || /joint|finger|arm|thumb/i.test(n.name)));
+
+        if (joints.length === 0) return;
+
+        const v = new THREE.Vector3();
+        const jPos = new THREE.Vector3();
+
+        for (let i = 0; i < position.count; i++) {
+            v.fromArray(position.array, i * 3).applyMatrix4(mesh.matrixWorld);
+            const influence = {};
+            
+            joints.forEach(joint => {
+                joint.getWorldPosition(jPos);
+                const dist = v.distanceTo(jPos);
+                // Loi en carré inverse pour le "poids neuronal"
+                const w = 1 / (Math.pow(dist * 10, 2) + 0.1); 
+                if (w > 0.1) influence[joint.name] = w;
+            });
+            weights[i] = influence;
+        }
+        this.vertexWeights.set(mesh.name, weights);
+        console.log(`🧠 Neural Skinning généré pour ${mesh.name} (${joints.length} joints influents)`);
     }
 
     /**
