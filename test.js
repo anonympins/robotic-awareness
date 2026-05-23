@@ -4,7 +4,7 @@
 // ============================================================
 
 // ---------- Noyau Mathématique : Quaternions ----------
-class Quaternion {
+export class Quaternion {
     constructor(w = 1, x = 0, y = 0, z = 0) {
         this.w = w; this.x = x; this.y = y; this.z = z;
     }
@@ -140,7 +140,7 @@ class Quaternion {
 }
 
 // ---------- Noyau Mathématique : Vecteurs 3D ----------
-class Vector3 {
+export class Vector3 {
     constructor(x = 0, y = 0, z = 0) {
         this.x = x; this.y = y; this.z = z;
     }
@@ -195,7 +195,7 @@ class Vector3 {
 }
 
 // ---------- Neurone Seeker (Tête Chercheuse) ----------
-class SeekerNeuron {
+export class SeekerNeuron {
     constructor() {
         // L'orientation est le "poids" géométrique du neurone
         this.orientation = Quaternion.random();
@@ -228,7 +228,7 @@ class SeekerNeuron {
 }
 
 // ---------- Couche Géométrique (Seeker Layer) ----------
-class SeekerLayer {
+export class SeekerLayer {
     constructor(inputSize, outputSize) {
         this.neurons = Array.from({ length: outputSize }, () => new SeekerNeuron());
         // Buffer pour éviter l'allocation de Quaternions à chaque forward/train
@@ -266,7 +266,7 @@ class SeekerLayer {
 
 
 // ---------- Types de neurones ----------
-const NeuronType = {
+export const NeuronType = {
     AND: (a, b) => a & b,
     OR:  (a, b) => a | b,
     XOR: (a, b) => a ^ b,
@@ -276,7 +276,7 @@ const NeuronType = {
 };
 
 // ---------- Perceptron binaire avec poids en puissance de 2 ----------
-class BitPerceptron {
+export class BitPerceptron {
     constructor(weights, threshold) {
         // Les poids doivent être des puissances de 2 (1,2,4,8...)
         this.weights = new Int32Array(weights);  // ex: [1, 2, 4, 8]
@@ -297,7 +297,7 @@ class BitPerceptron {
 }
 
 // ---------- Neurone à vote majoritaire avec pondération ----------
-class MajorityNeuron {
+export class MajorityNeuron {
     constructor(weights, customThreshold = null) { // Added customThreshold
         // weights: tableau d'entiers (nombre de voix pour chaque entrée)
         this.weights = new Int32Array(weights);
@@ -317,7 +317,7 @@ class MajorityNeuron {
 }
 
 // ---------- Réseau multicouche à votes majoritaires ----------
-class MajorityNetwork {
+export class MajorityNetwork {
     constructor(layers) {
         // layers: array of arrays. Each inner array can contain:
         //   - an array of weights (e.g., [1, 1]) for a MajorityNeuron with default threshold
@@ -366,7 +366,7 @@ class MajorityNetwork {
 // ---------- Version ultime: réseau entièrement bit à bit ----------
 // Pas de multiplications, que des AND/OR/XOR/NOT
 
-class BitwiseNetwork {
+export class BitwiseNetwork {
     constructor() {
         // Pré-allocation pour éviter les allocations mémoire
         this.workBuffer = new Uint8Array(32);
@@ -427,7 +427,7 @@ class BitwiseNetwork {
 }
 
 // ---------- Perceptron stochastique avec génération de bits ----------
-class StochasticPerceptron {
+export class StochasticPerceptron {
     constructor(weights, rngSeed = Date.now()) {
         this.weights = weights;
         // Générateur aléatoire simple (xorshift)
@@ -497,7 +497,7 @@ class StochasticPerceptron {
 // Un réseau qui maintient un état interne (sa propre sortie précédente)
 // et l'utilise comme entrée pour la prédiction suivante.
 // Ceci est une forme simple de Réseau de Neurones Récurrents (RNN) bit à bit.
-class StatefulMajorityNetwork {
+export class StatefulMajorityNetwork {
     /**
      * Construit un réseau récurrent à partir d'une logique de règle.
      * La logique de règle doit inclure des variables pour les entrées actuelles
@@ -547,7 +547,7 @@ class StatefulMajorityNetwork {
 }
 
 // ---------- Benchmarks et tests ----------
-function benchmark() {
+/*function benchmark() {
     console.log("=== Benchmark perceptrons bit à bit ===\n");
 
     // Test XOR
@@ -589,12 +589,12 @@ function benchmark() {
     console.log(`10M prédictions: ${perfMs.toFixed(2)} ms`);
     console.log(`Résultat de contrôle: ${result}`);
 }
-
+*/
 
 
 
 // ---------- Interprète de Règles pour MajorityNetwork ----------
-class RuleInterpreter {
+export class RuleInterpreter {
     /**
      * Compile une règle logique imbriquée (arbre) en un MajorityNetwork multicouche.
      * Gère automatiquement les dépendances et les "pass-through" entre couches.
@@ -846,7 +846,7 @@ class RuleInterpreter {
 }
 
 // ---------- Version encore plus optimisée avec TypedArrays ----------
-class OptimizedMajorityPerceptron {
+export class OptimizedMajorityPerceptron {
     constructor(weights, useSimd = false) {
         this.weights = new Uint8Array(weights);
         this.total = 0;
@@ -890,7 +890,7 @@ class OptimizedMajorityPerceptron {
     }
 }
 
-class MultiHeadAttentionBinary {
+export class MultiHeadAttentionBinary {
     constructor(dModel, nHeads) {
         this.nHeads = nHeads;
         this.dHead = Math.floor(dModel / nHeads);
@@ -935,7 +935,7 @@ class MultiHeadAttentionBinary {
         return result;
     }
 }
-class BinaryTransformer {
+export class BinaryTransformer {
     constructor(vocabSize = 256, nLayers = 2, nHeads = 4, dModel = 64) {
         // Embeddings binaires
         this.embeddings = new Array(vocabSize);
@@ -1004,7 +1004,7 @@ class BinaryTransformer {
  * Attention Géométrique par Quaternions
  * Utilise l'alignement spatial au lieu de la logique binaire
  */
-class QuaternionAttention {
+export class QuaternionAttention {
     constructor(dModel, nHeads) {
         this.nHeads = nHeads;
         // Chaque tête est un "Seeker" qui apprend une orientation préférentielle
@@ -1042,7 +1042,7 @@ class QuaternionAttention {
 }
 
 // Feed-forward binaire
-class FeedForwardBinary {
+export class FeedForwardBinary {
     constructor(dModel) {
         this.W1 = new Array(dModel);
         this.W2 = new Array(dModel);
@@ -1062,7 +1062,7 @@ class FeedForwardBinary {
 
 
 // ---------- Wrapper de données : Réalité -> Bits ----------
-class DataWrapper {
+export class DataWrapper {
     // Convertit un nombre en vecteur binaire basé sur des seuils (Thermometer Encoding)
     // Très efficace pour les neurones majoritaires
     static numberToBits(value, thresholds = [0.2, 0.4, 0.6, 0.8]) {
@@ -1120,7 +1120,7 @@ class DataWrapper {
 }
 
 // ---------- Moteur de Règles Pré-entraînées ----------
-class RuleEngine {
+export class RuleEngine {
     constructor() {
         this.rules = new Map();
     }
@@ -1133,6 +1133,59 @@ class RuleEngine {
     execute(name, inputs) {
         const net = this.rules.get(name);
         return net ? net.predict(inputs) : null;
+    }
+}
+
+// ---------- Utilitaires de Conscience Géométrique (Mesh Awareness) ----------
+export class MeshAwarenessUtils {
+    /**
+     * Calcule une AABB (Axis-Aligned Bounding Box) à partir des sommets d'un maillage.
+     * @param {Float32Array|number[]} vertices Tableau de sommets [x,y,z, x,y,z...]
+     */
+    static computeCollisionBox(vertices) {
+        if (!vertices || vertices.length === 0) return null;
+        let minX = Infinity, minY = Infinity, minZ = Infinity;
+        let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
+
+        for (let i = 0; i < vertices.length; i += 3) {
+            const x = vertices[i], y = vertices[i+1], z = vertices[i+2];
+            if (x < minX) minX = x; if (x > maxX) maxX = x;
+            if (y < minY) minY = y; if (y > maxY) maxY = y;
+            if (z < minZ) minZ = z; if (z > maxZ) maxZ = z;
+        }
+
+        return {
+            min: new Vector3(minX, minY, minZ),
+            max: new Vector3(maxX, maxY, maxZ)
+        };
+    }
+
+    /**
+     * Algorithme ultra-rapide d'intersection AABB-AABB (6 comparaisons).
+     * C'est l'algorithme au temps d'exécution le plus prédictible pour la 3D.
+     */
+    static intersects(boxA, boxB) {
+        return (boxA.min.x <= boxB.max.x && boxA.max.x >= boxB.min.x) &&
+               (boxA.min.y <= boxB.max.y && boxA.max.y >= boxB.min.y) &&
+               (boxA.min.z <= boxB.max.z && boxA.max.z >= boxB.min.z);
+    }
+
+    /**
+     * Transforme une boîte locale en boîte englobante monde (AABB).
+     */
+    static getTransformedAABB(localBox, position, rotation) {
+        const corners = [
+            new Vector3(localBox.min.x, localBox.min.y, localBox.min.z),
+            new Vector3(localBox.max.x, localBox.min.y, localBox.min.z),
+            new Vector3(localBox.min.x, localBox.max.y, localBox.min.z),
+            new Vector3(localBox.min.x, localBox.min.y, localBox.max.z),
+            new Vector3(localBox.max.x, localBox.max.y, localBox.min.z),
+            new Vector3(localBox.max.x, localBox.min.y, localBox.max.z),
+            new Vector3(localBox.min.x, localBox.max.y, localBox.max.z),
+            new Vector3(localBox.max.x, localBox.max.y, localBox.max.z),
+        ];
+        const worldCorners = corners.map(c => rotation.rotateVector(c).add(position));
+        return this.computeCollisionBox(worldCorners.flatMap(v => [v.x, v.y, v.z]));
     }
 }
 
@@ -1181,11 +1234,8 @@ const gpt = new BinaryTransformer();
 const texteGenere = gpt.generate("Bonjour", 50);
 console.log(texteGenere);
 
-// Exécution
-benchmark();
-
 // Exécution du nouveau benchmark
-benchmarkCompiledRules();
+//benchmarkCompiledRules();
 
 console.log("\n=== Mode Optionnel : Seeker Quaternions ===");
 const seeker = new SeekerLayer(3, 2); // 3 entrées (x,y,z), 2 neurones de sortie
@@ -1213,19 +1263,7 @@ const testInputs = [1, 0, 1, 0, 1, 0, 1, 0];
 const prediction = classifier.predict(testInputs);
 console.log(`Prédiction: ${prediction}`);
 
-// Export pour utilisation dans d'autres modules
-module.exports = {
-    BitPerceptron,
-    MajorityNeuron,
-    MajorityNetwork,
-    BitwiseNetwork,
-    StochasticPerceptron,
-    OptimizedMajorityPerceptron,
-    NeuronType,
-    Quaternion,
-    SeekerLayer,
-    Vector3
-};
+
 // 1. Création d'une règle "Sécurité" :
 // Règle métier: Si (Température élevée ET Fumée détectée) OU (Bouton Alerte)
 // Mappage en neurones majoritaires avec l'Interprète de Règles:
@@ -1735,7 +1773,7 @@ Résumé de la diversité des requêtes :
  * Couche de Neurones Analogiques pour le contrôle moteur (Cervelet)
  * Permet d'apprendre des mappings complexes [Maillage Capteurs] -> [Position Actuateur]
  */
-class AnalogNeuralLayer {
+export class AnalogNeuralLayer {
     constructor(inputSize, outputSize) {
         this.inputSize = inputSize;
         // Poids initialisés pour une réponse douce
@@ -1809,7 +1847,7 @@ class AnalogNeuralLayer {
  * Couche d'abstraction pour les capteurs
  * Permet de découpler la topologie physique de la logique neuronale
  */
-class SensorMapper {
+export class SensorMapper {
     constructor(sensorConfig) {
         this.config = sensorConfig;
         this.inputSize = 0;
@@ -1886,7 +1924,7 @@ class SensorMapper {
 /**
  * Contrôleur de Maillage Complexe (ex: Drap intelligent)
  */
-class MeshController {
+export class MeshController {
     constructor(sensorCount, actuatorCount) {
         this.cerebellum = new AnalogNeuralLayer(sensorCount, actuatorCount);
         this.anchors = []; // Stockage des échantillons maîtres
@@ -1952,9 +1990,10 @@ class MeshController {
  * Contrôleur d'Actuateur Générique (Servo, Vérin, Pince, etc.)
  * Utilise le même maillage géométrique mais avec des paramètres spécifiques.
  */
-class RobotActuator {
+export class RobotActuator {
     constructor(name, safetyLogic, varMap, config = {}) {
         this.name = name;
+        this.varMap = varMap;
         // Sécurité logique
         this.safetyNet = RuleInterpreter.interpret(safetyLogic, varMap);
         // Apprentissage de l'orientation
@@ -1968,12 +2007,14 @@ class RobotActuator {
         this.speed = config.speed || 0.1;   // Réactivité / Force
         this.proprioceptionRatio = config.proprioceptionRatio || 0.7; // 70% pour le maillage capteurs par défaut
         this.group = config.group || "default"; // Groupe cinématique
+        this.directJointCommand = null; // New: For explicit joint value commands from postures
         this.sensorId = config.sensorId || null; // Capteur tactile associé
 
         // Lissage (Low-pass filter)
         this.filtering = config.filtering || { alpha: 0.15 };
         this.filteredTarget = (this.max + this.min) / 2;
 
+        this.collisionBox = null; // Donnée locale AABB
         // Gestion du blocage (Stall / Obstacle Aspirant)
         this.ikTarget = null; // Cible temporaire injectée par le solveur IK
         this.stallThreshold = config.stall_threshold || 10;
@@ -2033,7 +2074,7 @@ class RobotActuator {
         // 2.1 Évaluation de la Sécurité Granulaire
         let movementScale = 1.0;
         for (const rule of this.safetyRules) {
-            const result = RuleInterpreter.interpret(rule.condition, robotVarMap).predict(decisionInputs);
+            const result = RuleInterpreter.interpret(rule.condition, this.varMap).predict(decisionInputs);
             if (result[0] === (rule.action === "HALT" ? 0 : 1)) {
                 if (rule.action === "HALT") return this.currentValue;
                 if (rule.action === "REDUCE_SPEED") movementScale = 0.3;
@@ -2042,38 +2083,34 @@ class RobotActuator {
         }
 
 
-        // 3. Projection et Mapping des Paramètres
-        // IK Simplifiée : Calcul de l'angle/position par projection sur l'axe du joint
-        let targetMapped;
+        // 3. Détermination de la cible (Priorité : Direct > IK > Seeker)
+        let effectiveTargetValue;
 
-        if (this.ikTarget !== null) {
-            targetMapped = this.ikTarget;
+        if (this.directJointCommand !== null) {
+            effectiveTargetValue = this.directJointCommand;
+        } else if (this.ikTarget !== null) {
+            effectiveTargetValue = this.ikTarget;
         } else {
+            // Utilisation de la logique géométrique (Seeker) uniquement si pas de cible directe
             const alignment = this.seeker.predict(globalTarget);
             const error = 1.0 - alignment;
             this.seeker.update(globalTarget, error, this.speed);
             this.currentOrientation = this.seeker.orientation;
+
+            const q = this.currentOrientation;
+            const dot = q.x * this.jointAxis.x + q.y * this.jointAxis.y + q.z * this.jointAxis.z;
+            
+            if (this.kinematics.type === 'revolute') {
+                const angle = 2 * Math.atan2(dot, q.w);
+                const norm = (angle + Math.PI) / (2 * Math.PI);
+                effectiveTargetValue = norm * (this.max - this.min) + this.min;
+            } else {
+                effectiveTargetValue = ((dot + 1) / 2) * (this.max - this.min) + this.min;
+            }
         }
 
-        const q = this.currentOrientation;
-        
-        // Dot product entre la partie imaginaire du quaternion et l'axe du joint
-        const dot = q.x * this.jointAxis.x + q.y * this.jointAxis.y + q.z * this.jointAxis.z;
-        
-        if (this.kinematics.type === 'revolute') {
-            const angle = 2 * Math.atan2(dot, q.w);
-            // On normalise l'angle (-PI à PI) vers (0 à 1)
-            const norm = (angle + Math.PI) / (2 * Math.PI);
-            targetMapped = norm * (this.max - this.min) + this.min;
-        } else {
-            // Pour le prismatique (Vérin), on utilise une projection linéaire simple
-            targetMapped = ((dot + 1) / 2) * (this.max - this.min) + this.min;
-        }
-        
         // 4. Fusion Adaptative : Spatiale vs Environnementale (Apprise)
-        const finalTarget = learnedTarget !== null 
-            ? (targetMapped * (1 - this.proprioceptionRatio)) + (learnedTarget * this.proprioceptionRatio) 
-            : targetMapped;
+        const finalTarget = learnedTarget !== null ? (effectiveTargetValue * (1 - this.proprioceptionRatio)) + (learnedTarget * this.proprioceptionRatio) : effectiveTargetValue;
             
         // 4.1 Lissage de la commande (Low-Pass Filter)
         this.filteredTarget = (this.filtering.alpha * finalTarget) + (1 - this.filtering.alpha) * this.filteredTarget;
@@ -2097,15 +2134,16 @@ class RobotActuator {
         // Application avec limite de vitesse et scaling de sécurité
         const maxStep = this.speed * movementScale;
         this.currentValue += Math.max(-maxStep, Math.min(maxStep, pidOutput));
-        this.currentValue = Math.max(this.min, Math.min(this.max, this.currentValue));
-        this.ikTarget = null; // Reset pour le prochain cycle
+        this.currentValue = Math.max(this.min, Math.min(this.max, this.currentValue)); // Clamp final value
+        this.ikTarget = null; // Reset temporary IK target for next frame
+        this.directJointCommand = null; // Reset direct command for next frame
 
         return this.currentValue;
     }
 }
 
 // --- Gestionnaire de Cibles Multi-Groupes ---
-class KinematicHub {
+export class KinematicHub {
     constructor() {
         this.activeStates = new Map(); // GroupName -> État complet actuel {orientation, position, values}
         this.stateLibraries = new Map(); // GroupName -> État[]
@@ -2161,19 +2199,22 @@ class KinematicHub {
  * Représente un maillon (link) dans la chaîne cinématique du robot.
  * Un maillon est défini par son joint et sa transformation par rapport à son parent.
  */
-class Link {
-    constructor(name, parentName, offset, orientationOffset, jointType, jointAxis) {
+export class Link {
+    constructor(name, parentName, offset, orientationOffset, jointType, jointAxis, primitive = null) {
         this.name = name;
         this.parentName = parentName; // Nom du maillon parent ('base' pour le premier)
         this.offset = new Vector3(...offset); // Translation de l'origine du parent à l'origine de ce joint
         this.orientationOffset = new Quaternion(...orientationOffset); // Orientation fixe par rapport au parent
         this.jointType = jointType; // 'revolute' ou 'prismatic'
         this.jointAxis = new Vector3(...jointAxis).normalize(); // Axe de rotation/translation du joint
+        this.primitive = primitive; // Données géométriques
 
         this.currentJointValue = 0; // Valeur actuelle du joint (angle en degrés, longueur en mm)
         this.currentRotation = new Quaternion(); // Rotation locale du joint (par rapport à son état neutre)
         this.currentPosition = new Vector3(); // Position de l'origine de ce joint dans le repère monde
         this.currentWorldRotation = new Quaternion(); // Orientation de ce joint dans le repère monde
+        this.localBox = null; // Box locale
+        this.worldAABB = null; // Box calculée dans le monde après FK
     }
 
     // Calcule la transformation locale en réutilisant les objets out
@@ -2197,7 +2238,7 @@ class Link {
 /**
  * Gère la chaîne cinématique du robot et calcule la cinématique directe (FK).
  */
-class KinematicChain {
+export class KinematicChain {
     constructor(baseOffset = [0, 0, 0], baseRotation = [1, 0, 0, 0]) {
         this.links = new Map(); // Map<string, Link> pour un accès rapide par nom
         this.baseOffset = new Vector3(...baseOffset); // Position de la base du robot dans le monde
@@ -2249,7 +2290,8 @@ class KinematicChain {
                 actConfig.offset,
                 rotOffset,
                 actConfig.kinematics.type,
-                actConfig.kinematics.axis
+                actConfig.kinematics.axis,
+                actConfig.primitive || null
             );
             this.addLink(link);
         });
@@ -2304,6 +2346,15 @@ class KinematicChain {
             pRot.multiply(link.orientationOffset, this._tempWorldBaseRot);
             this._tempWorldBaseRot.multiply(this._tempRot, link.currentWorldRotation).normalize();
             
+            // Mise à jour intelligente de l'AABB Monde pour la détection de collision
+            if (link.localBox) {
+                link.worldAABB = MeshAwarenessUtils.getTransformedAABB(
+                    link.localBox, 
+                    link.currentPosition, 
+                    link.currentWorldRotation
+                );
+            }
+
             link.currentJointValue = jointValue;
         }
 
@@ -2311,6 +2362,26 @@ class KinematicChain {
         return endEffectorLink ? 
             { position: endEffectorLink.currentPosition, orientation: endEffectorLink.currentWorldRotation } : 
             { position: new Vector3(), orientation: new Quaternion() };
+    }
+
+    /**
+     * Vérifie les auto-collisions entre tous les maillons.
+     * Exclut les paires parent-enfant directes (qui se touchent toujours).
+     */
+    checkSelfCollision() {
+        const collisions = [];
+        const linkArray = Array.from(this.links.values());
+        for (let i = 0; i < linkArray.length; i++) {
+            for (let j = i + 2; j < linkArray.length; j++) { // i+2 évite le parent direct
+                const a = linkArray[i], b = linkArray[j];
+                if (a.worldAABB && b.worldAABB) {
+                    if (MeshAwarenessUtils.intersects(a.worldAABB, b.worldAABB)) {
+                        collisions.push({ a: a.name, b: b.name });
+                    }
+                }
+            }
+        }
+        return collisions;
     }
 
     /**
@@ -2372,7 +2443,7 @@ class KinematicChain {
 /**
  * Usine de montage du robot à partir d'une configuration JSON
  */
-class RobotFactory {
+export class RobotFactory {
     static build(config) {
         const hub = new KinematicHub();
         const actuators = [];
@@ -2430,7 +2501,7 @@ class RobotFactory {
  * Échantillonneur Temporel pour l'apprentissage relatif
  * Transforme une séquence d'états absolus en un dataset différentiel
  */
-class TemporalSampler {
+export class TemporalSampler {
     constructor() {
         this.history = [];
     }
@@ -2484,150 +2555,150 @@ class TemporalSampler {
 
 
 // --- Simulation Pilotée par le Fichier Unique ---
-// Note: En production, on ferait require('./robot_config.json')
-const robotConfiguration = require('./robot_config.json'); 
-const { hub, actuators, varMap: robotVarMap, safetyNet: actualSafetyNet, behaviorNet, kinematicChain, sensorMapper } = RobotFactory.build(robotConfiguration);
+// // --- Simulation Pilotée par le Fichier Unique ---
+// // Note: En production, on ferait require('./robot_config.json')
+// const { hub, actuators, varMap: robotVarMap, safetyNet: actualSafetyNet, behaviorNet, kinematicChain, sensorMapper } = RobotFactory.build(robotConfiguration);
 
-// Initialisation de la hauteur du robot (Base à 0.6m pour que les jambes touchent le sol à Z=0)
-kinematicChain.baseOffset.z = 0.6;
+// // Initialisation de la hauteur du robot (Base à 0.6m pour que les jambes touchent le sol à Z=0)
+// kinematicChain.baseOffset.z = 0.6;
 
-// Utilisation d'un set de données sécurisé pour le test de mouvement
-const dynamicSensorData = { temp: 0.1, contact: 0 }; // Simulation : Contact détecté
-const trainingExamples = robotConfiguration.training.examples;
-const meshSensors = trainingExamples[0].input; // On garde le premier pour la simu
+// // Utilisation d'un set de données sécurisé pour le test de mouvement
+// const dynamicSensorData = { temp: 0.1, contact: 0 }; // Simulation : Contact détecté
+// const trainingExamples = robotConfiguration.training.examples;
+// const meshSensors = trainingExamples[0].input; // On garde le premier pour la simu
 
-const sampler = new TemporalSampler();
-const controller = new MeshController(meshSensors.length, actuators.length);
+// const sampler = new TemporalSampler();
+// const controller = new MeshController(meshSensors.length, actuators.length);
 
-console.log("\n--- Phase 1: Apprentissage du Maillage (Adaptation au terrain) ---");
-trainingExamples.forEach(ex => {
-    // Reformage des données d'entraînement pour correspondre à la config matérielle
-    const cleanEx = sensorMapper.reshapeTrainingExample(ex);
-    
-    for (let i = 0; i < 50; i++) {
-        controller.learnBehavior(cleanEx.input, cleanEx.output, 1);
-    }
-});
-controller.addAnchorsFromExamples(trainingExamples, actuators.length);
-console.log("Apprentissage terminé. Le robot a 'intégré' la souplesse du maillage.");
+// console.log("\n--- Phase 1: Apprentissage du Maillage (Adaptation au terrain) ---");
+// trainingExamples.forEach(ex => {
+//     // Reformage des données d'entraînement pour correspondre à la config matérielle
+//     const cleanEx = sensorMapper.reshapeTrainingExample(ex);
 
-console.log("\n--- PHASE 2 : TEST DE MANIPULATION & RÉSILIENCE (Épaule) ---");
-for (let i = 0; i < 15; i++) {
-    runStep(i, new Vector3(0.25, 0.05, 0.45), (a) => (a.name === "Servo_Epaule" && i >= 5 && i <= 10) ? 25 : 2);
-}
+//     for (let i = 0; i < 50; i++) {
+//         controller.learnBehavior(cleanEx.input, cleanEx.output, 1);
+//     }
+// });
+// controller.addAnchorsFromExamples(trainingExamples, actuators.length);
+// console.log("Apprentissage terminé. Le robot a 'intégré' la souplesse du maillage.");
 
-console.log("\n--- PHASE 3 : TEST DE LOCOMOTION (Marche vers Cible 2m) ---");
-for (let i = 15; i < 40; i++) {
-    runStep(i, new Vector3(2.0, 0, 0), () => 2); // Pas de blocage anormal pendant la marche
-}
+// console.log("\n--- PHASE 2 : TEST DE MANIPULATION & RÉSILIENCE (Épaule) ---");
+// for (let i = 0; i < 15; i++) {
+//     runStep(i, new Vector3(0.25, 0.05, 0.45), (a) => (a.name === "Servo_Epaule" && i >= 5 && i <= 10) ? 25 : 2);
+// }
 
-/**
- * Exécute un pas de simulation complet
- */
-function runStep(i, targetXYZ, loadSimFn) {
-    const decisionInputs = new Uint8Array(Object.keys(robotVarMap).length);
-    if (robotVarMap.temp_high !== undefined) decisionInputs[robotVarMap.temp_high] = dynamicSensorData.temp > 0.8 ? 1 : 0;
-    if (robotVarMap.contact !== undefined) decisionInputs[robotVarMap.contact] = dynamicSensorData.contact;
-    if (robotVarMap.fire_detected !== undefined) decisionInputs[robotVarMap.fire_detected] = i > 38 ? 1 : 0;
-    if (robotVarMap.step_phase !== undefined) decisionInputs[robotVarMap.step_phase] = i % 10 < 5 ? 1 : 0;
+// console.log("\n--- PHASE 3 : TEST DE LOCOMOTION (Marche vers Cible 2m) ---");
+// for (let i = 15; i < 40; i++) {
+//     runStep(i, new Vector3(2.0, 0, 0), () => 2); // Pas de blocage anormal pendant la marche
+// }
 
-    // 1. Simulation d'un cycle de marche sur les capteurs de pression (Gauche/Droite)
-    const gaitSync = Math.sin(i * 0.6); 
-    const rawHardwareReadings = {
-        "p_top_l": 0.5 + gaitSync * 0.45,
-        "p_top_r": 0.5 - gaitSync * 0.45,
-        "p_bot_l": 0.5 + gaitSync * 0.45,
-        "p_bot_r": 0.5 - gaitSync * 0.45
-    };
-    const liveSensors = sensorMapper.format(rawHardwareReadings);
+// /**
+//  * Exécute un pas de simulation complet
+//  */
+// function runStep(i, targetXYZ, loadSimFn) {
+//     const decisionInputs = new Uint8Array(Object.keys(robotVarMap).length);
+//     if (robotVarMap.temp_high !== undefined) decisionInputs[robotVarMap.temp_high] = dynamicSensorData.temp > 0.8 ? 1 : 0;
+//     if (robotVarMap.contact !== undefined) decisionInputs[robotVarMap.contact] = dynamicSensorData.contact;
+//     if (robotVarMap.fire_detected !== undefined) decisionInputs[robotVarMap.fire_detected] = i > 38 ? 1 : 0;
+//     if (robotVarMap.step_phase !== undefined) decisionInputs[robotVarMap.step_phase] = i % 10 < 5 ? 1 : 0;
 
-    // 2. Calculs du Cerveau (MeshController pour les jambes + Behavior)
-    const meshCommands = controller.compute(liveSensors);
-    const behaviorBits = behaviorNet.predict(decisionInputs);
-    const learnedInfluence = DataWrapper.bitsToAnalog(behaviorBits, 0, 1);
+//     // 1. Simulation d'un cycle de marche sur les capteurs de pression (Gauche/Droite)
+//     const gaitSync = Math.sin(i * 0.6);
+//     const rawHardwareReadings = {
+//         "p_top_l": 0.5 + gaitSync * 0.45,
+//         "p_top_r": 0.5 - gaitSync * 0.45,
+//         "p_bot_l": 0.5 + gaitSync * 0.45,
+//         "p_bot_r": 0.5 - gaitSync * 0.45
+//     };
+//     const liveSensors = sensorMapper.format(rawHardwareReadings);
 
-    // 3. Logique de Locomotion (Translation de la base)
-    const distBaseToTarget = kinematicChain.baseOffset.distanceTo(targetXYZ);
-    
-    // On ne marche que si on n'est pas en train d'éteindre un feu (Behavior bit 1)
-    const isExtinguishing = behaviorBits[1] === 1;
+//     // 2. Calculs du Cerveau (MeshController pour les jambes + Behavior)
+//     const meshCommands = controller.compute(liveSensors);
+//     const behaviorBits = behaviorNet.predict(decisionInputs);
+//     const learnedInfluence = DataWrapper.bitsToAnalog(behaviorBits, 0, 1);
 
-    if (distBaseToTarget > 0.1 && !isExtinguishing) {
-        // Locomotion planaire : on ignore la composante Z pour la direction de marche
-        const basePos = kinematicChain.baseOffset;
-        const moveDir = new Vector3(targetXYZ.x - basePos.x, targetXYZ.y - basePos.y, 0).normalize();
-        kinematicChain.moveBase(moveDir.scale(0.7), 0.02); // Vitesse augmentée à 0.7m/s
-    }
+//     // 3. Logique de Locomotion (Translation de la base)
+//     const distBaseToTarget = kinematicChain.baseOffset.distanceTo(targetXYZ);
 
-    // 4. Application des États du Hub (IK & Valeurs en dur)
-    const actuatorMap = new Map(actuators.map(a => [a.name, a]));
-    
-    // On parcourt les groupes pour appliquer les positions de translation ou valeurs forcées
-    for (const [groupName, state] of hub.activeStates) {
-        // Si l'état définit une position cible (pos), on écrase le targetXYZ pour ce groupe
-        const effectiveTarget = state.position || targetXYZ;
-        
-        // Gestion des valeurs en dur (values: { "Recul_Canon": 0.08 })
-        if (state.values) {
-            for (const [actName, val] of Object.entries(state.values)) {
-                if (actuatorMap.has(actName)) actuatorMap.get(actName).ikTarget = val;
-            }
-        }
+//     // On ne marche que si on n'est pas en train d'éteindre un feu (Behavior bit 1)
+//     const isExtinguishing = behaviorBits[1] === 1;
 
-        kinematicChain.solveIK(effectiveTarget, actuatorMap, [groupName], 5, 0.5);
-    }
+//     if (distBaseToTarget > 0.1 && !isExtinguishing) {
+//         // Locomotion planaire : on ignore la composante Z pour la direction de marche
+//         const basePos = kinematicChain.baseOffset;
+//         const moveDir = new Vector3(targetXYZ.x - basePos.x, targetXYZ.y - basePos.y, 0).normalize();
+//         kinematicChain.moveBase(moveDir.scale(0.7), 0.02); // Vitesse augmentée à 0.7m/s
+//     }
 
-    // 5. Mise à jour physique des actuateurs
-    const currentJointValues = new Map();
-    actuators.forEach((a, idx) => {
-        const load = loadSimFn(a);
-        
-        // Apprentissage spécifique : on injecte la commande du Mesh pour les jambes
-        let learnedTarget = learnedInfluence * a.max;
-        if (a.group === "jambes") {
-            learnedTarget = meshCommands[idx]; // Commande réflexe apprise
-        }
+//     // 4. Application des États du Hub (IK & Valeurs en dur)
+//     const actuatorMap = new Map(actuators.map(a => [a.name, a]));
 
-        // On vérifie la sécurité globale
-        const safetyResult = actualSafetyNet.predict(decisionInputs);
-        const canMove = safetyResult.length === 0 || safetyResult[0] === 1;
+//     // On parcourt les groupes pour appliquer les positions de translation ou valeurs forcées
+//     for (const [groupName, state] of hub.activeStates) {
+//         // Si l'état définit une position cible (pos), on écrase le targetXYZ pour ce groupe
+//         const effectiveTarget = state.position || targetXYZ;
 
-        // Extraction de la pression tactile spécifique à cet actuateur
-        let pressure = 0;
-        if (a.sensorId && sensorMapper.registry.has(a.sensorId)) {
-            pressure = liveSensors[sensorMapper.registry.get(a.sensorId).globalIndex];
-        }
+//         // Gestion des valeurs en dur (values: { "Recul_Canon": 0.08 })
+//         if (state.values) {
+//             for (const [actName, val] of Object.entries(state.values)) {
+//                 if (actuatorMap.has(actName)) actuatorMap.get(actName).ikTarget = val;
+//             }
+//         }
 
-        // On récupère l'orientation cible depuis le hub pour ce groupe
-        const targetOrientation = hub.getTarget(a.group).orientation || new Quaternion();
+//         kinematicChain.solveIK(effectiveTarget, actuatorMap, [groupName], 5, 0.5);
+//     }
 
-        a.update(decisionInputs, targetOrientation, load, canMove, learnedTarget, 0.02, pressure);
-        
-        const link = kinematicChain.links.get(a.name);
-        if (link) link.currentJointValue = a.currentValue;
-        currentJointValues.set(a.name, a.currentValue);
-    });
+//     // 5. Mise à jour physique des actuateurs
+//     const currentJointValues = new Map();
+//     actuators.forEach((a, idx) => {
+//         const load = loadSimFn(a);
 
-    sampler.record(liveSensors, actuators);
+//         // Apprentissage spécifique : on injecte la commande du Mesh pour les jambes
+//         let learnedTarget = learnedInfluence * a.max;
+//         if (a.group === "jambes") {
+//             learnedTarget = meshCommands[idx]; // Commande réflexe apprise
+//         }
 
-    // 6. Kinématique Directe (FK) pour le log
-    const { position: eePos } = kinematicChain.calculateFK(currentJointValues);
-    const distEE = eePos.distanceTo(targetXYZ);
-    
-    let log = `[${i.toString().padStart(2, '0')}] Base: [${kinematicChain.baseOffset.x.toFixed(2)},${kinematicChain.baseOffset.y.toFixed(2)}] `;
-    log += `| Jambes: ${actuators.filter(a=>a.group==='jambes').map(a=>a.currentValue.toFixed(0)).join('/')} `;
-    log += `| Bras: ${actuators.filter(a=>a.group==='bras').map(a=>a.currentValue.toFixed(0)).join('/')} `;
-    log += `| Err EE: ${(distEE*100).toFixed(1)}cm`;
-    if (actuators[4].isCompliant) log += " | ! STALL !"; // Servo_Epaule index 4
-    console.log(log);
-}
+//         // On vérifie la sécurité globale
+//         const safetyResult = actualSafetyNet.predict(decisionInputs);
+//         const canMove = safetyResult.length === 0 || safetyResult[0] === 1;
 
-// --- Phase 2: Génération du Dataset Relatif ---
-const relativeData = sampler.generateRelativeDataset();
-console.log("\n--- Phase 2: Dataset Relatif Généré ---");
-console.log(`Nombre d'échantillons temporels : ${relativeData.length}`);
-if (relativeData.length > 0) {
-    console.log("Exemple de Delta (Étape 0 -> 1) pour le premier actuateur :");
-    console.log(`  Input Sensors: [${relativeData[0].input.map(s => s.toFixed(2))}]`);
-    console.log(`  Delta Actuators: ${relativeData[0].deltaOutput[0].toFixed(4)}`);
-}
+//         // Extraction de la pression tactile spécifique à cet actuateur
+//         let pressure = 0;
+//         if (a.sensorId && sensorMapper.registry.has(a.sensorId)) {
+//             pressure = liveSensors[sensorMapper.registry.get(a.sensorId).globalIndex];
+//         }
+
+//         // On récupère l'orientation cible depuis le hub pour ce groupe
+//         const targetOrientation = hub.getTarget(a.group).orientation || new Quaternion();
+
+//         a.update(decisionInputs, targetOrientation, load, canMove, learnedTarget, 0.02, pressure);
+
+//         const link = kinematicChain.links.get(a.name);
+//         if (link) link.currentJointValue = a.currentValue;
+//         currentJointValues.set(a.name, a.currentValue);
+//     });
+
+//     sampler.record(liveSensors, actuators);
+
+//     // 6. Kinématique Directe (FK) pour le log
+//     const { position: eePos } = kinematicChain.calculateFK(currentJointValues);
+//     const distEE = eePos.distanceTo(targetXYZ);
+
+//     let log = `[${i.toString().padStart(2, '0')}] Base: [${kinematicChain.baseOffset.x.toFixed(2)},${kinematicChain.baseOffset.y.toFixed(2)}] `;
+//     log += `| Jambes: ${actuators.filter(a=>a.group==='jambes').map(a=>a.currentValue.toFixed(0)).join('/')} `;
+//     log += `| Bras: ${actuators.filter(a=>a.group==='bras').map(a=>a.currentValue.toFixed(0)).join('/')} `;
+//     log += `| Err EE: ${(distEE*100).toFixed(1)}cm`;
+//     if (actuators[4].isCompliant) log += " | ! STALL !"; // Servo_Epaule index 4
+//     console.log(log);
+// }
+
+// // --- Phase 2: Génération du Dataset Relatif ---
+// const relativeData = sampler.generateRelativeDataset();
+// console.log("\n--- Phase 2: Dataset Relatif Généré ---");
+// console.log(`Nombre d'échantillons temporels : ${relativeData.length}`);
+// if (relativeData.length > 0) {
+//     console.log("Exemple de Delta (Étape 0 -> 1) pour le premier actuateur :");
+//     console.log(`  Input Sensors: [${relativeData[0].input.map(s => s.toFixed(2))}]`);
+//     console.log(`  Delta Actuators: ${relativeData[0].deltaOutput[0].toFixed(4)}`);
+// }

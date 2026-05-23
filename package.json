@@ -9,7 +9,11 @@
   "license": "ISC",
   "description": "",
   "dependencies": {
+    "@gltf-transform/core": "^4.3.0",
+    "@gltf-transform/extensions": "^4.3.0",
     "compromise": "^14.15.0",
-    "natural": "^8.1.1"
+    "express": "^5.2.1",
+    "natural": "^8.1.1",
+    "three": "^0.184.0"
   }
 }

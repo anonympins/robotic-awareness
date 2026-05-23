@@ -1,0 +1,341 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="UTF-8">
+    <title>G-NEURO : Robot Awareness Viewer</title>
+    <style>
+        body { margin: 0; overflow: hidden; background: #050505; color: #0ff; font-family: monospace; }
+        #ui-header { position: absolute; top: 10px; left: 10px; z-index: 10; pointer-events: none; }
+        #robot-view { width: 100vw; height: 100vh; }
+        .status { color: #555; }
+
+        /* Panneau de Contrôles */
+        #control-panel {
+            position: absolute; right: 20px; top: 20px; width: 280px;
+            background: rgba(5, 5, 5, 0.85); border: 1px solid #0ff;
+            padding: 0; z-index: 100; box-shadow: 0 0 15px rgba(0, 255, 255, 0.2);
+        }
+        .tabs { display: flex; border-bottom: 1px solid #0ff; }
+        .tab-btn { 
+            flex: 1; padding: 10px; background: none; border: none; 
+            color: #0ff; cursor: pointer; font-family: monospace; opacity: 0.5;
+        }
+        .tab-btn.active { opacity: 1; background: rgba(0, 255, 255, 0.1); font-weight: bold; }
+        
+        .tab-content { padding: 15px; display: none; }
+        .tab-content.active { display: block; }
+
+        .control-group { margin-bottom: 15px; }
+        label { display: block; font-size: 10px; text-transform: uppercase; margin-bottom: 5px; color: #555; }
+        
+        /* Style des inputs */
+        input[type="range"] { 
+            width: 100%; appearance: none; background: #222; height: 4px; outline: none; 
+        }
+        input[type="range"]::-webkit-slider-thumb {
+            appearance: none; width: 12px; height: 12px; background: #0ff; cursor: pointer;
+            box-shadow: 0 0 5px #0ff;
+        }
+        
+        .value-display { float: right; color: #0ff; font-size: 12px; }
+        .system-info { font-size: 11px; line-height: 1.4; color: #888; }
+        .system-info b { color: #0ff; }
+
+        h1 { font-size: 16px; margin: 0; letter-spacing: 2px; }
+        #status { font-size: 11px; margin-top: 5px; }
+
+        /* Scrollbar neuro-style */
+        ::-webkit-scrollbar { width: 4px; }
+        ::-webkit-scrollbar-thumb { background: #0ff; }
+    </style>
+</head>
+<body>
+    <div id="ui-header">
+        <h1>G-NEURO : AWARENESS_3D</h1>
+        <div id="status">SYS_LINK: <span class="status">Initialisation...</span></div>
+    </div>
+
+    <div id="control-panel">
+        <div class="tabs">
+            <button class="tab-btn active" onclick="openTab(event, 'tab-controls')">Contrôles</button>
+            <button class="tab-btn" onclick="openTab(event, 'tab-system')">Système</button>
+        </div>
+
+        <div id="tab-controls" class="tab-content active">
+            <div class="control-group">
+                <label>Sensibilité Zoom <span id="zoom-val" class="value-display">8.0</span></label>
+                <input type="range" id="zoom-speed" min="5" max="20.0" step="1" value="8.0">
+            </div>
+            <div class="control-group">
+                <label>Rotation Automatique</label>
+                <input type="checkbox" id="auto-rotate" style="accent-color: #0ff;">
+            </div>
+            <div class="control-group" style="border-top: 1px solid #222; padding-top: 10px;">
+                <label>Simulation</label>
+                <button id="sim-toggle" class="tab-btn active" style="border: 1px solid #0ff; margin-bottom: 5px;">▶ LANCER</button>
+                
+                <label>Capteur de Contact <span id="contact-val" class="value-display">0</span></label>
+                <input type="range" id="sensor-contact" min="0" max="1" step="0.1" value="0">
+            </div>
+            <div class="control-group" style="border-top: 1px solid #222; padding-top: 10px;">
+                <label>Postures de Préhension</label>
+                <select id="posture-select" style="width: 100%; background: #111; color: #0ff; border: 1px solid #0ff; font-family: monospace; padding: 5px; cursor: pointer;">
+                    <option value="AUTO">-- MODE AUTO (Capteurs) --</option>
+                </select>
+            </div>
+        </div>
+
+        <div id="tab-system" class="tab-content">
+            <div class="system-info" id="sys-details">
+                Chargement de la configuration...
+            </div>
+        </div>
+    </div>
+
+    <div id="robot-view"></div>
+
+    <script type="importmap">
+        { "imports": { "three": "https://unpkg.com/three@0.160.0/build/three.module.js", 
+                       "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/",
+                       "g-neuro": "/test.js" } }
+    </script>
+    <script type="module">
+        import { GLBViewer } from './viewer.js';
+        import { RobotFactory, Vector3 } from 'g-neuro';
+        
+        // Configuration de secours (Fallback) si le fetch échoue
+        const DEFAULT_CONFIG = {
+            version: "1.0.0-LOCAL",
+            actuators: [
+                { 
+                    name: "base_link", parent: "base", offset: [0, 0, 0], 
+                    primitive: { type: "box", size: [0.2, 0.05, 0.2], color: 0x333333 },
+                    kinematics: { type: "fixed" }
+                },
+                { 
+                    name: "joint_1", parent: "base_link", offset: [0, 0.05, 0], 
+                    primitive: { type: "cylinder", radius: 0.04, height: 0.2, color: 0x00ffff },
+                    kinematics: { type: "revolute", axis: [0, 1, 0] }
+                }
+            ],
+            system_settings: {
+                ik_solver_type: "FABRIK_BASIC",
+                loop_frequency_hz: 50
+            },
+            metadata: {
+                name: "Robot Debug Mode",
+                model_url: null
+            }
+        };
+
+        // Gestion des Onglets
+        window.openTab = (evt, tabId) => {
+            const contents = document.getElementsByClassName("tab-content");
+            for (let c of contents) c.classList.remove("active");
+            const buttons = document.getElementsByClassName("tab-btn");
+            for (let b of buttons) b.classList.remove("active");
+            document.getElementById(tabId).classList.add("active");
+            evt.currentTarget.classList.add("active");
+        }
+
+        let robotInstance = null;
+        let viewer = null;
+        let isRunning = false;
+        let simStep = 0;
+        let graspTimer = 0;
+        const sensorMeshValues = {}; // Stocke la pression par ID (idx_p1, maj_p1, etc.)
+
+        async function start() {
+            const statusEl = document.querySelector('.status');
+            const sysDetails = document.getElementById('sys-details');
+            
+            try {
+                // 1. Charger la config et construire le robot
+                let config;
+                try {
+                    const response = await fetch('/config');
+                    if (!response.ok) throw new Error("Fichier config non trouvé");
+                    config = await response.json();
+                } catch (fetchErr) {
+                    console.warn("[System] Impossible de charger /config, passage en mode fallback local.");
+                    config = DEFAULT_CONFIG;
+                    const warning = document.createElement('div');
+                    warning.style.color = '#ffa500';
+                    warning.style.fontSize = '10px';
+                    warning.innerText = "ATTN: MODE DE SECOURS (CONFIG NON CHARGÉE)";
+                    sysDetails.parentElement.prepend(warning);
+                }
+
+                // Population dynamique du sélecteur de postures
+                const postureSelect = document.getElementById('posture-select');
+                const allTags = new Set();
+                // On récupère tous les tags définis dans la cinématique
+                Object.values(config.kinematics).forEach(group => {
+                    if (group.states) group.states.forEach(s => allTags.add(s.tag));
+                });
+                
+                // Tri et ajout des options (en ignorant les états de base pour la lisibilité)
+                [...allTags].sort().forEach(tag => {
+                    if (tag !== "OPEN" && tag !== "REST") {
+                        const opt = document.createElement('option');
+                        opt.value = tag;
+                        opt.textContent = tag.replace('_', ' ');
+                        postureSelect.appendChild(opt);
+                    }
+                });
+
+                // Affichage infos système
+                sysDetails.innerHTML = `
+                    VERSION: <b>${config.version}</b><br>
+                    NODES: <b>${config.actuators.length}</b><br>
+                    SOLVER: <b>${config.system_settings.ik_solver_type}</b><br>
+                    FREQ: <b>${config.system_settings.loop_frequency_hz} Hz</b>
+                `;
+
+                // 2. Initialiser le viewer et l'usine G-NEURO
+                viewer = new GLBViewer('robot-view');
+                await viewer.initRobot(config);
+                
+                robotInstance = RobotFactory.build(config);
+
+                // 3. Liaison des contrôles UI
+                const zoomSlider = document.getElementById('zoom-speed');
+                const zoomVal = document.getElementById('zoom-val');
+                
+                zoomSlider.addEventListener('input', (e) => {
+                    const val = parseFloat(e.target.value);
+                    viewer.controls.zoomSpeed = val;
+                    zoomVal.textContent = val.toFixed(1);
+                });
+
+                const autoRotateCheck = document.getElementById('auto-rotate');
+                autoRotateCheck.addEventListener('change', (e) => {
+                    viewer.controls.autoRotate = e.target.checked;
+                });
+
+                const simBtn = document.getElementById('sim-toggle');
+                simBtn.onclick = () => {
+                    isRunning = !isRunning;
+                    simBtn.textContent = isRunning ? "⏸ PAUSE" : "▶ RELANCER";
+                    simBtn.style.borderColor = isRunning ? "#f0f" : "#0ff";
+                };
+
+                const contactSlider = document.getElementById('sensor-contact');
+                contactSlider.oninput = (e) => {
+                    const globalPressure = parseFloat(e.target.value);
+                    document.getElementById('contact-val').textContent = globalPressure.toFixed(1);
+                    
+                    // Simulation d'un maillage : on distribue la pression sur tous les IDs connus
+                    if (robotInstance && robotInstance.sensorMapper) {
+                        robotInstance.actuators.forEach(a => {
+                            if (a.sensorId) {
+                                // On simule une légère variation pour le réalisme mécanique
+                                sensorMeshValues[a.sensorId] = globalPressure * (0.8 + Math.random() * 0.4);
+                            }
+                        });
+                    }
+                };
+
+                // Animation immédiate lors du changement de posture
+                postureSelect.onchange = (e) => {
+                    if (!isRunning) simBtn.click(); // Force le démarrage de la simu
+                };
+
+                viewer.controls.zoomSpeed = parseFloat(zoomSlider.value);
+                statusEl.textContent = "ACTIF";
+                statusEl.style.color = "#0f0";
+
+                // 4. Lancer la boucle de simulation
+                simulationLoop();
+
+            } catch (e) {
+                statusEl.textContent = "ERREUR : " + e.message;
+                statusEl.style.color = "#f00";
+                console.error(e);
+            }
+        }
+
+        function simulationLoop() {
+            if (isRunning && robotInstance) {
+                const { actuators, hub, sensorMapper, varMap } = robotInstance;
+                // 1. Calcul de la pression moyenne d'abord
+                const averageContact = Object.values(sensorMeshValues).reduce((a, b) => a + b, 0) / 
+                                     (Object.keys(sensorMeshValues).length || 1);
+
+                // 2. Préparation des entrées binaires pour les réseaux de neurones
+                const inputs = new Uint8Array(varMap ? Object.keys(varMap).length : 0).fill(0);
+                
+                if (varMap) {
+                    if (varMap.contact !== undefined) {
+                        inputs[varMap.contact] = averageContact > 0.4 ? 1 : 0;
+                    }
+                    if (varMap.overpressure !== undefined) {
+                        inputs[varMap.overpressure] = averageContact > 0.8 ? 1 : 0;
+                    }
+                }
+
+                const manualPosture = document.getElementById('posture-select').value;
+
+                // --- PRIORITÉ : POSTURE MANUELLE OU AUTO ---
+                if (manualPosture !== "AUTO") {
+                    graspTimer = 0;
+                    const fingers = ["index", "majeur", "annulaire", "auriculaire"];
+                    fingers.forEach(f => {
+                        if (!hub.selectState(f, manualPosture)) hub.selectState(f, "OPEN");
+                    });
+                    
+                    hub.selectState("pouce", manualPosture === "OPEN" ? "REST" : manualPosture);
+
+                } else {
+                    // --- LOGIQUE AUTOMATIQUE PAR CAPTEUR ---
+                    if (averageContact > 0.4) {
+                        graspTimer++;
+                        const stage = graspTimer > 80 ? "MAX_GRIP" : "GRAB";
+                        
+                        hub.selectState("index", stage);
+                        hub.selectState("majeur", stage);
+                        hub.selectState("annulaire", stage);
+                        hub.selectState("auriculaire", stage);
+                        hub.selectState("pouce", stage === "MAX_GRIP" ? "MAX_GRIP" : "OPPOSITION");
+                    } else {
+                        graspTimer = 0;
+                        hub.selectState("index", "OPEN");
+                        hub.selectState("majeur", "OPEN");
+                        hub.selectState("annulaire", "OPEN");
+                        hub.selectState("auriculaire", "OPEN");
+                        hub.selectState("pouce", "REST");
+                    }
+                }
+
+                // Vérification de la sécurité globale
+                const safetyResult = robotInstance.safetyNet.predict(inputs);
+                const globalCanMove = safetyResult.length === 0 || safetyResult[0] === 1;
+
+                // Mise à jour de chaque actuateur
+                actuators.forEach(a => {
+                    a.directJointCommand = null; // Reset direct command for this frame
+                    a.ikTarget = null;           // Reset IK target for this frame
+                    const state = hub.getTarget(a.group);
+                    
+                    // Si l'état contient des valeurs forcées (comme dans nos tags GRAB)
+                    if (state.values && state.values[a.name] !== undefined) {
+                        a.ikTarget = state.values[a.name];
+                    }
+
+                    const pressure = a.sensorId ? (sensorMeshValues[a.sensorId] || 0) : 0;
+                    a.update(inputs, state.orientation, 0.5, globalCanMove, null, 0.02, pressure);
+                });
+
+                // Mise à jour du viewer 3D
+                viewer.updateJoints(actuators);
+                viewer.updateSensors(sensorMeshValues); // Visualisation du maillage
+                
+                simStep++;
+            }
+            requestAnimationFrame(simulationLoop);
+        }
+
+        start();
+    </script>
+</body>
+</html>

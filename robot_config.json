@@ -27,8 +27,14 @@
         { "id": "maj_p1", "pin": "A3", "label": "Majeur P1" },
         { "id": "maj_p2", "pin": "A4", "label": "Majeur P2" },
         { "id": "maj_p3", "pin": "A5", "label": "Majeur P3" },
-        { "id": "pouce_prox", "pin": "A6", "label": "Pouce Proximal" },
-        { "id": "pouce_dist", "pin": "A5", "label": "Pouce Distal" }
+        { "id": "ann_p1", "pin": "A6", "label": "Annulaire P1" },
+        { "id": "ann_p2", "pin": "A7", "label": "Annulaire P2" },
+        { "id": "ann_p3", "pin": "A8", "label": "Annulaire P3" },
+        { "id": "aur_p1", "pin": "A9", "label": "Auriculaire P1" },
+        { "id": "aur_p2", "pin": "A10", "label": "Auriculaire P2" },
+        { "id": "aur_p3", "pin": "A11", "label": "Auriculaire P3" },
+        { "id": "pouce_p1", "pin": "A12", "label": "Pouce P1" },
+        { "id": "pouce_p2", "pin": "A13", "label": "Pouce P2" }
       ]
     },
     "torque_wrist": { "type": "analog", "pin": "A6", "label": "Torque Poignet" }
@@ -55,15 +61,58 @@
     },
     "index": {
       "states": [
-        {"tag": "OPEN", "euler": [0, 0, 0]},
+        {"tag": "OPEN", "euler": [0, 0, 0], "values": { "Index_P1": 0, "Index_P2": 0, "Index_P3": 0 }},
         {"tag": "POINT", "pos": [0.1, 0, 0], "euler": [0, 0, 0]},
-        {"tag": "GRAB", "values": { "Index_P1": 70, "Index_P2": 85 }}
+        {"tag": "GRAB", "values": { "Index_P1": 60, "Index_P2": 70, "Index_P3": 45 }},
+        {"tag": "MAX_GRIP", "values": { "Index_P1": 90, "Index_P2": 110, "Index_P3": 90 }},
+        {"tag": "CYLINDER_GRIP", "values": { "Index_P1": 45, "Index_P2": 50, "Index_P3": 30 }},
+        {"tag": "PINCH_PRECISION", "values": { "Index_P1": 40, "Index_P2": 80, "Index_P3": 40 }},
+        {"tag": "SPHERICAL_GRIP", "values": { "Index_P1": 30, "Index_P2": 30, "Index_P3": 30 }},
+        {"tag": "HOOK_GRIP", "values": { "Index_P1": 0, "Index_P2": 90, "Index_P3": 90 }}
+      ]
+    },
+    "majeur": {
+      "states": [
+        {"tag": "OPEN", "euler": [0, 0, 0], "values": { "Majeur_P1": 0, "Majeur_P2": 0, "Majeur_P3": 0 }},
+        {"tag": "GRAB", "values": { "Majeur_P1": 60, "Majeur_P2": 70, "Majeur_P3": 45 }},
+        {"tag": "MAX_GRIP", "values": { "Majeur_P1": 90, "Majeur_P2": 110, "Majeur_P3": 90 }},
+        {"tag": "CYLINDER_GRIP", "values": { "Majeur_P1": 50, "Majeur_P2": 55, "Majeur_P3": 35 }},
+        {"tag": "PINCH_PRECISION", "values": { "Majeur_P1": 0, "Majeur_P2": 0, "Majeur_P3": 0 }},
+        {"tag": "SPHERICAL_GRIP", "values": { "Majeur_P1": 35, "Majeur_P2": 35, "Majeur_P3": 35 }},
+        {"tag": "HOOK_GRIP", "values": { "Majeur_P1": 0, "Majeur_P2": 95, "Majeur_P3": 95 }}
+      ]
+    },
+    "annulaire": {
+      "states": [
+        {"tag": "OPEN", "euler": [0, 0, 0], "values": { "Annulaire_P1": 0, "Annulaire_P2": 0, "Annulaire_P3": 0 }},
+        {"tag": "GRAB", "values": { "Annulaire_P1": 60, "Annulaire_P2": 70, "Annulaire_P3": 45 }},
+        {"tag": "MAX_GRIP", "values": { "Annulaire_P1": 90, "Annulaire_P2": 100, "Annulaire_P3": 90 }},
+        {"tag": "CYLINDER_GRIP", "values": { "Annulaire_P1": 55, "Annulaire_P2": 60, "Annulaire_P3": 40 }},
+        {"tag": "PINCH_PRECISION", "values": { "Annulaire_P1": 0, "Annulaire_P2": 0, "Annulaire_P3": 0 }},
+        {"tag": "SPHERICAL_GRIP", "values": { "Annulaire_P1": 40, "Annulaire_P2": 40, "Annulaire_P3": 40 }},
+        {"tag": "HOOK_GRIP", "values": { "Annulaire_P1": 0, "Annulaire_P2": 100, "Annulaire_P3": 100 }}
+      ]
+    },
+    "auriculaire": {
+      "states": [
+        {"tag": "OPEN", "euler": [0, 0, 0], "values": { "Auriculaire_P1": 0, "Auriculaire_P2": 0, "Auriculaire_P3": 0 }},
+        {"tag": "GRAB", "values": { "Auriculaire_P1": 60, "Auriculaire_P2": 70, "Auriculaire_P3": 45 }},
+        {"tag": "MAX_GRIP", "values": { "Auriculaire_P1": 90, "Auriculaire_P2": 90, "Auriculaire_P3": 90 }},
+        {"tag": "CYLINDER_GRIP", "values": { "Auriculaire_P1": 60, "Auriculaire_P2": 65, "Auriculaire_P3": 45 }},
+        {"tag": "PINCH_PRECISION", "values": { "Auriculaire_P1": 0, "Auriculaire_P2": 0, "Auriculaire_P3": 0 }},
+        {"tag": "SPHERICAL_GRIP", "values": { "Auriculaire_P1": 45, "Auriculaire_P2": 45, "Auriculaire_P3": 45 }},
+        {"tag": "HOOK_GRIP", "values": { "Auriculaire_P1": 0, "Auriculaire_P2": 100, "Auriculaire_P3": 100 }}
       ]
     },
     "pouce": {
       "states": [
-        {"tag": "REST", "euler": [0, 0, 0]},
-        {"tag": "OPPOSITION", "pos": [0.05, 0.05, 0], "euler": [45, 0, 0]}
+        {"tag": "REST", "euler": [0, 0, 0], "values": { "Pouce_P1": 0, "Pouce_P2": 0 }},
+        {"tag": "OPPOSITION", "euler": [45, 0, 0], "values": { "Pouce_Rot": 45, "Pouce_P1": 20, "Pouce_P2": 10 }},
+        {"tag": "MAX_GRIP", "values": { "Pouce_P1": 90, "Pouce_P2": 90 }},
+        {"tag": "CYLINDER_GRIP", "values": { "Pouce_Rot": 60, "Pouce_P1": 40, "Pouce_P2": 30 }},
+        {"tag": "PINCH_PRECISION", "values": { "Pouce_Rot": 70, "Pouce_P1": 50, "Pouce_P2": 45 }},
+        {"tag": "SPHERICAL_GRIP", "values": { "Pouce_Rot": 45, "Pouce_P1": 30, "Pouce_P2": 30 }},
+        {"tag": "HOOK_GRIP", "values": { "Pouce_Rot": 0, "Pouce_P1": 0, "Pouce_P2": 80 }}
       ]
     }
   },
@@ -73,15 +122,20 @@
       "group": "main_base",
       "parent": "base",
       "offset": [0, 0, 0],
-      "kinematics": { "type": "revolute", "axis": [1, 0, 0] },
-      "config": { "min": -90, "max": 90, "speed": 0.5 }
+      "kinematics": { "type": "revolute", "axis": [0, 0, 1] },
+      "primitive": { "type": "box", "size": [0.05, 0.05, 0.05], "color": "#00ffff" },
+      "config": { 
+        "min": -90, "max": 90, "speed": 0.5,
+        "safety_rules": [{ "condition": { "var": "contact" }, "action": "HALT", "severity": "HIGH" }]
+      }
     },
     {
       "name": "Index_P1",
       "group": "index",
       "parent": "Poignet",
       "offset": [0.02, 0.05, 0],
-      "kinematics": { "type": "revolute", "axis": [0, 1, 0] },
+      "kinematics": { "type": "revolute", "axis": [1, 0, 0] },
+      "primitive": { "type": "pyramid", "radius": 0.01, "height": 0.04, "color": "#ff00ff" },
       "config": { "min": 0, "max": 90, "speed": 1.2, "proprioceptionRatio": 1.0, "sensorId": "idx_p1" }
     },
     {
@@ -89,7 +143,13 @@
       "group": "index",
       "parent": "Index_P1",
       "offset": [0, 0.04, 0],
-      "kinematics": { "type": "revolute", "axis": [0, 1, 0] },
+      "kinematics": { "type": "revolute", "axis": [1, 0, 0] },
+      "primitive": { 
+        "type": "tube", 
+        "path": [[0,0,0], [0,0.02,0.01], [0,0.04,0]], 
+        "radius": 0.005, 
+        "color": "#ffff00" 
+      },
       "config": { "min": 0, "max": 110, "speed": 1.5, "proprioceptionRatio": 1.0, "sensorId": "idx_p2" }
     },
     {
@@ -97,46 +157,155 @@
       "group": "index",
       "parent": "Index_P2",
       "offset": [0, 0.03, 0],
-      "kinematics": { "type": "revolute", "axis": [0, 1, 0] },
+      "kinematics": { "type": "revolute", "axis": [1, 0, 0] },
+      "primitive": {
+        "type": "cylinder",
+        "radiusTop": 0.004,
+        "radiusBottom": 0.006,
+        "height": 0.03,
+        "color": "#00ff00"
+      },
       "config": { "min": 0, "max": 90, "speed": 1.8, "proprioceptionRatio": 1.0, "sensorId": "idx_p3" }
     },
     {
       "name": "Majeur_P1",
       "group": "majeur",
       "parent": "Poignet",
-      "offset": [0, 0.05, 0],
-      "kinematics": { "type": "revolute", "axis": [0, 1, 0] },
-      "config": { "min": 0, "max": 90, "speed": 1.2, "proprioceptionRatio": 1.0 }
+      "offset": [0, 0.05, 0.02],
+      "kinematics": { "type": "revolute", "axis": [1, 0, 0] },
+      "primitive": {
+        "type": "cylinder",
+        "radius": 0.008,
+        "height": 0.04,
+        "color": "#ff8800"
+      },
+      "config": { "min": 0, "max": 90, "speed": 1.2, "proprioceptionRatio": 1.0, "sensorId": "maj_p1" }
     },
     {
       "name": "Majeur_P2",
       "group": "majeur",
       "parent": "Majeur_P1",
-      "offset": [0, 0.045, 0],
-      "kinematics": { "type": "revolute", "axis": [0, 1, 0] },
-      "config": { "min": 0, "max": 110, "speed": 1.5, "proprioceptionRatio": 1.0 }
+      "offset": [0, 0.045, 0], 
+      "kinematics": { "type": "revolute", "axis": [1, 0, 0] },
+      "primitive": {
+        "type": "tube",
+        "path": [[0,0,0], [0,0.02,0.01], [0,0.04,0]],
+        "radius": 0.004,
+        "color": "#8800ff"
+      },
+      "config": { "min": 0, "max": 110, "speed": 1.5, "proprioceptionRatio": 1.0, "sensorId": "maj_p2" }
+    },
+    {
+      "name": "Majeur_P3",
+      "group": "majeur",
+      "parent": "Majeur_P2",
+      "offset": [0, 0.04, 0],
+      "kinematics": { "type": "revolute", "axis": [1, 0, 0] },
+      "primitive": { "type": "cylinder", "radius": 0.003, "height": 0.03, "color": "#ffaa00" },
+      "config": { "min": 0, "max": 90, "speed": 1.8, "proprioceptionRatio": 1.0, "sensorId": "maj_p3" }
+    },
+    {
+      "name": "Annulaire_P1",
+      "group": "annulaire",
+      "parent": "Poignet",
+      "offset": [-0.015, 0.05, 0.035],
+      "kinematics": { "type": "revolute", "axis": [1, 0, 0] },
+      "primitive": { "type": "cylinder", "radius": 0.007, "height": 0.038, "color": "#00bbff" },
+      "config": { "min": 0, "max": 90, "speed": 1.2, "sensorId": "ann_p1" }
+    },
+    {
+      "name": "Annulaire_P2",
+      "group": "annulaire",
+      "parent": "Annulaire_P1",
+      "offset": [0, 0.04, 0],
+      "kinematics": { "type": "revolute", "axis": [1, 0, 0] },
+      "primitive": { "type": "cylinder", "radius": 0.006, "height": 0.035, "color": "#0099ff" },
+      "config": { "min": 0, "max": 100, "speed": 1.4, "sensorId": "ann_p2" }
+    },
+    {
+      "name": "Annulaire_P3",
+      "group": "annulaire",
+      "parent": "Annulaire_P2",
+      "offset": [0, 0.035, 0],
+      "kinematics": { "type": "revolute", "axis": [1, 0, 0] },
+      "primitive": { "type": "cylinder", "radius": 0.005, "height": 0.03, "color": "#0077ff" },
+      "config": { "min": 0, "max": 90, "speed": 1.6, "sensorId": "ann_p3" }
+    },
+    {
+      "name": "Auriculaire_P1",
+      "group": "auriculaire",
+      "parent": "Poignet",
+      "offset": [-0.025, 0.045, 0.05],
+      "kinematics": { "type": "revolute", "axis": [1, 0, 0] },
+      "primitive": { "type": "cylinder", "radius": 0.006, "height": 0.03, "color": "#ffffff" },
+      "config": { "min": 0, "max": 90, "speed": 1.1, "sensorId": "aur_p1" }
+    },
+    {
+      "name": "Auriculaire_P2",
+      "group": "auriculaire",
+      "parent": "Auriculaire_P1",
+      "offset": [0, 0.035, 0],
+      "kinematics": { "type": "revolute", "axis": [1, 0, 0] },
+      "primitive": { "type": "cylinder", "radius": 0.005, "height": 0.025, "color": "#cccccc" },
+      "config": { "min": 0, "max": 90, "speed": 1.3, "sensorId": "aur_p2" }
+    },
+    {
+      "name": "Auriculaire_P3",
+      "group": "auriculaire",
+      "parent": "Auriculaire_P2",
+      "offset": [0, 0.025, 0],
+      "kinematics": { "type": "revolute", "axis": [1, 0, 0] },
+      "primitive": { "type": "cylinder", "radius": 0.004, "height": 0.02, "color": "#aaaaaa" },
+      "config": { "min": 0, "max": 90, "speed": 1.5, "sensorId": "aur_p3" }
     },
     {
       "name": "Pouce_Rot",
       "group": "pouce",
       "parent": "Poignet",
-      "offset": [-0.03, 0.02, 0],
+      "offset": [-0.03, 0.02, -0.02],
       "kinematics": { "type": "revolute", "axis": [0, 0, 1] },
-      "config": { "min": -30, "max": 60, "speed": 1.0 }
+      "primitive": {
+        "type": "torus",
+        "radius": 0.015,
+        "tube": 0.005,
+        "color": "#ff0000"
+      },
+      "config": { 
+        "min": -30, "max": 60, "speed": 1.0,
+        "safety_rules": [{ "condition": { "var": "contact" }, "action": "HALT", "severity": "HIGH" }]
+      }
     },
     {
       "name": "Pouce_P1",
       "group": "pouce",
       "parent": "Pouce_Rot",
-      "offset": [0, 0.04, 0],
-      "kinematics": { "type": "revolute", "axis": [1, 0, 0] },
-      "config": { "min": 0, "max": 90, "speed": 1.2, "proprioceptionRatio": 1.0 }
+      "offset": [0, 0.04, 0], 
+      "kinematics": { "type": "revolute", "axis": [0, 1, 0] },
+      "primitive": {
+        "type": "cylinder",
+        "radius": 0.01,
+        "height": 0.035,
+        "color": "#0000ff"
+      },
+      "config": { "min": 0, "max": 90, "speed": 1.2, "proprioceptionRatio": 1.0, "sensorId": "pouce_p1" }
+    },
+    {
+      "name": "Pouce_P2",
+      "group": "pouce",
+      "parent": "Pouce_P1",
+      "offset": [0, 0.035, 0],
+      "kinematics": { "type": "revolute", "axis": [0, 1, 0] },
+      "primitive": { "type": "cylinder", "radius": 0.008, "height": 0.03, "color": "#2222ff" },
+      "config": { "min": 0, "max": 90, "speed": 1.4, "sensorId": "pouce_p2" }
     }
   ],
   "training": {
     "examples": [
-      { "label": "Fermeture_Douce", "input": [0.2, 0.2, 0.2, 0.2, 0.2, 0.2], "output": [45, 45, 45, 45, 20, 45] },
-      { "label": "Saisie_Pleine_Main", "input": [0.8, 0.8, 0.8, 0.8, 0.8, 0.8], "output": [80, 90, 80, 90, 45, 80] }
+      { "label": "REPOS", "input": [0,0,0,0,0,0,0,0,0,0,0,0,0,0], "output": [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0] },
+      { "label": "PINCE_FINE", "input": [0.9,0.9,0.9,0,0,0,0,0,0,0,0,0,0.9,0.9], "output": [0, 40,80,40, 0,0,0, 0,0,0, 0,0,0, 70,50,45] },
+      { "label": "SAISIE_BOUTEILLE", "input": [0.6,0.6,0,0.6,0.6,0,0.6,0.6,0,0.6,0.6,0,0.6,0.6], "output": [0, 45,50,30, 50,55,35, 55,60,40, 60,65,45, 60,40,30] },
+      { "label": "PORTE_SAC", "input": [0,0.8,0.8,0,0.8,0.8,0,0.8,0.8,0,0.8,0.8,0,0.8], "output": [0, 0,90,90, 0,95,95, 0,100,100, 0,100,100, 0,0,80] },
+      { "label": "BALLE", "input": [0.4,0.4,0.4,0.4,0.4,0.4,0.4,0.4,0.4,0.4,0.4,0.4,0.4,0.4], "output": [0, 30,30,30, 35,35,35, 40,40,40, 45,45,45, 45,30,30] }
     ]
   }
 }

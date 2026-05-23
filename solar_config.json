@@ -1,0 +1,22 @@
+{
+  "astrophysics": {
+    "sunRadiusKm": 695700,
+    "speedOfLightKms": 299792.458,
+    "radiativeZoneLimit": 0.7,
+    "coreLimit": 0.25,
+    "meanFreePathBaseKm": 0.0000005,
+    "secondsPerYear": 31557600
+  },
+  "simulation": {
+    "mfpScale": 104200.0,
+    "maxSteps": 10000000,
+    "epicenterCount": 100,
+    "logFrequency": 5000,
+    "corruptionChance": 0.00001,
+    "coolingFrequency": 100000
+  },
+  "solarHistory": {
+    "currentAgeYears": 4600000000,
+    "totalLifeYears": 10000000000
+  }
+}
