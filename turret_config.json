@@ -1,0 +1,62 @@
+{
+  "version": "1.0",
+  "metadata": { "name": "Tourelle-Sentinelle" },
+  "variables": {
+    "cible_detectee": 0,
+    "mode_manuel": 1,
+    "munitions_basses": 2
+  },
+  "logic": {
+    "safety_ok": {
+      "type": "AND",
+      "args": [
+        { "type": "NOT", "args": [{ "var": "mode_manuel" }] }
+      ]
+    },
+    "behavior": {
+        "tirer": { "type": "AND", "args": [{ "var": "cible_detectee" }, { "type": "NOT", "args": [{ "var": "munitions_basses" }] }] }
+    }
+  },
+  "actuators": [
+    {
+      "name": "Pivot_Base",
+      "group": "turret",
+      "parent": "base",
+      "offset": [0, 0, 0],
+      "kinematics": { "type": "revolute", "axis": [0, 0, 1] },
+      "config": { "min": -180, "max": 180, "speed": 1.2 }
+    },
+    {
+      "name": "Canon_Elevation",
+      "group": "turret",
+      "parent": "Pivot_Base",
+      "offset": [0, 0, 0.2],
+      "kinematics": { "type": "revolute", "axis": [0, 1, 0] },
+      "config": { "min": -10, "max": 45, "speed": 0.5 }
+    },
+    {
+      "name": "Recul_Canon",
+      "group": "turret",
+      "parent": "Canon_Elevation",
+      "offset": [0, 0, 0],
+      "kinematics": { "type": "prismatic", "axis": [0, -1, 0] },
+      "config": { "min": 0, "max": 0.1, "speed": 2.0 }
+    }
+  ],
+  "kinematics": {
+    "turret": {
+      "states": [
+        {"tag": "SCAN", "euler": [0, 0, 0]},
+        {"tag": "TRACK", "euler": [0, 20, 45], "pos": [0, 0, 0]},
+        {
+          "tag": "RECOIL", 
+          "euler": [0, 20, 45], 
+          "values": { "Recul_Canon": 0.08 }
+        }
+      ]
+    }
+  },
+  "training": {
+    "examples": []
+  }
+}

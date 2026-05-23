@@ -1,0 +1,142 @@
+{
+  "version": "1.0",
+  "metadata": { "name": "Main-Bio-Sensorisee-v1" },
+  "system_settings": {
+    "loop_frequency_hz": 50,
+    "ik_solver_type": "DampedLeastSquares",
+    "ik_precision_threshold": 0.001,
+    "max_ik_iterations": 50
+  },
+  "variables": {
+    "temp_high": 0,
+    "contact": 1,
+    "fire_detected": 2,
+    "is_slippery": 3,
+    "tilt_critical": 4,
+    "object_grasped": 5,
+    "overpressure": 6
+  },
+  "sensors": {
+    "maillage_main": {
+      "type": "analog_array",
+      "resolution": [3, 2],
+      "mapping": [
+        { "id": "idx_p1", "pin": "A0", "label": "Index P1" },
+        { "id": "idx_p2", "pin": "A1", "label": "Index P2" },
+        { "id": "idx_p3", "pin": "A2", "label": "Index P3" },
+        { "id": "maj_p1", "pin": "A3", "label": "Majeur P1" },
+        { "id": "maj_p2", "pin": "A4", "label": "Majeur P2" },
+        { "id": "maj_p3", "pin": "A5", "label": "Majeur P3" },
+        { "id": "pouce_prox", "pin": "A6", "label": "Pouce Proximal" },
+        { "id": "pouce_dist", "pin": "A5", "label": "Pouce Distal" }
+      ]
+    },
+    "torque_wrist": { "type": "analog", "pin": "A6", "label": "Torque Poignet" }
+  },
+  "logic": {
+    "safety_ok": {
+      "type": "AND",
+      "args": [
+        { "type": "NOT", "args": [{ "var": "fire_detected" }] },
+        { "type": "NOT", "args": [{ "var": "overpressure" }] }
+      ]
+    },
+    "behavior": {
+        "bit_0_grasp": { "var": "contact" },
+        "bit_1_release": { "type": "NOT", "args": [{ "var": "contact" }] },
+        "bit_2_emergency_open": { "var": "overpressure" }
+    }
+  },
+  "kinematics": {
+    "workspace_envelope": {
+      "center": [0, 0, 0],
+      "radius_max": 0.2,
+      "radius_min": 0.0
+    },
+    "index": {
+      "states": [
+        {"tag": "OPEN", "euler": [0, 0, 0]},
+        {"tag": "POINT", "pos": [0.1, 0, 0], "euler": [0, 0, 0]},
+        {"tag": "GRAB", "values": { "Index_P1": 70, "Index_P2": 85 }}
+      ]
+    },
+    "pouce": {
+      "states": [
+        {"tag": "REST", "euler": [0, 0, 0]},
+        {"tag": "OPPOSITION", "pos": [0.05, 0.05, 0], "euler": [45, 0, 0]}
+      ]
+    }
+  },
+  "actuators": [
+    {
+      "name": "Poignet",
+      "group": "main_base",
+      "parent": "base",
+      "offset": [0, 0, 0],
+      "kinematics": { "type": "revolute", "axis": [1, 0, 0] },
+      "config": { "min": -90, "max": 90, "speed": 0.5 }
+    },
+    {
+      "name": "Index_P1",
+      "group": "index",
+      "parent": "Poignet",
+      "offset": [0.02, 0.05, 0],
+      "kinematics": { "type": "revolute", "axis": [0, 1, 0] },
+      "config": { "min": 0, "max": 90, "speed": 1.2, "proprioceptionRatio": 1.0, "sensorId": "idx_p1" }
+    },
+    {
+      "name": "Index_P2",
+      "group": "index",
+      "parent": "Index_P1",
+      "offset": [0, 0.04, 0],
+      "kinematics": { "type": "revolute", "axis": [0, 1, 0] },
+      "config": { "min": 0, "max": 110, "speed": 1.5, "proprioceptionRatio": 1.0, "sensorId": "idx_p2" }
+    },
+    {
+      "name": "Index_P3",
+      "group": "index",
+      "parent": "Index_P2",
+      "offset": [0, 0.03, 0],
+      "kinematics": { "type": "revolute", "axis": [0, 1, 0] },
+      "config": { "min": 0, "max": 90, "speed": 1.8, "proprioceptionRatio": 1.0, "sensorId": "idx_p3" }
+    },
+    {
+      "name": "Majeur_P1",
+      "group": "majeur",
+      "parent": "Poignet",
+      "offset": [0, 0.05, 0],
+      "kinematics": { "type": "revolute", "axis": [0, 1, 0] },
+      "config": { "min": 0, "max": 90, "speed": 1.2, "proprioceptionRatio": 1.0 }
+    },
+    {
+      "name": "Majeur_P2",
+      "group": "majeur",
+      "parent": "Majeur_P1",
+      "offset": [0, 0.045, 0],
+      "kinematics": { "type": "revolute", "axis": [0, 1, 0] },
+      "config": { "min": 0, "max": 110, "speed": 1.5, "proprioceptionRatio": 1.0 }
+    },
+    {
+      "name": "Pouce_Rot",
+      "group": "pouce",
+      "parent": "Poignet",
+      "offset": [-0.03, 0.02, 0],
+      "kinematics": { "type": "revolute", "axis": [0, 0, 1] },
+      "config": { "min": -30, "max": 60, "speed": 1.0 }
+    },
+    {
+      "name": "Pouce_P1",
+      "group": "pouce",
+      "parent": "Pouce_Rot",
+      "offset": [0, 0.04, 0],
+      "kinematics": { "type": "revolute", "axis": [1, 0, 0] },
+      "config": { "min": 0, "max": 90, "speed": 1.2, "proprioceptionRatio": 1.0 }
+    }
+  ],
+  "training": {
+    "examples": [
+      { "label": "Fermeture_Douce", "input": [0.2, 0.2, 0.2, 0.2, 0.2, 0.2], "output": [45, 45, 45, 45, 20, 45] },
+      { "label": "Saisie_Pleine_Main", "input": [0.8, 0.8, 0.8, 0.8, 0.8, 0.8], "output": [80, 90, 80, 90, 45, 80] }
+    ]
+  }
+}
