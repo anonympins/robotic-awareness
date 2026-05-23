@@ -2465,8 +2465,10 @@ export class KinematicChain {
                     if (distEE < 0.001 || distTarget < 0.001) continue;
 
                     // Vecteurs Joint->Effecteur et Joint->Cible normalisés
-                    const vEE = currentEE.sub(jointOrigin).normalize();
-                    const vTarget = targetPos.sub(jointOrigin).normalize();
+                    const vEE = currentEE.sub(jointOrigin, this._tempVec).normalize();
+                    // On utilise un second buffer pour ne pas écraser le premier
+                    const vTarget = targetPos.sub(jointOrigin, new Vector3()).normalize(); 
+                    // Note: Idéalement, ajoutez _tempVec2 dans le constructeur de KinematicChain
 
                     // Calcul de l'angle nécessaire (produit scalaire)
                     let dot = vEE.dot(vTarget);

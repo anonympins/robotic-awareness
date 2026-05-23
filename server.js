@@ -19,7 +19,7 @@ app.get('/test.js', (req, res) => {
 
 // Route pour récupérer la config du robot
 app.get('/config', (req, res) => {
-    const configPath = path.join(__dirname, 'robot_config.json');
+    const configPath = path.join(__dirname, 'robot_config-imported.json');
     if (fs.existsSync(configPath)) {
         res.sendFile(configPath);
     } else {

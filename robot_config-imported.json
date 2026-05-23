@@ -1,0 +1,2046 @@
+{
+  "version": "1.2",
+  "metadata": {
+    "name": "Deep-Extracted-Rigged Hand.fbx",
+    "extracted_at": "2026-05-23T22:46:13.071Z",
+    "model_url": "models/Rigged Hand.glb"
+  },
+  "system_settings": {
+    "loop_frequency_hz": 50,
+    "ik_solver_type": "CCD"
+  },
+  "variables": {
+    "state_point": 0,
+    "state_hemi": 1,
+    "state_armature": 2,
+    "state_ribs_001": 3,
+    "state_shoulder_l": 4,
+    "state_upper_arm_l": 5,
+    "state_forearm_l": 6,
+    "state_hand_l": 7,
+    "state_palm_02_l_001": 8,
+    "state_palm_02_l": 9,
+    "state_finger_middle_01_l": 10,
+    "state_finger_middle_02_l": 11,
+    "state_finger_middle_03_l": 12,
+    "state_palm_03_l_001": 13,
+    "state_palm_03_l": 14,
+    "state_finger_ring_01_l": 15,
+    "state_finger_ring_02_l": 16,
+    "state_finger_ring_03_l": 17,
+    "state_palm_04_l_001": 18,
+    "state_palm_04_l": 19,
+    "state_finger_pinky_01_l": 20,
+    "state_finger_pinky_02_l": 21,
+    "state_finger_pinky_03_l": 22,
+    "state_palm_01_l_001": 23,
+    "state_palm_01_l": 24,
+    "state_finger_index_01_l": 25,
+    "state_finger_index_02_l": 26,
+    "state_finger_index_03_l": 27,
+    "state_thumb_01_l_001": 28,
+    "state_thumb_01_l": 29,
+    "state_thumb_02_l": 30,
+    "state_thumb_03_l": 31,
+    "state_forearm_l_003": 32,
+    "state_shoulder_r": 33,
+    "state_upper_arm_r": 34,
+    "state_forearm_r": 35,
+    "state_hand_r": 36,
+    "state_palm_01_r_001": 37,
+    "state_palm_01_r": 38,
+    "state_finger_index_01_r": 39,
+    "state_finger_index_02_r": 40,
+    "state_finger_index_03_r": 41,
+    "state_thumb_01_r_001": 42,
+    "state_thumb_01_r": 43,
+    "state_thumb_02_r": 44,
+    "state_thumb_03_r": 45,
+    "state_palm_02_r_001": 46,
+    "state_palm_02_r": 47,
+    "state_finger_middle_01_r": 48,
+    "state_finger_middle_02_r": 49,
+    "state_finger_middle_03_r": 50,
+    "state_palm_03_r_001": 51,
+    "state_palm_03_r": 52,
+    "state_finger_ring_01_r": 53,
+    "state_finger_ring_02_r": 54,
+    "state_finger_ring_03_r": 55,
+    "state_palm_04_r_001": 56,
+    "state_palm_04_r": 57,
+    "state_finger_pinky_01_r": 58,
+    "state_finger_pinky_02_r": 59,
+    "state_finger_pinky_03_r": 60,
+    "state_forearm_r_003": 61,
+    "state_cube_000": 62,
+    "state_cube_005": 63
+  },
+  "sensors": {
+    "tips_l": {
+      "type": "analog_array",
+      "mapping": [
+        { "id": "tip_thumb_l", "pin": "A0", "label": "Bout Pouce G" },
+        { "id": "tip_index_l", "pin": "A1", "label": "Bout Index G" },
+        { "id": "tip_middle_l", "pin": "A2", "label": "Bout Majeur G" },
+        { "id": "tip_ring_l", "pin": "A3", "label": "Bout Annulaire G" },
+        { "id": "tip_pinky_l", "pin": "A4", "label": "Bout Auriculaire G" }
+      ]
+    },
+    "tips_r": {
+      "type": "analog_array",
+      "mapping": [
+        { "id": "tip_thumb_r", "pin": "A5", "label": "Bout Pouce D" },
+        { "id": "tip_index_r", "pin": "A6", "label": "Bout Index D" },
+        { "id": "tip_middle_r", "pin": "A7", "label": "Bout Majeur D" },
+        { "id": "tip_ring_r", "pin": "A8", "label": "Bout Annulaire D" },
+        { "id": "tip_pinky_r", "pin": "A9", "label": "Bout Auriculaire D" }
+      ]
+    }
+  },
+  "logic": {
+    "safety_ok": {
+      "type": "AND",
+      "args": []
+    },
+    "behavior": {}
+  },
+  "kinematics": {
+    "articulation": {
+      "states": [
+        {
+          "tag": "REPOS",
+          "values": {
+            "finger_index.01.L": 0, "finger_index.02.L": 0, "finger_index.03.L": 0,
+            "finger_index.01.R": 0, "finger_index.02.R": 0, "finger_index.03.R": 0,
+            "thumb.01.L": 0, "thumb.01.R": 0
+          }
+        },
+        {
+          "tag": "PINCE_FINE_GAUCHE",
+          "values": {
+            "finger_index.01.L": 45, "finger_index.02.L": 60, "finger_index.03.L": 30,
+            "thumb.01.L": 30, "thumb.02.L": 40, "thumb.03.L": 30
+          }
+        },
+        {
+          "tag": "POING_FERME_GAUCHE",
+          "values": {
+            "finger_middle.01.L": 80, "finger_middle.02.L": 80, "finger_middle.03.L": 80,
+            "finger_ring.01.L": 80, "finger_ring.02.L": 80, "finger_ring.03.L": 80,
+            "finger_pinky.01.L": 80, "finger_pinky.02.L": 80, "finger_pinky.03.L": 80,
+            "finger_index.01.L": 80, "finger_index.02.L": 80, "finger_index.03.L": 80,
+            "thumb.01.L": 80, "thumb.02.L": 80, "thumb.03.L": 80
+          }
+        },
+        {
+          "tag": "PINCE_FINE_DROITE",
+          "values": {
+            "finger_index.01.R": 45, "finger_index.02.R": 60, "finger_index.03.R": 30,
+            "thumb.01.R": 30, "thumb.02.R": 40, "thumb.03.R": 30
+          }
+        },
+        {
+          "tag": "POING_FERME_DROITE",
+          "values": {
+            "finger_middle.01.R": 80, "finger_middle.02.R": 80, "finger_middle.03.R": 80,
+            "finger_ring.01.R": 80, "finger_ring.02.R": 80, "finger_ring.03.R": 80,
+            "finger_pinky.01.R": 80, "finger_pinky.02.R": 80, "finger_pinky.03.R": 80,
+            "finger_index.01.R": 80, "finger_index.02.R": 80, "finger_index.03.R": 80,
+            "thumb.01.R": 80, "thumb.02.R": 80, "thumb.03.R": 80
+          }
+        }
+      ]
+    }
+  },
+  "actuators": [
+    {
+      "name": "Point",
+      "group": "articulation",
+      "parent": "base",
+      "offset": [
+        0.08275171369314194,
+        0.7904020547866821,
+        -0.5708600878715515
+      ],
+      "kinematics": {
+        "type": "revolute",
+        "axis": [
+          1,
+          0,
+          0
+        ]
+      },
+      "config": {
+        "min": -180,
+        "max": 180,
+        "speed": 1,
+        "proprioceptionRatio": 0.5,
+        "calibration": {
+          "offset": 0,
+          "scale": 1,
+          "deadzone": 0.02
+        }
+      }
+    },
+    {
+      "name": "Hemi",
+      "group": "articulation",
+      "parent": "base",
+      "offset": [
+        0.4955960512161255,
+        2.795537233352661,
+        -0.7850614190101624
+      ],
+      "kinematics": {
+        "type": "revolute",
+        "axis": [
+          1,
+          0,
+          0
+        ]
+      },
+      "config": {
+        "min": -180,
+        "max": 180,
+        "speed": 1,
+        "proprioceptionRatio": 0.5,
+        "calibration": {
+          "offset": 0,
+          "scale": 1,
+          "deadzone": 0.02
+        }
+      }
+    },
+    {
+      "name": "Armature",
+      "group": "articulation",
+      "parent": "base",
+      "offset": [
+        0,
+        0,
+        -0.024562474340200424
+      ],
+      "kinematics": {
+        "type": "revolute",
+        "axis": [
+          1,
+          0,
+          0
+        ]
+      },
+      "config": {
+        "min": -180,
+        "max": 180,
+        "speed": 1,
+        "proprioceptionRatio": 0.5,
+        "calibration": {
+          "offset": 0,
+          "scale": 1,
+          "deadzone": 0.02
+        }
+      }
+    },
+    {
+      "name": "ribs.001",
+      "group": "articulation",
+      "parent": "Armature",
+      "offset": [
+        -0.0006867306656204164,
+        -0.06580569595098495,
+        1.295984148979187
+      ],
+      "kinematics": {
+        "type": "revolute",
+        "axis": [
+          1,
+          0,
+          0
+        ]
+      },
+      "config": {
+        "min": -180,
+        "max": 180,
+        "speed": 1,
+        "proprioceptionRatio": 0.5,
+        "calibration": {
+          "offset": 0,
+          "scale": 1,
+          "deadzone": 0.02
+        }
+      }
+    },
+    {
+      "name": "shoulder.L",
+      "group": "articulation",
+      "parent": "ribs.001",
+      "offset": [
+        0.016470007598400116,
+        0.17457140982151031,
+        0.04355684667825699
+      ],
+      "kinematics": {
+        "type": "revolute",
+        "axis": [
+          1,
+          0,
+          0
+        ]
+      },
+      "config": {
+        "min": -180,
+        "max": 180,
+        "speed": 1,
+        "proprioceptionRatio": 0.5,
+        "calibration": {
+          "offset": 0,
+          "scale": 1,
+          "deadzone": 0.02
+        }
+      }
+    },
+    {
+      "name": "upper_arm.L",
+      "group": "articulation",
+      "parent": "shoulder.L",
+      "offset": [
+        0.008230818435549736,
+        0.1775686889886856,
+        -0.017327308654785156
+      ],
+      "kinematics": {
+        "type": "revolute",
+        "axis": [
+          1,
+          0,
+          0
+        ]
+      },
+      "config": {
+        "min": -180,
+        "max": 180,
+        "speed": 1,
+        "proprioceptionRatio": 0.5,
+        "calibration": {
+          "offset": 0,
+          "scale": 1,
+          "deadzone": 0.02
+        }
+      }
+    },
+    {
+      "name": "forearm.L",
+      "group": "articulation",
+      "parent": "upper_arm.L",
+      "offset": [
+        -6.984919309616089e-8,
+        0.27661728858947754,
+        3.725290298461914e-9
+      ],
+      "kinematics": {
+        "type": "revolute",
+        "axis": [
+          1,
+          0,
+          0
+        ]
+      },
+      "config": {
+        "min": -180,
+        "max": 180,
+        "speed": 1,
+        "proprioceptionRatio": 0.5,
+        "calibration": {
+          "offset": 0,
+          "scale": 1,
+          "deadzone": 0.02
+        }
+      }
+    },
+    {
+      "name": "hand.L",
+      "group": "articulation",
+      "parent": "forearm.L",
+      "offset": [
+        8.381903171539307e-9,
+        0.2677391767501831,
+        -7.450580596923828e-9
+      ],
+      "kinematics": {
+        "type": "revolute",
+        "axis": [
+          1,
+          0,
+          0
+        ]
+      },
+      "config": {
+        "min": -180,
+        "max": 180,
+        "speed": 1,
+        "proprioceptionRatio": 0.5,
+        "calibration": {
+          "offset": 0,
+          "scale": 1,
+          "deadzone": 0.02
+        }
+      }
+    },
+    {
+      "name": "palm.02.L.001",
+      "group": "articulation",
+      "parent": "hand.L",
+      "offset": [
+        0.0065952809527516365,
+        0.022875133901834488,
+        -0.0034447165671736
+      ],
+      "kinematics": {
+        "type": "revolute",
+        "axis": [
+          1,
+          0,
+          0
+        ]
+      },
+      "config": {
+        "min": -180,
+        "max": 180,
+        "speed": 1,
+        "proprioceptionRatio": 0.5,
+        "calibration": {
+          "offset": 0,
+          "scale": 1,
+          "deadzone": 0.02
+        }
+      }
+    },
+    {
+      "name": "palm.02.L",
+      "group": "articulation",
+      "parent": "palm.02.L.001",
+      "offset": [
+        0,
+        0,
+        0
+      ],
+      "kinematics": {
+        "type": "revolute",
+        "axis": [
+          1,
+          0,
+          0
+        ]
+      },
+      "config": {
+        "min": -180,
+        "max": 180,
+        "speed": 1,
+        "proprioceptionRatio": 0.5,
+        "calibration": {
+          "offset": 0,
+          "scale": 1,
+          "deadzone": 0.02
+        }
+      }
+    },
+    {
+      "name": "finger_middle.01.L",
+      "group": "articulation",
+      "parent": "palm.02.L",
+      "offset": [
+        1.210719347000122e-8,
+        0.05149099603295326,
+        -8.381903171539307e-8
+      ],
+      "kinematics": {
+        "type": "revolute",
+        "axis": [
+          1,
+          0,
+          0
+        ]
+      },
+      "config": {
+        "min": -180,
+        "max": 180,
+        "speed": 1,
+        "proprioceptionRatio": 0.5,
+        "calibration": {
+          "offset": 0,
+          "scale": 1,
+          "deadzone": 0.02
+        }
+      }
+    },
+    {
+      "name": "finger_middle.02.L",
+      "group": "articulation",
+      "parent": "finger_middle.01.L",
+      "offset": [
+        -8.940696716308594e-8,
+        0.037124939262866974,
+        7.450580596923828e-9
+      ],
+      "kinematics": {
+        "type": "revolute",
+        "axis": [
+          1,
+          0,
+          0
+        ]
+      },
+      "config": {
+        "min": -180,
+        "max": 180,
+        "speed": 1,
+        "proprioceptionRatio": 0.5,
+        "calibration": {
+          "offset": 0,
+          "scale": 1,
+          "deadzone": 0.02
+        }
+      }
+    },
+    {
+      "name": "finger_middle.03.L",
+      "group": "articulation",
+      "parent": "finger_middle.02.L",
+      "offset": [
+        -9.313225746154785e-9,
+        0.027858994901180267,
+        1.564621925354004e-7
+      ],
+      "kinematics": {
+        "type": "revolute",
+        "axis": [
+          1,
+          0,
+          0
+        ]
+      },
+      "config": {
+        "min": -180,
+        "max": 180,
+        "speed": 1,
+        "proprioceptionRatio": 0.5,
+        "calibration": {
+          "offset": 0,
+          "scale": 1,
+          "deadzone": 0.02
+        }
+      }
+    },
+    {
+      "name": "palm.03.L.001",
+      "group": "articulation",
+      "parent": "hand.L",
+      "offset": [
+        0.005847773049026728,
+        0.02226000837981701,
+        0.011940062046051025
+      ],
+      "kinematics": {
+        "type": "revolute",
+        "axis": [
+          1,
+          0,
+          0
+        ]
+      },
+      "config": {
+        "min": -180,
+        "max": 180,
+        "speed": 1,
+        "proprioceptionRatio": 0.5,
+        "calibration": {
+          "offset": 0,
+          "scale": 1,
+          "deadzone": 0.02
+        }
+      }
+    },
+    {
+      "name": "palm.03.L",
+      "group": "articulation",
+      "parent": "palm.03.L.001",
+      "offset": [
+        0,
+        0,
+        0
+      ],
+      "kinematics": {
+        "type": "revolute",
+        "axis": [
+          1,
+          0,
+          0
+        ]
+      },
+      "config": {
+        "min": -180,
+        "max": 180,
+        "speed": 1,
+        "proprioceptionRatio": 0.5,
+        "calibration": {
+          "offset": 0,
+          "scale": 1,
+          "deadzone": 0.02
+        }
+      }
+    },
+    {
+      "name": "finger_ring.01.L",
+      "group": "articulation",
+      "parent": "palm.03.L",
+      "offset": [
+        -9.778887033462524e-9,
+        0.048988841474056244,
+        1.9744038581848145e-7
+      ],
+      "kinematics": {
+        "type": "revolute",
+        "axis": [
+          1,
+          0,
+          0
+        ]
+      },
+      "config": {
+        "min": -180,
+        "max": 180,
+        "speed": 1,
+        "proprioceptionRatio": 0.5,
+        "calibration": {
+          "offset": 0,
+          "scale": 1,
+          "deadzone": 0.02
+        }
+      }
+    },
+    {
+      "name": "finger_ring.02.L",
+      "group": "articulation",
+      "parent": "finger_ring.01.L",
+      "offset": [
+        -8.195638656616211e-8,
+        0.034183256328105927,
+        -9.499490261077881e-8
+      ],
+      "kinematics": {
+        "type": "revolute",
+        "axis": [
+          1,
+          0,
+          0
+        ]
+      },
+      "config": {
+        "min": -180,
+        "max": 180,
+        "speed": 1,
+        "proprioceptionRatio": 0.5,
+        "calibration": {
+          "offset": 0,
+          "scale": 1,
+          "deadzone": 0.02
+        }
+      }
+    },
+    {
+      "name": "finger_ring.03.L",
+      "group": "articulation",
+      "parent": "finger_ring.02.L",
+      "offset": [
+        3.725290298461914e-8,
+        0.02495095506310463,
+        -1.932494342327118e-8
+      ],
+      "kinematics": {
+        "type": "revolute",
+        "axis": [
+          1,
+          0,
+          0
+        ]
+      },
+      "config": {
+        "min": -180,
+        "max": 180,
+        "speed": 1,
+        "proprioceptionRatio": 0.5,
+        "calibration": {
+          "offset": 0,
+          "scale": 1,
+          "deadzone": 0.02
+        }
+      }
+    },
+    {
+      "name": "palm.04.L.001",
+      "group": "articulation",
+      "parent": "hand.L",
+      "offset": [
+        0.0026936077047139406,
+        0.017865240573883057,
+        0.022745201364159584
+      ],
+      "kinematics": {
+        "type": "revolute",
+        "axis": [
+          1,
+          0,
+          0
+        ]
+      },
+      "config": {
+        "min": -180,
+        "max": 180,
+        "speed": 1,
+        "proprioceptionRatio": 0.5,
+        "calibration": {
+          "offset": 0,
+          "scale": 1,
+          "deadzone": 0.02
+        }
+      }
+    },
+    {
+      "name": "palm.04.L",
+      "group": "articulation",
+      "parent": "palm.04.L.001",
+      "offset": [
+        0,
+        0,
+        0
+      ],
+      "kinematics": {
+        "type": "revolute",
+        "axis": [
+          1,
+          0,
+          0
+        ]
+      },
+      "config": {
+        "min": -180,
+        "max": 180,
+        "speed": 1,
+        "proprioceptionRatio": 0.5,
+        "calibration": {
+          "offset": 0,
+          "scale": 1,
+          "deadzone": 0.02
+        }
+      }
+    },
+    {
+      "name": "finger_pinky.01.L",
+      "group": "articulation",
+      "parent": "palm.04.L",
+      "offset": [
+        1.4901161193847656e-8,
+        0.052943065762519836,
+        4.842877388000488e-8
+      ],
+      "kinematics": {
+        "type": "revolute",
+        "axis": [
+          1,
+          0,
+          0
+        ]
+      },
+      "config": {
+        "min": -180,
+        "max": 180,
+        "speed": 1,
+        "proprioceptionRatio": 0.5,
+        "calibration": {
+          "offset": 0,
+          "scale": 1,
+          "deadzone": 0.02
+        }
+      }
+    },
+    {
+      "name": "finger_pinky.02.L",
+      "group": "articulation",
+      "parent": "finger_pinky.01.L",
+      "offset": [
+        2.9802322387695312e-8,
+        0.01948118582367897,
+        -5.960464477539063e-8
+      ],
+      "kinematics": {
+        "type": "revolute",
+        "axis": [
+          1,
+          0,
+          0
+        ]
+      },
+      "config": {
+        "min": -180,
+        "max": 180,
+        "speed": 1,
+        "proprioceptionRatio": 0.5,
+        "calibration": {
+          "offset": 0,
+          "scale": 1,
+          "deadzone": 0.02
+        }
+      }
+    },
+    {
+      "name": "finger_pinky.03.L",
+      "group": "articulation",
+      "parent": "finger_pinky.02.L",
+      "offset": [
+        -1.2293457984924316e-7,
+        0.020365532487630844,
+        2.9802322387695312e-8
+      ],
+      "kinematics": {
+        "type": "revolute",
+        "axis": [
+          1,
+          0,
+          0
+        ]
+      },
+      "config": {
+        "min": -180,
+        "max": 180,
+        "speed": 1,
+        "proprioceptionRatio": 0.5,
+        "calibration": {
+          "offset": 0,
+          "scale": 1,
+          "deadzone": 0.02
+        }
+      }
+    },
+    {
+      "name": "palm.01.L.001",
+      "group": "articulation",
+      "parent": "hand.L",
+      "offset": [
+        0.005265708547085524,
+        0.020909197628498077,
+        -0.020160378888249397
+      ],
+      "kinematics": {
+        "type": "revolute",
+        "axis": [
+          1,
+          0,
+          0
+        ]
+      },
+      "config": {
+        "min": -180,
+        "max": 180,
+        "speed": 1,
+        "proprioceptionRatio": 0.5,
+        "calibration": {
+          "offset": 0,
+          "scale": 1,
+          "deadzone": 0.02
+        }
+      }
+    },
+    {
+      "name": "palm.01.L",
+      "group": "articulation",
+      "parent": "palm.01.L.001",
+      "offset": [
+        0,
+        0,
+        0
+      ],
+      "kinematics": {
+        "type": "revolute",
+        "axis": [
+          1,
+          0,
+          0
+        ]
+      },
+      "config": {
+        "min": -180,
+        "max": 180,
+        "speed": 1,
+        "proprioceptionRatio": 0.5,
+        "calibration": {
+          "offset": 0,
+          "scale": 1,
+          "deadzone": 0.02
+        }
+      }
+    },
+    {
+      "name": "finger_index.01.L",
+      "group": "articulation",
+      "parent": "palm.01.L",
+      "offset": [
+        -1.4901161193847656e-8,
+        0.052302099764347076,
+        -1.862645149230957e-9
+      ],
+      "kinematics": {
+        "type": "revolute",
+        "axis": [
+          1,
+          0,
+          0
+        ]
+      },
+      "config": {
+        "min": -180,
+        "max": 180,
+        "speed": 1,
+        "proprioceptionRatio": 0.5,
+        "calibration": {
+          "offset": 0,
+          "scale": 1,
+          "deadzone": 0.02
+        }
+      }
+    },
+    {
+      "name": "finger_index.02.L",
+      "group": "articulation",
+      "parent": "finger_index.01.L",
+      "offset": [
+        -1.4901161193847656e-8,
+        0.03680037707090378,
+        1.7136335372924805e-7
+      ],
+      "kinematics": {
+        "type": "revolute",
+        "axis": [
+          1,
+          0,
+          0
+        ]
+      },
+      "config": {
+        "min": -180,
+        "max": 180,
+        "speed": 1,
+        "proprioceptionRatio": 0.5,
+        "calibration": {
+          "offset": 0,
+          "scale": 1,
+          "deadzone": 0.02
+        }
+      }
+    },
+    {
+      "name": "finger_index.03.L",
+      "group": "articulation",
+      "parent": "finger_index.02.L",
+      "offset": [
+        6.705522537231445e-8,
+        0.019658289849758148,
+        4.6566128730773926e-8
+      ],
+      "kinematics": {
+        "type": "revolute",
+        "axis": [
+          1,
+          0,
+          0
+        ]
+      },
+      "config": {
+        "min": -180,
+        "max": 180,
+        "speed": 1,
+        "proprioceptionRatio": 0.5,
+        "calibration": {
+          "offset": 0,
+          "scale": 1,
+          "deadzone": 0.02
+        }
+      }
+    },
+    {
+      "name": "thumb.01.L.001",
+      "group": "articulation",
+      "parent": "palm.01.L",
+      "offset": [
+        -0.0077032670378685,
+        -0.006398721598088741,
+        0.013340514153242111
+      ],
+      "kinematics": {
+        "type": "revolute",
+        "axis": [
+          1,
+          0,
+          0
+        ]
+      },
+      "config": {
+        "min": -180,
+        "max": 180,
+        "speed": 1,
+        "proprioceptionRatio": 0.5,
+        "calibration": {
+          "offset": 0,
+          "scale": 1,
+          "deadzone": 0.02
+        }
+      }
+    },
+    {
+      "name": "thumb.01.L",
+      "group": "articulation",
+      "parent": "thumb.01.L.001",
+      "offset": [
+        0,
+        0,
+        0
+      ],
+      "kinematics": {
+        "type": "revolute",
+        "axis": [
+          1,
+          0,
+          0
+        ]
+      },
+      "config": {
+        "min": -180,
+        "max": 180,
+        "speed": 1,
+        "proprioceptionRatio": 0.5,
+        "calibration": {
+          "offset": 0,
+          "scale": 1,
+          "deadzone": 0.02
+        }
+      }
+    },
+    {
+      "name": "thumb.02.L",
+      "group": "articulation",
+      "parent": "thumb.01.L",
+      "offset": [
+        -4.842877388000488e-8,
+        0.028391428291797638,
+        2.2351741790771484e-8
+      ],
+      "kinematics": {
+        "type": "revolute",
+        "axis": [
+          1,
+          0,
+          0
+        ]
+      },
+      "config": {
+        "min": -180,
+        "max": 180,
+        "speed": 1,
+        "proprioceptionRatio": 0.5,
+        "calibration": {
+          "offset": 0,
+          "scale": 1,
+          "deadzone": 0.02
+        }
+      }
+    },
+    {
+      "name": "thumb.03.L",
+      "group": "articulation",
+      "parent": "thumb.02.L",
+      "offset": [
+        -1.3550743460655212e-7,
+        0.030998926609754562,
+        4.470348358154297e-8
+      ],
+      "kinematics": {
+        "type": "revolute",
+        "axis": [
+          1,
+          0,
+          0
+        ]
+      },
+      "config": {
+        "min": -180,
+        "max": 180,
+        "speed": 1,
+        "proprioceptionRatio": 0.5,
+        "calibration": {
+          "offset": 0,
+          "scale": 1,
+          "deadzone": 0.02
+        }
+      }
+    },
+    {
+      "name": "forearm.L.003",
+      "group": "articulation",
+      "parent": "forearm.L",
+      "offset": [
+        -0.07476967573165894,
+        0.2655799984931946,
+        -0.03278077021241188
+      ],
+      "kinematics": {
+        "type": "revolute",
+        "axis": [
+          1,
+          0,
+          0
+        ]
+      },
+      "config": {
+        "min": -180,
+        "max": 180,
+        "speed": 1,
+        "proprioceptionRatio": 0.5,
+        "calibration": {
+          "offset": 0,
+          "scale": 1,
+          "deadzone": 0.02
+        }
+      }
+    },
+    {
+      "name": "shoulder.R",
+      "group": "articulation",
+      "parent": "ribs.001",
+      "offset": [
+        -0.017843477427959442,
+        0.17457140982151031,
+        0.04355684295296669
+      ],
+      "kinematics": {
+        "type": "revolute",
+        "axis": [
+          1,
+          0,
+          0
+        ]
+      },
+      "config": {
+        "min": -180,
+        "max": 180,
+        "speed": 1,
+        "proprioceptionRatio": 0.5,
+        "calibration": {
+          "offset": 0,
+          "scale": 1,
+          "deadzone": 0.02
+        }
+      }
+    },
+    {
+      "name": "upper_arm.R",
+      "group": "articulation",
+      "parent": "shoulder.R",
+      "offset": [
+        -0.008230797946453094,
+        0.1775687038898468,
+        -0.017327312380075455
+      ],
+      "kinematics": {
+        "type": "revolute",
+        "axis": [
+          1,
+          0,
+          0
+        ]
+      },
+      "config": {
+        "min": -180,
+        "max": 180,
+        "speed": 1,
+        "proprioceptionRatio": 0.5,
+        "calibration": {
+          "offset": 0,
+          "scale": 1,
+          "deadzone": 0.02
+        }
+      }
+    },
+    {
+      "name": "forearm.R",
+      "group": "articulation",
+      "parent": "upper_arm.R",
+      "offset": [
+        1.8347054719924927e-7,
+        0.27661725878715515,
+        7.450580596923828e-9
+      ],
+      "kinematics": {
+        "type": "revolute",
+        "axis": [
+          1,
+          0,
+          0
+        ]
+      },
+      "config": {
+        "min": -180,
+        "max": 180,
+        "speed": 1,
+        "proprioceptionRatio": 0.5,
+        "calibration": {
+          "offset": 0,
+          "scale": 1,
+          "deadzone": 0.02
+        }
+      }
+    },
+    {
+      "name": "hand.R",
+      "group": "articulation",
+      "parent": "forearm.R",
+      "offset": [
+        -1.1175870895385742e-8,
+        0.2677392363548279,
+        1.1175870895385742e-8
+      ],
+      "kinematics": {
+        "type": "revolute",
+        "axis": [
+          1,
+          0,
+          0
+        ]
+      },
+      "config": {
+        "min": -180,
+        "max": 180,
+        "speed": 1,
+        "proprioceptionRatio": 0.5,
+        "calibration": {
+          "offset": 0,
+          "scale": 1,
+          "deadzone": 0.02
+        }
+      }
+    },
+    {
+      "name": "palm.01.R.001",
+      "group": "articulation",
+      "parent": "hand.R",
+      "offset": [
+        -0.0052658263593912125,
+        0.020909134298563004,
+        -0.02016039378941059
+      ],
+      "kinematics": {
+        "type": "revolute",
+        "axis": [
+          1,
+          0,
+          0
+        ]
+      },
+      "config": {
+        "min": -180,
+        "max": 180,
+        "speed": 1,
+        "proprioceptionRatio": 0.5,
+        "calibration": {
+          "offset": 0,
+          "scale": 1,
+          "deadzone": 0.02
+        }
+      }
+    },
+    {
+      "name": "palm.01.R",
+      "group": "articulation",
+      "parent": "palm.01.R.001",
+      "offset": [
+        0,
+        0,
+        0
+      ],
+      "kinematics": {
+        "type": "revolute",
+        "axis": [
+          1,
+          0,
+          0
+        ]
+      },
+      "config": {
+        "min": -180,
+        "max": 180,
+        "speed": 1,
+        "proprioceptionRatio": 0.5,
+        "calibration": {
+          "offset": 0,
+          "scale": 1,
+          "deadzone": 0.02
+        }
+      }
+    },
+    {
+      "name": "finger_index.01.R",
+      "group": "articulation",
+      "parent": "palm.01.R",
+      "offset": [
+        7.450580596923828e-9,
+        0.052302151918411255,
+        -1.1175870895385742e-8
+      ],
+      "kinematics": {
+        "type": "revolute",
+        "axis": [
+          1,
+          0,
+          0
+        ]
+      },
+      "config": {
+        "min": -180,
+        "max": 180,
+        "speed": 1,
+        "proprioceptionRatio": 0.5,
+        "calibration": {
+          "offset": 0,
+          "scale": 1,
+          "deadzone": 0.02
+        }
+      }
+    },
+    {
+      "name": "finger_index.02.R",
+      "group": "articulation",
+      "parent": "finger_index.01.R",
+      "offset": [
+        1.4901161193847656e-8,
+        0.03680036962032318,
+        4.0978193283081055e-8
+      ],
+      "kinematics": {
+        "type": "revolute",
+        "axis": [
+          1,
+          0,
+          0
+        ]
+      },
+      "config": {
+        "min": -180,
+        "max": 180,
+        "speed": 1,
+        "proprioceptionRatio": 0.5,
+        "calibration": {
+          "offset": 0,
+          "scale": 1,
+          "deadzone": 0.02
+        }
+      }
+    },
+    {
+      "name": "finger_index.03.R",
+      "group": "articulation",
+      "parent": "finger_index.02.R",
+      "offset": [
+        -6.705522537231445e-8,
+        0.019658219069242477,
+        -8.754432201385498e-8
+      ],
+      "kinematics": {
+        "type": "revolute",
+        "axis": [
+          1,
+          0,
+          0
+        ]
+      },
+      "config": {
+        "min": -180,
+        "max": 180,
+        "speed": 1,
+        "proprioceptionRatio": 0.5,
+        "calibration": {
+          "offset": 0,
+          "scale": 1,
+          "deadzone": 0.02
+        }
+      }
+    },
+    {
+      "name": "thumb.01.R.001",
+      "group": "articulation",
+      "parent": "palm.01.R",
+      "offset": [
+        0.007703259587287903,
+        -0.006398667581379414,
+        0.013340383768081665
+      ],
+      "kinematics": {
+        "type": "revolute",
+        "axis": [
+          1,
+          0,
+          0
+        ]
+      },
+      "config": {
+        "min": -180,
+        "max": 180,
+        "speed": 1,
+        "proprioceptionRatio": 0.5,
+        "calibration": {
+          "offset": 0,
+          "scale": 1,
+          "deadzone": 0.02
+        }
+      }
+    },
+    {
+      "name": "thumb.01.R",
+      "group": "articulation",
+      "parent": "thumb.01.R.001",
+      "offset": [
+        0,
+        0,
+        0
+      ],
+      "kinematics": {
+        "type": "revolute",
+        "axis": [
+          1,
+          0,
+          0
+        ]
+      },
+      "config": {
+        "min": -180,
+        "max": 180,
+        "speed": 1,
+        "proprioceptionRatio": 0.5,
+        "calibration": {
+          "offset": 0,
+          "scale": 1,
+          "deadzone": 0.02
+        }
+      }
+    },
+    {
+      "name": "thumb.02.R",
+      "group": "articulation",
+      "parent": "thumb.01.R",
+      "offset": [
+        2.9802322387695312e-8,
+        0.02839142084121704,
+        2.2351741790771484e-8
+      ],
+      "kinematics": {
+        "type": "revolute",
+        "axis": [
+          1,
+          0,
+          0
+        ]
+      },
+      "config": {
+        "min": -180,
+        "max": 180,
+        "speed": 1,
+        "proprioceptionRatio": 0.5,
+        "calibration": {
+          "offset": 0,
+          "scale": 1,
+          "deadzone": 0.02
+        }
+      }
+    },
+    {
+      "name": "thumb.03.R",
+      "group": "articulation",
+      "parent": "thumb.02.R",
+      "offset": [
+        6.658956408500671e-8,
+        0.030998893082141876,
+        -7.450580596923828e-9
+      ],
+      "kinematics": {
+        "type": "revolute",
+        "axis": [
+          1,
+          0,
+          0
+        ]
+      },
+      "config": {
+        "min": -180,
+        "max": 180,
+        "speed": 1,
+        "proprioceptionRatio": 0.5,
+        "calibration": {
+          "offset": 0,
+          "scale": 1,
+          "deadzone": 0.02
+        }
+      }
+    },
+    {
+      "name": "palm.02.R.001",
+      "group": "articulation",
+      "parent": "hand.R",
+      "offset": [
+        -0.006595398299396038,
+        0.022875068709254265,
+        -0.003444729605689645
+      ],
+      "kinematics": {
+        "type": "revolute",
+        "axis": [
+          1,
+          0,
+          0
+        ]
+      },
+      "config": {
+        "min": -180,
+        "max": 180,
+        "speed": 1,
+        "proprioceptionRatio": 0.5,
+        "calibration": {
+          "offset": 0,
+          "scale": 1,
+          "deadzone": 0.02
+        }
+      }
+    },
+    {
+      "name": "palm.02.R",
+      "group": "articulation",
+      "parent": "palm.02.R.001",
+      "offset": [
+        0,
+        0,
+        0
+      ],
+      "kinematics": {
+        "type": "revolute",
+        "axis": [
+          1,
+          0,
+          0
+        ]
+      },
+      "config": {
+        "min": -180,
+        "max": 180,
+        "speed": 1,
+        "proprioceptionRatio": 0.5,
+        "calibration": {
+          "offset": 0,
+          "scale": 1,
+          "deadzone": 0.02
+        }
+      }
+    },
+    {
+      "name": "finger_middle.01.R",
+      "group": "articulation",
+      "parent": "palm.02.R",
+      "offset": [
+        7.450580596923828e-9,
+        0.05149104818701744,
+        -1.0803341865539551e-7
+      ],
+      "kinematics": {
+        "type": "revolute",
+        "axis": [
+          1,
+          0,
+          0
+        ]
+      },
+      "config": {
+        "min": -180,
+        "max": 180,
+        "speed": 1,
+        "proprioceptionRatio": 0.5,
+        "calibration": {
+          "offset": 0,
+          "scale": 1,
+          "deadzone": 0.02
+        }
+      }
+    },
+    {
+      "name": "finger_middle.02.R",
+      "group": "articulation",
+      "parent": "finger_middle.01.R",
+      "offset": [
+        1.4156103134155273e-7,
+        0.03712494671344757,
+        8.568167686462402e-8
+      ],
+      "kinematics": {
+        "type": "revolute",
+        "axis": [
+          1,
+          0,
+          0
+        ]
+      },
+      "config": {
+        "min": -180,
+        "max": 180,
+        "speed": 1,
+        "proprioceptionRatio": 0.5,
+        "calibration": {
+          "offset": 0,
+          "scale": 1,
+          "deadzone": 0.02
+        }
+      }
+    },
+    {
+      "name": "finger_middle.03.R",
+      "group": "articulation",
+      "parent": "finger_middle.02.R",
+      "offset": [
+        -2.421438694000244e-8,
+        0.027858993038535118,
+        1.3783574104309082e-7
+      ],
+      "kinematics": {
+        "type": "revolute",
+        "axis": [
+          1,
+          0,
+          0
+        ]
+      },
+      "config": {
+        "min": -180,
+        "max": 180,
+        "speed": 1,
+        "proprioceptionRatio": 0.5,
+        "calibration": {
+          "offset": 0,
+          "scale": 1,
+          "deadzone": 0.02
+        }
+      }
+    },
+    {
+      "name": "palm.03.R.001",
+      "group": "articulation",
+      "parent": "hand.R",
+      "offset": [
+        -0.005847897380590439,
+        0.02225995808839798,
+        0.01194004900753498
+      ],
+      "kinematics": {
+        "type": "revolute",
+        "axis": [
+          1,
+          0,
+          0
+        ]
+      },
+      "config": {
+        "min": -180,
+        "max": 180,
+        "speed": 1,
+        "proprioceptionRatio": 0.5,
+        "calibration": {
+          "offset": 0,
+          "scale": 1,
+          "deadzone": 0.02
+        }
+      }
+    },
+    {
+      "name": "palm.03.R",
+      "group": "articulation",
+      "parent": "palm.03.R.001",
+      "offset": [
+        0,
+        0,
+        0
+      ],
+      "kinematics": {
+        "type": "revolute",
+        "axis": [
+          1,
+          0,
+          0
+        ]
+      },
+      "config": {
+        "min": -180,
+        "max": 180,
+        "speed": 1,
+        "proprioceptionRatio": 0.5,
+        "calibration": {
+          "offset": 0,
+          "scale": 1,
+          "deadzone": 0.02
+        }
+      }
+    },
+    {
+      "name": "finger_ring.01.R",
+      "group": "articulation",
+      "parent": "palm.03.R",
+      "offset": [
+        3.259629011154175e-9,
+        0.048988811671733856,
+        6.05359673500061e-8
+      ],
+      "kinematics": {
+        "type": "revolute",
+        "axis": [
+          1,
+          0,
+          0
+        ]
+      },
+      "config": {
+        "min": -180,
+        "max": 180,
+        "speed": 1,
+        "proprioceptionRatio": 0.5,
+        "calibration": {
+          "offset": 0,
+          "scale": 1,
+          "deadzone": 0.02
+        }
+      }
+    },
+    {
+      "name": "finger_ring.02.R",
+      "group": "articulation",
+      "parent": "finger_ring.01.R",
+      "offset": [
+        -6.705522537231445e-8,
+        0.03418319672346115,
+        -1.5459954738616943e-7
+      ],
+      "kinematics": {
+        "type": "revolute",
+        "axis": [
+          1,
+          0,
+          0
+        ]
+      },
+      "config": {
+        "min": -180,
+        "max": 180,
+        "speed": 1,
+        "proprioceptionRatio": 0.5,
+        "calibration": {
+          "offset": 0,
+          "scale": 1,
+          "deadzone": 0.02
+        }
+      }
+    },
+    {
+      "name": "finger_ring.03.R",
+      "group": "articulation",
+      "parent": "finger_ring.02.R",
+      "offset": [
+        4.470348358154297e-8,
+        0.024950940161943436,
+        -6.577465683221817e-8
+      ],
+      "kinematics": {
+        "type": "revolute",
+        "axis": [
+          1,
+          0,
+          0
+        ]
+      },
+      "config": {
+        "min": -180,
+        "max": 180,
+        "speed": 1,
+        "proprioceptionRatio": 0.5,
+        "calibration": {
+          "offset": 0,
+          "scale": 1,
+          "deadzone": 0.02
+        }
+      }
+    },
+    {
+      "name": "palm.04.R.001",
+      "group": "articulation",
+      "parent": "hand.R",
+      "offset": [
+        -0.002693612826988101,
+        0.017865175381302834,
+        0.022745201364159584
+      ],
+      "kinematics": {
+        "type": "revolute",
+        "axis": [
+          1,
+          0,
+          0
+        ]
+      },
+      "config": {
+        "min": -180,
+        "max": 180,
+        "speed": 1,
+        "proprioceptionRatio": 0.5,
+        "calibration": {
+          "offset": 0,
+          "scale": 1,
+          "deadzone": 0.02
+        }
+      }
+    },
+    {
+      "name": "palm.04.R",
+      "group": "articulation",
+      "parent": "palm.04.R.001",
+      "offset": [
+        0,
+        0,
+        0
+      ],
+      "kinematics": {
+        "type": "revolute",
+        "axis": [
+          1,
+          0,
+          0
+        ]
+      },
+      "config": {
+        "min": -180,
+        "max": 180,
+        "speed": 1,
+        "proprioceptionRatio": 0.5,
+        "calibration": {
+          "offset": 0,
+          "scale": 1,
+          "deadzone": 0.02
+        }
+      }
+    },
+    {
+      "name": "finger_pinky.01.R",
+      "group": "articulation",
+      "parent": "palm.04.R",
+      "offset": [
+        7.450580596923828e-9,
+        0.052943069487810135,
+        1.695007085800171e-7
+      ],
+      "kinematics": {
+        "type": "revolute",
+        "axis": [
+          1,
+          0,
+          0
+        ]
+      },
+      "config": {
+        "min": -180,
+        "max": 180,
+        "speed": 1,
+        "proprioceptionRatio": 0.5,
+        "calibration": {
+          "offset": 0,
+          "scale": 1,
+          "deadzone": 0.02
+        }
+      }
+    },
+    {
+      "name": "finger_pinky.02.R",
+      "group": "articulation",
+      "parent": "finger_pinky.01.R",
+      "offset": [
+        1.4901161193847656e-8,
+        0.019481178373098373,
+        -7.450580596923828e-8
+      ],
+      "kinematics": {
+        "type": "revolute",
+        "axis": [
+          1,
+          0,
+          0
+        ]
+      },
+      "config": {
+        "min": -180,
+        "max": 180,
+        "speed": 1,
+        "proprioceptionRatio": 0.5,
+        "calibration": {
+          "offset": 0,
+          "scale": 1,
+          "deadzone": 0.02
+        }
+      }
+    },
+    {
+      "name": "finger_pinky.03.R",
+      "group": "articulation",
+      "parent": "finger_pinky.02.R",
+      "offset": [
+        1.1920928955078125e-7,
+        0.020365532487630844,
+        1.4901161193847656e-8
+      ],
+      "kinematics": {
+        "type": "revolute",
+        "axis": [
+          1,
+          0,
+          0
+        ]
+      },
+      "config": {
+        "min": -180,
+        "max": 180,
+        "speed": 1,
+        "proprioceptionRatio": 0.5,
+        "calibration": {
+          "offset": 0,
+          "scale": 1,
+          "deadzone": 0.02
+        }
+      }
+    },
+    {
+      "name": "forearm.R.003",
+      "group": "articulation",
+      "parent": "forearm.R",
+      "offset": [
+        0.07476979494094849,
+        0.26558005809783936,
+        -0.03278077393770218
+      ],
+      "kinematics": {
+        "type": "revolute",
+        "axis": [
+          1,
+          0,
+          0
+        ]
+      },
+      "config": {
+        "min": -180,
+        "max": 180,
+        "speed": 1,
+        "proprioceptionRatio": 0.5,
+        "calibration": {
+          "offset": 0,
+          "scale": 1,
+          "deadzone": 0.02
+        }
+      }
+    },
+    {
+      "name": "Cube.000",
+      "group": "articulation",
+      "parent": "base",
+      "offset": [
+        0,
+        0,
+        0
+      ],
+      "kinematics": {
+        "type": "revolute",
+        "axis": [
+          1,
+          0,
+          0
+        ]
+      },
+      "config": {
+        "min": -180,
+        "max": 180,
+        "speed": 1,
+        "proprioceptionRatio": 0.5,
+        "calibration": {
+          "offset": 0,
+          "scale": 1,
+          "deadzone": 0.02
+        }
+      }
+    },
+    {
+      "name": "Cube.005",
+      "group": "articulation",
+      "parent": "base",
+      "offset": [
+        0,
+        0,
+        0
+      ],
+      "kinematics": {
+        "type": "revolute",
+        "axis": [
+          1,
+          0,
+          0
+        ]
+      },
+      "config": {
+        "min": -180,
+        "max": 180,
+        "speed": 1,
+        "proprioceptionRatio": 0.5,
+        "calibration": {
+          "offset": 0,
+          "scale": 1,
+          "deadzone": 0.02
+        }
+      }
+    }
+  ],
+  "training": {
+    "examples": [
+      {
+        "label": "REPOS",
+        "input": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        "output": [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
+      },
+      {
+        "label": "PINCE_FINE_GAUCHE",
+        "notes": "Contact Pouce-Index Main Gauche",
+        "input": [0.8, 0.8, 0, 0, 0, 0, 0, 0, 0, 0],
+        "output": [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,45,60,30,0,30,40,30,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
+      },
+      {
+        "label": "POING_FERME_GAUCHE",
+        "notes": "Flexion complète de tous les doigts à gauche",
+        "input": [0.7, 0.7, 0.7, 0.7, 0.7, 0, 0, 0, 0, 0],
+        "output": [0,0,0,0,0,0,0,0,0,0,80,80,80,0,0,80,80,80,0,0,80,80,80,0,0,80,80,80,0,80,80,80,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
+      },
+      {
+        "label": "PINCE_FINE_DROITE",
+        "notes": "Contact Pouce-Index Main Droite",
+        "input": [0, 0, 0, 0, 0, 0.8, 0.8, 0, 0, 0],
+        "output": [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,45,60,30,0,30,40,30,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
+      },
+      {
+        "label": "POING_FERME_DROITE",
+        "notes": "Flexion complète de tous les doigts à droite",
+        "input": [0, 0, 0, 0, 0, 0.7, 0.7, 0.7, 0.7, 0.7],
+        "output": [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,80,80,80,0,80,80,80,0,0,80,80,80,0,0,80,80,80,0,0,80,80,80,0,0,0]
+      }
+    ]
+  }
+}

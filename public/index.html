@@ -97,7 +97,8 @@
     <script type="importmap">
         { "imports": { "three": "https://unpkg.com/three@0.160.0/build/three.module.js", 
                        "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/",
-                       "g-neuro": "/test.js" } }
+                       "g-neuro": "/test.js" }
+        }
     </script>
     <script type="module">
         import { GLBViewer } from './viewer.js';
@@ -144,6 +145,11 @@
         let simStep = 0;
         let graspTimer = 0;
         let logicalState = "OPEN"; // État stable pour éviter le jitter
+
+        // Throttling variables
+        let lastSimTime = 0;
+        const simFrequency = 50; // Hz
+        const simInterval = 1000 / simFrequency;
         const sensorMeshValues = {}; // Stocke la pression par ID (idx_p1, maj_p1, etc.)
 
         async function start() {
@@ -256,13 +262,16 @@
             }
         }
 
-        function simulationLoop() {
+        function simulationLoop(currentTime) {
             // Log de pulsation pour confirmer que le script tourne
             if (simStep % 100 === 0) {
                 console.log(`[System] Loop heartbeat - Step: ${simStep}, Running: ${isRunning}`);
             }
 
-            if (isRunning && robotInstance) {
+            if (isRunning && robotInstance && currentTime - lastSimTime >= simInterval) {
+                const deltaTime = (currentTime - lastSimTime) / 1000;
+                lastSimTime = currentTime;
+
                 const { actuators, hub, sensorMapper, varMap } = robotInstance;
                 // 1. Calcul de la pression moyenne d'abord
                 const averageContact = Object.values(sensorMeshValues).reduce((a, b) => a + b, 0) / 
@@ -289,13 +298,11 @@
                 // --- PRIORITÉ : POSTURE MANUELLE OU AUTO ---
                 if (manualPosture !== "AUTO") {
                     graspTimer = 0;
-                    const fingers = ["index", "majeur", "annulaire", "auriculaire"];
-                    fingers.forEach(f => {
-                        if (!hub.selectState(f, manualPosture)) hub.selectState(f, "OPEN");
+                    // Protection contre les objets undefined/null
+                    const groups = (hub && hub.groups) ? Object.keys(hub.groups) : [];
+                    groups.forEach(groupName => {
+                        hub.selectState(groupName, manualPosture);
                     });
-                    
-                    hub.selectState("pouce", manualPosture === "OPEN" ? "REST" : manualPosture);
-
                 } else {
                     // --- LOGIQUE AUTOMATIQUE PAR CAPTEUR ---
                     // Application d'une Hystérésis pour stabiliser la décision
@@ -319,18 +326,17 @@
                         graspTimer++;
                         const stage = graspTimer > 80 ? "MAX_GRIP" : "GRAB";
                         
-                        hub.selectState("index", stage);
-                        hub.selectState("majeur", stage);
-                        hub.selectState("annulaire", stage);
-                        hub.selectState("auriculaire", stage);
-                        hub.selectState("pouce", stage === "MAX_GRIP" ? "MAX_GRIP" : "OPPOSITION");
+                        const groups = (hub && hub.groups) ? Object.keys(hub.groups) : [];
+                        groups.forEach(groupName => {
+                            // On tente d'appliquer l'état, sinon REPOS par défaut
+                            hub.selectState(groupName, stage);
+                        });
                     } else {
                         graspTimer = 0;
-                        hub.selectState("index", "OPEN");
-                        hub.selectState("majeur", "OPEN");
-                        hub.selectState("annulaire", "OPEN");
-                        hub.selectState("auriculaire", "OPEN");
-                        hub.selectState("pouce", "REST");
+                        const groups = (hub && hub.groups) ? Object.keys(hub.groups) : [];
+                        groups.forEach(groupName => {
+                            hub.selectState(groupName, "REPOS");
+                        });
                     }
                 }
 

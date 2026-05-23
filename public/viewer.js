@@ -6,6 +6,9 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { OBJLoader } from 'three/addons/loaders/OBJLoader.js';
+import { FBXLoader } from 'three/addons/loaders/FBXLoader.js';
+import * as fflate from 'https://cdn.jsdelivr.net/npm/fflate@0.8.2/+esm';
 
 export class GLBViewer {
     constructor(containerId) {
@@ -49,19 +52,42 @@ export class GLBViewer {
         this.animate();
         window.addEventListener('resize', () => this.onResize());
         this.meshes = new Map(); // Suivi des objets par nom
+        this.initialQuaternions = new Map(); // Sauvegarde des poses de repos
         this.taxelMeshes = new Map(); // Suivi des capteurs par sensorId
+        
+        // Initialisation pour la calibration (Tare)
+        this.sensorConfigs = new Map();
+        this.isCalibrating = false;
+        this.calibrationBuffer = new Map(); // { sensorId: [values] }
     }
 
     /**
      * Tente de charger un GLB, sinon génère les primitives
      */
     async initRobot(config) {
-        if (config.metadata && config.metadata.model_url) {
-            this.loadModel(config.metadata.model_url);
-        } else {
-            console.log("[Viewer] Aucun modèle GLB spécifié, génération des primitives...");
-            this.buildFromConfig(config);
+        // Priorité à l'URL extraite proactivement dans metadata
+        const url = config.metadata?.model_url || config.visual?.model_url;
+        
+        if (url) {
+            const ext = url.split('.').pop().toLowerCase();
+            try {
+                if (ext === 'obj') {
+                    await this.loadOBJ(url);
+                } else if (ext === 'fbx') {
+                    await this.loadFBX(url);
+                } else if (ext === 'glb' || ext === 'gltf' || url.includes('data:application/octet-stream')) {
+                    await this.loadModel(url);
+                } else {
+                    console.warn(`[Viewer] Format non supporté : ${ext}`);
+                }
+            } catch (err) {
+                console.error(`[Viewer] Échec du chargement du modèle extrait (${url}). Bascule sur le rendu par primitives.`, err);
+                // On ne re-throw pas l'erreur pour laisser buildFromConfig s'exécuter
+            }
         }
+
+        // On complète toujours avec la config (pour les pièces/capteurs non présents dans le modèle)
+        this.buildFromConfig(config);
     }
 
     /**
@@ -72,9 +98,20 @@ export class GLBViewer {
 
         // 1. Création de tous les maillons
         config.actuators.forEach(act => {
-            if (!act.primitive) return;
+            // Si l'objet existe déjà dans le modèle global (par son nom), on ne crée pas de primitive
+            if (this.meshes.has(act.name)) {
+                console.log(`[Viewer] Utilisation du mesh existant pour : ${act.name}`);
+                
+                // Ajout d'une aide visuelle sur le mesh existant pour confirmer le joint
+                const jointMarker = new THREE.AxesHelper(0.05);
+                this.meshes.get(act.name).add(jointMarker);
+                return;
+            }
+
+            // Fallback : Si l'actuateur n'est pas dans le modèle 3D, on crée une sphère debug
+            const primitiveData = act.primitive || { type: 'sphere', radius: 0.02, color: 0xff00ff };
             
-            const mesh = this.createPrimitive(act.primitive);
+            const mesh = this.createPrimitive(primitiveData);
             mesh.name = act.name;
             
             // Positionnement initial relatif au parent
@@ -104,6 +141,9 @@ export class GLBViewer {
                 taxel.position.set(0, (act.primitive.height || 0.04) / 2, 0.006);
                 mesh.add(taxel);
                 this.taxelMeshes.set(act.config.sensorId, taxel);
+            }
+            if (act.config) {
+                this.sensorConfigs.set(act.config.sensorId || act.name, act.config);
             }
         });
 
@@ -179,7 +219,10 @@ export class GLBViewer {
                 // Conversion de l'angle (degrés) en Quaternion local sur l'axe défini
                 const axis = new THREE.Vector3(...act.kinematics.axis);
                 const angleRad = act.currentValue * (Math.PI / 180);
-                mesh.quaternion.setFromAxisAngle(axis, angleRad);
+                
+                const q = new THREE.Quaternion().setFromAxisAngle(axis, angleRad);
+                const initialQ = this.initialQuaternions.get(act.name) || new THREE.Quaternion();
+                mesh.quaternion.copy(initialQ).multiply(q);
             } 
             else if (act.kinematics.type === 'prismatic') {
                 // Déplacement linéaire le long de l'axe
@@ -195,36 +238,252 @@ export class GLBViewer {
     }
 
     /**
+     * Lance une procédure de Tare (1 seconde)
+     */
+    startCalibration() {
+        console.log("⚖️ Calibration (Tare) en cours... Ne touchez à rien.");
+        this.isCalibrating = true;
+        this.calibrationBuffer.clear();
+        
+        setTimeout(() => {
+            this.finalizeCalibration();
+        }, 1000);
+    }
+
+    finalizeCalibration() {
+        for (const [id, values] of this.calibrationBuffer.entries()) {
+            const avg = values.reduce((a, b) => a + b, 0) / values.length;
+            const config = this.sensorConfigs.get(id) || {};
+            config.calibration = config.calibration || {};
+            config.calibration.offset = avg;
+            console.log(`✅ Capteur [${id}] calibré : offset = ${avg.toFixed(4)}`);
+        }
+        this.isCalibrating = false;
+        console.log("🚀 Calibration terminée. Robot prêt.");
+    }
+
+    /**
      * Met à jour la couleur des capteurs selon la pression reçue (0.0 à 1.0)
      */
     updateSensors(sensorValues) {
         for (const [id, value] of Object.entries(sensorValues)) {
+            // Phase de calibration : on enregistre les valeurs
+            if (this.isCalibrating) {
+                if (!this.calibrationBuffer.has(id)) this.calibrationBuffer.set(id, []);
+                this.calibrationBuffer.get(id).push(value);
+                continue;
+            }
+
             const taxel = this.taxelMeshes.get(id);
+            const fullConfig = this.sensorConfigs.get(id) || {};
+            const calib = fullConfig.calibration || {};
+            
             if (taxel) {
-                taxel.material.color.setRGB(value * 2, 0.1, 0.1); // Devient rouge vif sous pression
+                // 1. Application de l'offset et du scale
+                let calibratedValue = (value - (calib.offset || 0)) * (calib.scale || 1);
+                
+                // 2. Application de la zone morte
+                if (Math.abs(calibratedValue) < (calib.deadzone || 0)) calibratedValue = 0;
+                
+                // 3. Clamp (0.0 a 1.0) pour l'affichage
+                const finalValue = Math.max(0, Math.min(1, calibratedValue));
+
+                taxel.material.color.setRGB(finalValue * 2, 0.1, 0.1); 
             }
         }
     }
 
     loadModel(url) {
-        const loader = new GLTFLoader();
-        loader.load(url, (gltf) => {
-            this.scene.add(gltf.scene);
-
-            // Centrage automatique de la caméra sur le robot
-            const box = new THREE.Box3().setFromObject(gltf.scene);
-            const center = box.getCenter(new THREE.Vector3());
-            const size = box.getSize(new THREE.Vector3());
-            
-            this.controls.target.copy(center);
-            const maxDim = Math.max(size.x, size.y, size.z);
-            this.camera.position.set(center.x + maxDim, center.y + maxDim, center.z + maxDim);
-            this.controls.update();
-            
-            console.log(`[Viewer] Modèle chargé : ${url}`);
-        }, undefined, (error) => {
-            console.error("[Viewer] Erreur de chargement GLB:", error);
+        return new Promise((resolve, reject) => {
+            const loader = new GLTFLoader();
+            loader.load(url, 
+                (gltf) => {
+                    this.scene.add(gltf.scene);
+                    this.onModelReady(gltf.scene, url);
+                    resolve();
+            }, undefined, (error) => {
+                console.error("[Viewer] Erreur de chargement GLB:", error);
+                reject(error);
+            });
         });
+    }
+
+    loadOBJ(url) {
+        return new Promise((resolve, reject) => {
+            const loader = new OBJLoader();
+            loader.load(url, (obj) => {
+                this.scene.add(obj);
+                this.onModelReady(obj, url);
+                resolve();
+            }, undefined, (error) => {
+                console.error("[Viewer] Erreur de chargement OBJ:", error);
+                reject(error);
+            });
+        });
+    }
+
+    loadFBX(url) {
+        return new Promise((resolve, reject) => {
+            // Nécessaire pour le support des FBX compressés/binaires via fflate
+            window.fflate = fflate;
+            const loader = new FBXLoader();
+            loader.load(url, (fbx) => {
+                this.scene.add(fbx);
+                this.onModelReady(fbx, url);
+                resolve();
+            }, undefined, (error) => {
+                console.error("[Viewer] Erreur fatale FBX:", error);
+                reject(error);
+            });
+        });
+    }
+
+    /**
+     * Finalisation et analyse du modèle (Hiérarchie et Segmentation)
+     */
+    onModelReady(model, url) {
+        const isExtracted = url.includes('.glb');
+        console.log(`[Viewer] ${isExtracted ? '🛡️ Modèle stabilisé' : '📦 Modèle brut'} chargé : ${url}`);
+
+        // Normalisation de l'orientation globale du modèle
+        // Si le FBX arrive "couché", on redresse le root ici
+        if (url.toLowerCase().includes('hand')) {
+            model.rotation.x = 0; // Ajuster si la main est à plat ou verticale
+            model.updateMatrixWorld(true);
+        }
+
+        // Ajout d'un SkeletonHelper pour debugger le "pliage" (optionnel)
+        const helper = new THREE.SkeletonHelper(model);
+        helper.visible = false; // Activer pour voir les os
+        this.scene.add(helper);
+
+        model.traverse(node => {
+            if (node.name) {
+                this.meshes.set(node.name, node);
+                this.initialQuaternions.set(node.name, node.quaternion.clone());
+                
+                // Si c'est un os, on peut attacher un repère visuel plus discret
+                if (node.isBone) {
+                    const axes = new THREE.AxesHelper(0.02);
+                    node.add(axes);
+                }
+
+                if (node.isMesh) {
+                    node.castShadow = true;
+                    node.receiveShadow = true;
+                    
+                    // Si c'est un SkinnedMesh (modèle riggé), on active le skinning
+                    if (node.isSkinnedMesh) {
+                        node.frustumCulled = false; // Évite que le mesh disparaisse quand il se déforme
+                        
+                        // Injection d'un Shader personnalisé pour accentuer le pliage
+                        node.material.onBeforeCompile = (shader) => {
+                            shader.uniforms.uFlexionColor = { value: new THREE.Color(0x00ffff) };
+                            shader.vertexShader = `
+                                varying float vSkinWeight;
+                                ${shader.vertexShader}
+                            `.replace(
+                                `#include <skinnormal_vertex>`,
+                                `#include <skinnormal_vertex>
+                                 // On détecte la transition entre deux os (pliage)
+                                 vSkinWeight = (skinWeight.x > 0.1 && skinWeight.y > 0.1) ? 1.0 : 0.0;
+                                `
+                            );
+                            shader.fragmentShader = `
+                                uniform vec3 uFlexionColor;
+                                varying float vSkinWeight;
+                                ${shader.fragmentShader}
+                            `.replace(
+                                `#include <color_fragment>`,
+                                `#include <color_fragment>
+                                 diffuseColor.rgb = mix(diffuseColor.rgb, uFlexionColor, vSkinWeight * 0.6);
+                                `
+                            );
+                        };
+                    }
+                }
+            }
+        });
+
+        // Déduction proactive comme dans extract.js
+        this.analyzeProactive(model);
+
+        const box = new THREE.Box3().setFromObject(model);
+        const center = box.getCenter(new THREE.Vector3());
+        const size = box.getSize(new THREE.Vector3());
+        this.controls.target.copy(center);
+        const maxDim = Math.max(size.x, size.y, size.z);
+        this.camera.position.set(center.x + maxDim, center.y + maxDim, center.z + maxDim);
+        this.controls.update();
+        console.log(`[Viewer] Modèle prêt (${url}) : ${this.meshes.size} nœuds indexés.`);
+    }
+
+    /**
+     * Analyse proactive de la hiérarchie et des momentums géométriques
+     */
+    analyzeProactive(root) {
+        console.log("[Viewer] Analyse des momentums géométriques...");
+        root.traverse(node => {
+            if (!node.isMesh) return;
+            
+            // 1. Analyse sémantique des noms
+            const name = node.name.toLowerCase();
+            if (/wheel|roue|arm|bras|joint|pivot/i.test(name)) {
+                console.log(`🔍 Actuateur probable détecté par nom : ${node.name}`);
+            }
+
+            // 2. Détection d'îlots (segmentation de maillage fusionné)
+            if (node.geometry.attributes.position && node.geometry.attributes.position.count > 100) {
+                this.detectGeometricIslands(node);
+            }
+        });
+    }
+
+    /**
+     * Recherche de composants disjoints au sein d'une seule géométrie (Island Detection)
+     */
+    detectGeometricIslands(mesh) {
+        const geometry = mesh.geometry;
+        const pos = geometry.attributes.position.array;
+        const count = geometry.attributes.position.count;
+        const indices = geometry.index ? geometry.index.array : Array.from({length: count}, (_, i) => i);
+        
+        // Construction sommaire du graphe de connectivité
+        const adj = Array.from({ length: count }, () => []);
+        for (let i = 0; i < indices.length; i += 3) {
+            const a = indices[i], b = indices[i+1], c = indices[i+2];
+            adj[a].push(b, c); adj[b].push(a, c); adj[c].push(a, b);
+        }
+
+        const visited = new Uint8Array(count);
+        const islands = [];
+
+        for (let i = 0; i < count; i++) {
+            if (visited[i]) continue;
+            const island = { min: [Infinity, Infinity, Infinity], max: [-Infinity, -Infinity, -Infinity] };
+            const stack = [i];
+            visited[i] = 1;
+
+            while (stack.length > 0) {
+                const v = stack.pop();
+                for(let a=0; a<3; a++) {
+                    const val = pos[v*3+a];
+                    island.min[a] = Math.min(island.min[a], val);
+                    island.max[a] = Math.max(island.max[a], val);
+                }
+                for (const n of adj[v]) {
+                    if (!visited[n]) {
+                        visited[n] = 1;
+                        stack.push(n);
+                    }
+                }
+            }
+            islands.push(island);
+        }
+
+        if (islands.length > 1) {
+            console.log(`📦 Momentum : ${mesh.name} contient ${islands.length} sous-pièces distinctes.`);
+        }
     }
 
     onResize() {
