@@ -36,78 +36,6 @@ Movement is handled by a robust kinematic chain supporting both Forward (FK) and
 
 ---
 
-## 🛠 Quick Start: Control Loop & 3D Sync
-
-To run the system instantly, use the following pattern. It synchronizes your hardware data, bitwise logic, and the 3D visualizer using the same logic as the simulation in `test.js`.
-
-```javascript
-import { RobotFactory, Vector3, Quaternion } from './test.js';
-import { GLBViewer } from './public/viewer.js';
-
-// 1. Initialize the Engine and 3D Visualizer
-const { 
-    hub, actuators, varMap, safetyNet, behaviorNet, kinematicChain, sensorMapper 
-} = RobotFactory.build(robotConfig);
-
-const viewer = new GLBViewer('container-id');
-
-async function start() {
-    // Load the GLB model and setup skeletal mapping
-    await viewer.initRobot(robotConfig);
-    
-    // Launch the real-time loop (50Hz)
-    requestAnimationFrame(controlLoop);
-}
-
-function controlLoop() {
-    const deltaTime = 0.02; // 20ms steps
-
-    // 1. Fetch & Map raw sensor data (Analog to Vector)
-    const rawHardwareData = { "idx_p1": 0.8, "torque_wrist": 0.1 };
-    const sensorVector = sensorMapper.format(rawHardwareData);
-
-    // 2. Prepare Bitwise Decision Inputs
-    const decisionInputs = new Uint8Array(Object.keys(varMap).length);
-    // Example: Map raw pressure to binary "contact" variable
-    decisionInputs[varMap.contact] = rawHardwareData.idx_p1 > 0.5 ? 1 : 0;
-
-    // 3. Evaluate Safety Logic (Compiled Bitwise Network)
-    const isSafe = safetyNet.predict(decisionInputs)[0] === 1;
-
-    // 4. Resolve Kinematics & Postures
-    // Set a high-level target state from config
-    hub.selectState("index", "GRAB");
-    
-    // Optional: Solve Inverse Kinematics for a 3D coordinate
-    // kinematicChain.solveIK(new Vector3(0.1, 0.2, 0), actuators);
-
-    // 5. Update Physical Actuators (PID + Compliance + Logic)
-    actuators.forEach(actuator => {
-        // Get tactile pressure if a sensor is mapped to this specific joint
-        const sensorInfo = sensorMapper.registry.get(actuator.sensorId);
-        const pressure = sensorInfo ? sensorVector[sensorInfo.globalIndex] : 0;
-
-        actuator.update(
-            decisionInputs, 
-            hub.getTarget(actuator.group).orientation, 
-            0,          // currentLoad (Torque feedback)
-            isSafe,     // global movement enable
-            null,       // learnedTarget override
-            deltaTime,
-            pressure    // tactile feedback
-        );
-    });
-
-    // 6. Synchronize 3D Visualizer
-    viewer.updateJoints(actuators);        // Sync joint rotations
-    viewer.updateSensors(rawHardwareData); // Sync sensor heatmaps
-
-    requestAnimationFrame(controlLoop);
-}
-
-start();
-```
-
 ## 📄 Example Configuration (`robot_config.json`)
 
 This file defines the physical structure, the bitwise logic for safety, and the predefined postures.
@@ -191,6 +119,75 @@ This file defines the physical structure, the bitwise logic for safety, and the 
       { "label": "TOUCH", "input": [0.8], "output": [10, 45] }
     ]
   }
+}
+```
+
+To simulate a complete control loop to simulate the movement to the pose GRAB : 
+```javascript
+import { RobotFactory } from './test.js';
+import fs from 'fs';
+import path from 'path';
+
+// 1. Charger la configuration depuis le fichier JSON fourni
+const configPath = 'C:/Dev/robotic-awareness/robot_config.json';
+const robotConfig = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+
+// 2. Utiliser la Factory pour construire les composants
+// C'est ici que sensorMapper est généré !
+const { 
+    hub, 
+    actuators, 
+    varMap, 
+    safetyNet, 
+    sensorMapper 
+} = RobotFactory.build(robotConfig);
+
+console.log("=== G-NEURO STANDALONE DEMO ===");
+console.log(`Modèle chargé : ${robotConfig.metadata.name}`);
+console.log(`Capteurs configurés : ${sensorMapper.inputSize} points d'entrée`);
+
+// 3. Simulation de données brutes arrivant du Hardware (ex: Arduino/ESP32)
+const rawHardwareData = {
+    "idx_p1": 0.85,    // Pression forte sur l'index
+    "idx_p2": 0.10,
+    "torque_wrist": 0.05
+};
+
+// 4. Transformation des données brutes en vecteur via le sensorMapper
+// Il place 0.85 au bon index correspondant à "idx_p1" défini dans le JSON
+const sensorVector = sensorMapper.format(rawHardwareData);
+
+// 5. Préparation des entrées pour la logique binaire (Safety)
+const decisionInputs = new Uint8Array(Object.keys(varMap).length);
+
+// On mappe la pression de l'index sur la variable logique "contact"
+// Si pression > 0.5, alors contact = 1
+decisionInputs[varMap.contact] = rawHardwareData.idx_p1 > 0.5 ? 1 : 0;
+// On simule l'absence de feu
+decisionInputs[varMap.fire_detected] = 0;
+
+// 6. Évaluation de la sécurité via le réseau binaire compilé
+const isSafe = safetyNet.predict(decisionInputs)[0] === 1;
+
+console.log("\n--- Diagnostic Temps Réel ---");
+console.log(`État Logique [contact] : ${decisionInputs[varMap.contact]}`);
+console.log(`Sécurité Globale (safety_ok) : ${isSafe ? "✅ OK" : "❌ DANGER"}`);
+
+// 7. Mise à jour d'un actuateur spécifique
+const indexP1 = actuators.find(a => a.name === "Index_P1");
+
+if (indexP1) {
+    // On simule un mouvement vers la pose "GRAB"
+    const targetOrientation = hub.getTarget("index").orientation;
+    const pressure = sensorVector[sensorMapper.registry.get("idx_p1").globalIndex];
+
+    indexP1.update(
+        decisionInputs, 
+        targetOrientation, 
+        0, isSafe, null, 0.02, pressure
+    );
+
+    console.log(`Position Index_P1 : ${indexP1.currentValue.toFixed(2)}° (Pression tactile: ${pressure})`);
 }
 ```
 
