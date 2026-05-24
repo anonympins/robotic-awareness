@@ -50,17 +50,25 @@ export class GLBViewer {
         this.controls = new OrbitControls(this.camera, this.renderer.domElement);
         this.controls.enableDamping = true;
 
+        // Raycaster pour la sélection
+        this.raycaster = new THREE.Raycaster();
+        this.mouse = new THREE.Vector2();
+        this.selectedObject = null;
+        this.originalMaterials = new Map(); // Pour restaurer les couleurs après sélection
+
         // 5. Lumières
         const hemiLight = new THREE.HemisphereLight(0xffffff, 0x444444, 1.5);
         hemiLight.position.set(0, 20, 0);
         this.scene.add(hemiLight);
 
-        const dirLight = new THREE.DirectionalLight(0x00ffff, 0.8); // Teinte cyan pour le style technique
+        const dirLight = new THREE.DirectionalLight(0xffffff, 1.0);
         dirLight.position.set(5, 5, 5);
         this.scene.add(dirLight);
 
         this.animate();
         window.addEventListener('resize', () => this.onResize());
+        this.container.addEventListener('pointerdown', (e) => this.onPointerDown(e));
+
         this.meshes = new Map(); // Suivi des objets par nom
         this.initialQuaternions = new Map(); // Sauvegarde des poses de repos
         this.initialPositions = new Map(); // Positions de repos pour la déformation
@@ -71,9 +79,10 @@ export class GLBViewer {
         this.sensorConfigs = new Map();
         this.isCalibrating = false;
         this.calibrationBuffer = new Map(); // { sensorId: [values] }
+        this.config = null; // Stockage de la config globale
 
         // Initialisation de l'interface de contrôle
-        this.createUI();
+        this.initUnifiedUI();
     }
 
     /**
@@ -99,52 +108,309 @@ export class GLBViewer {
         console.log(`[Viewer] Qualité réglée sur : ${level}`);
     }
 
-    /**
-     * Génère l'interface de contrôle LOD en superposition
-     */
-    createUI() {
+    initUnifiedUI() {
         const ui = document.createElement('div');
-        ui.className = 'viewer-lod-controls';
+        ui.id = 'gneuro-control-panel';
         ui.style.cssText = `
             position: absolute;
             top: 20px;
             right: 20px;
-            background: rgba(10, 10, 10, 0.85);
-            border: 1px solid #00ffff;
-            padding: 12px;
-            border-radius: 8px;
-            color: #00ffff;
-            font-family: 'Segoe UI', Tahoma, sans-serif;
-            font-size: 11px;
+            width: 320px;
+            max-height: calc(100vh - 40px);
+            background: linear-gradient(135deg, rgba(5, 5, 5, 0.95) 0%, rgba(15, 25, 25, 0.9) 100%);
+            border-left: 2px solid #00ffff;
+            color: #e0f7f7;
+            font-family: 'Consolas', 'Monaco', monospace;
+            font-size: 12px;
             z-index: 1000;
-            pointer-events: auto;
-            box-shadow: 0 0 15px rgba(0, 255, 255, 0.2);
-            backdrop-filter: blur(4px);
+            box-shadow: -10px 0 30px rgba(0, 0, 0, 0.5);
+            backdrop-filter: blur(10px);
+            display: flex;
+            flex-direction: column;
+            border-radius: 4px 0 0 4px;
+            overflow-y: auto;
         `;
 
-        const label = document.createElement('div');
-        label.innerText = "ENGINE PRECISION";
-        label.style.cssText = "font-weight: bold; margin-bottom: 8px; letter-spacing: 1px; color: #fff; border-bottom: 1px solid #00ffff44; padding-bottom: 4px;";
-        ui.appendChild(label);
+        ui.innerHTML = `
+            <!-- Header -->
+            <div style="padding: 15px; background: rgba(0, 255, 255, 0.1); border-bottom: 1px solid #00ffff44; position: sticky; top: 0; z-index: 10;">
+                <div style="display: flex; justify-content: space-between; align-items: center;">
+                    <span style="color: #00ffff; font-weight: bold; letter-spacing: 2px;">G-NEURO // CORE</span>
+                    <span id="status-tag" style="background: #00ff00; color: #000; padding: 2px 6px; font-size: 9px; border-radius: 2px; font-weight: bold;">ACTIVE</span>
+                </div>
+                <div id="ui-sys-info" style="font-size: 10px; margin-top: 5px; opacity: 0.7;">MODEL: INITIALIZING...</div>
+            </div>
 
-        const select = document.createElement('select');
-        select.style.cssText = "width: 100%; background: #000; color: #00ffff; border: 1px solid #00ffff; padding: 5px; cursor: pointer; outline: none; border-radius: 4px;";
+            <!-- Global Controls Section -->
+            <div class="ui-group" style="padding: 15px; border-bottom: 1px solid #00ffff22;">
+                <div style="color: #00ffff; font-size: 10px; margin-bottom: 10px; opacity: 0.5;">ENGINE PARAMETERS</div>
+                
+                <div style="margin-bottom: 12px;">
+                    <label style="display: block; margin-bottom: 5px; font-size: 10px;">PRECISION MODE</label>
+                    <select id="lod-select" style="width: 100%; background: #000; color: #00ffff; border: 1px solid #00ffff44; padding: 6px; font-size: 11px; outline: none;">
+                        ${Object.keys(LOD_LEVELS).map(lvl => `<option value="${lvl}" ${lvl === this.quality ? 'selected' : ''}>${lvl.toUpperCase()}</option>`).join('')}
+                    </select>
+                </div>
+
+                <div style="display: flex; justify-content: space-between; font-size: 10px;">
+                    <span>SYSTEM VERSION</span>
+                    <span id="ui-sys-ver" style="color: #00ffff;">-</span>
+                </div>
+            </div>
+
+            <!-- Manual Controls Section (Adopted) -->
+            <div id="ui-external-section" style="display: none; border-bottom: 1px solid #00ffff22; background: rgba(0, 255, 255, 0.02);">
+                <div style="color: #00ffff; font-size: 10px; padding: 12px 15px 5px 15px; opacity: 0.5;">MANUAL OVERRIDE</div>
+                <div id="ui-external-container" style="padding: 0 15px 12px 15px;"></div>
+            </div>
+
+            <!-- Diagnostic / Target Section -->
+            <div id="ui-target-section" style="display: none; flex-grow: 1;">
+                <div style="background: rgba(255, 0, 255, 0.05); padding: 15px; border-bottom: 1px solid #ff00ff44;">
+                    <div style="color: #ff00ff; font-weight: bold; margin-bottom: 15px; display: flex; align-items: center; gap: 8px;">
+                        <span style="width: 8px; height: 8px; background: #ff00ff; border-radius: 50%; box-shadow: 0 0 5px #ff00ff;"></span>
+                        SUBSYSTEM DIAGNOSTIC
+                    </div>
+                    
+                    <div style="background: rgba(0,0,0,0.3); padding: 10px; border-radius: 4px; border: 1px solid #ff00ff22;">
+                        <div style="font-size: 14px; color: #ff00ff; margin-bottom: 10px;" id="target-name">ACTUATOR_ID</div>
+                        
+                        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 8px; font-size: 11px;">
+                            <div style="opacity: 0.5;">GROUP:</div><div id="target-group" style="text-align: right;">-</div>
+                            <div style="opacity: 0.5;">PARENT:</div><div id="target-parent" style="text-align: right;">-</div>
+                            <div style="opacity: 0.5;">KINEMATICS:</div><div id="target-kin" style="text-align: right;">-</div>
+                            <div style="opacity: 0.5;">LIMITS:</div><div id="target-limits" style="text-align: right; color: #00ffff;">-</div>
+                            <div style="opacity: 0.5;">VELOCITY:</div><div id="target-speed" style="text-align: right; color: #00ffff;">-</div>
+                        </div>
+                    </div>
+
+                    <button id="target-focus" style="margin-top: 15px; width: 100%; background: #ff00ff22; border: 1px solid #ff00ff; color: #ff00ff; padding: 8px; cursor: pointer; font-family: inherit; font-size: 10px; transition: all 0.2s;">
+                        FOCUS ON COMPONENT
+                    </button>
+                </div>
+            </div>
+
+            <!-- Empty State / Placeholder -->
+            <div id="ui-target-empty" style="padding: 40px 20px; text-align: center; color: #00ffff44; font-style: italic; font-size: 11px;">
+                <div style="margin-bottom: 10px; font-size: 20px;">[ ! ]</div>
+                AWAITING COMPONENT SELECTION...
+            </div>
+
+            <!-- Footer / Telemetry -->
+            <div style="padding: 10px; font-size: 9px; opacity: 0.4; border-top: 1px solid #00ffff11; margin-top: auto;">
+                NEURAL_LINK: STABLE // RENDER_LATENCY: <span id="ui-latency">16ms</span>
+            </div>
+        `;
+
+        this.container.appendChild(ui);
+
+        // Event Listeners
+        ui.querySelector('#lod-select').addEventListener('change', (e) => this.setQuality(e.target.value));
         
-        Object.keys(LOD_LEVELS).forEach(lvl => {
-            const opt = document.createElement('option');
-            opt.value = lvl;
-            opt.innerText = lvl.toUpperCase();
-            if (lvl === this.quality) opt.selected = true;
-            select.appendChild(opt);
+        const focusBtn = ui.querySelector('#target-focus');
+        focusBtn.addEventListener('mouseover', () => focusBtn.style.background = '#ff00ff44');
+        focusBtn.addEventListener('mouseout', () => focusBtn.style.background = '#ff00ff22');
+        focusBtn.addEventListener('click', () => {
+            if (this.selectedObject) {
+                const box = new THREE.Box3().setFromObject(this.selectedObject);
+                const center = box.getCenter(new THREE.Vector3());
+                this.controls.target.copy(center);
+                this.controls.update();
+            }
         });
 
-        select.addEventListener('change', (e) => this.setQuality(e.target.value));
+        this.uiElements = {
+            sysInfo: ui.querySelector('#ui-sys-info'),
+            sysVer: ui.querySelector('#ui-sys-ver'),
+            targetSection: ui.querySelector('#ui-target-section'),
+            targetEmpty: ui.querySelector('#ui-target-empty'),
+            targetName: ui.querySelector('#target-name'),
+            targetGroup: ui.querySelector('#target-group'),
+            targetParent: ui.querySelector('#target-parent'),
+            targetKin: ui.querySelector('#target-kin'),
+            targetLimits: ui.querySelector('#target-limits'),
+            targetSpeed: ui.querySelector('#target-speed'),
+            externalSection: ui.querySelector('#ui-external-section'),
+            externalContainer: ui.querySelector('#ui-external-container')
+        };
+    }
 
-        ui.appendChild(select);
-        this.container.appendChild(ui);
+    onPointerDown(event) {
+        const rect = this.renderer.domElement.getBoundingClientRect();
+        this.mouse.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+        this.mouse.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+
+        this.raycaster.setFromCamera(this.mouse, this.camera);
+
+        this.clearHighlight();
+
+        // Nouvelle méthode : Calcul de distance Rayon-Point pour capturer les articulations sans géométrie
+        const actuatorData = this.findActuatorByProximity();
+
+        if (actuatorData) {
+            const currentNode = this.meshes.get(actuatorData.name);
+            this.selectedObject = currentNode;
+            this.applyHighlight(currentNode); 
+            this.updateTargetUI(actuatorData.name);
+            console.log(`[Viewer] Actuateur sélectionné par proximité : ${actuatorData.name}`);
+        } else {
+            this.clearSelection();
+        }
+    }
+
+    /**
+     * Méthode mathématique : Trouve l'actuateur le plus proche du rayon de la souris
+     * même s'il n'a pas de géométrie (Bones/Empty).
+     */
+    findActuatorByProximity() {
+        if (!this.config) return null;
+
+        let closestActuator = null;
+        let minDistance = 0.03; // Seuil de clic (en unités monde, ex: 3cm)
+        const worldPos = new THREE.Vector3();
+
+        this.config.actuators.forEach(act => {
+            const node = this.meshes.get(act.name);
+            if (!node) return;
+
+            // Extraction de la position monde via la matrice de transformation
+            node.getWorldPosition(worldPos);
+
+            // Calcul de la distance entre la droite du Raycaster et le point pivot
+            // dist = |(P - A) x u|  où P est le point, A l'origine du rayon, u le vecteur direction
+            const dist = this.raycaster.ray.distanceSqToPoint(worldPos);
+
+            if (dist < minDistance) {
+                minDistance = dist;
+                closestActuator = act;
+            }
+        });
+
+        return closestActuator;
+    }
+
+    /**
+     * Recherche l'actuateur associé à un objet 3D en gérant les suffixes
+     * et la hiérarchie (Parenting) ou les influences de squelette.
+     */
+    findActuatorFromObject(obj, hitPoint = null) {
+        if (!this.config) return null;
+
+        // Cas spécifique des SkinnedMesh (FBX/GLB Riggés)
+        // Si on clique sur la "peau", on cherche l'os le plus proche du clic
+        if (obj.isSkinnedMesh && hitPoint) {
+            let closestBone = null;
+            let minDistance = Infinity;
+            const worldPos = new THREE.Vector3();
+
+            obj.skeleton.bones.forEach(bone => {
+                bone.getWorldPosition(worldPos);
+                const dist = worldPos.distanceTo(hitPoint);
+                if (dist < minDistance) {
+                    minDistance = dist;
+                    closestBone = bone;
+                }
+            });
+
+            if (closestBone) {
+                const boneMatch = this.matchNameWithConfig(closestBone.name);
+                if (boneMatch) return boneMatch;
+            }
+        }
+        
+        let current = obj;
+        while (current) {
+            // 1. Vérification userData (le plus rapide)
+            if (current.userData?.actuatorName) {
+                return this.config.actuators.find(a => a.name === current.userData.actuatorName);
+            }
+            
+            // 2. Vérification par nom (Flexible : accepte "Nom.001", "Nom_1", etc.)
+            const match = this.matchNameWithConfig(current.name);
+            if (match) return match;
+            
+            current = current.parent;
+        }
+        return null;
+    }
+
+    /**
+     * Helper interne pour le matching de nom
+     */
+    matchNameWithConfig(name) {
+        if (!name) return null;
+        const normalize = (s) => s.toLowerCase().replace(/[._-\s]/g, '');
+        const target = normalize(name);
+        
+        return this.config.actuators.find(a => {
+            const actName = normalize(a.name);
+            return target === actName || target.startsWith(actName + '0') || target.startsWith(actName + '_');
+        });
+    }
+
+    applyHighlight(mesh) {
+        if (!mesh.material) return;
+        
+        // Gestion multi-matériaux
+        const materials = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+        
+        materials.forEach(mat => {
+            if (mat.emissive) {
+                // Sauvegarde de l'état original si pas encore fait
+                const key = `${mesh.uuid}_${mat.uuid}`;
+                if (!this.originalMaterials.has(key)) {
+                    this.originalMaterials.set(key, { 
+                        emissive: mat.emissive.getHex(),
+                        mesh: mesh 
+                    });
+                }
+                mat.emissive.setHex(0x440044); // Violette G-NEURO
+            }
+        });
+    }
+
+    clearHighlight() {
+        this.originalMaterials.forEach((data, key) => {
+            const mesh = data.mesh;
+            const materials = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+            materials.forEach(mat => {
+                if (mat.emissive) mat.emissive.setHex(data.emissive);
+            });
+        });
+        this.originalMaterials.clear();
+    }
+
+    clearSelection() {
+        this.selectedObject = null;
+        this.uiElements.targetSection.style.display = 'none';
+        this.uiElements.targetEmpty.style.display = 'block';
+    }
+
+    updateTargetUI(name) {
+        if (!this.config) return;
+        const actuator = this.config.actuators.find(a => a.name === name);
+        if (!actuator) return;
+
+        this.uiElements.targetSection.style.display = 'block';
+        this.uiElements.targetEmpty.style.display = 'none';
+        
+        this.uiElements.targetName.innerText = actuator.name;
+        this.uiElements.targetGroup.innerText = actuator.group || 'N/A';
+        this.uiElements.targetParent.innerText = actuator.parent || 'N/A';
+        this.uiElements.targetKin.innerText = `${actuator.kinematics?.type} ([${actuator.kinematics?.axis?.join(',')}])`;
+        this.uiElements.targetLimits.innerText = `${actuator.config?.min}° / ${actuator.config?.max}°`;
+        this.uiElements.targetSpeed.innerText = `${actuator.config?.speed} rad/s`;
     }
 
     async initRobot(config) {
+        this.config = config;
+        
+        // Update System UI
+        if (this.uiElements) {
+            this.uiElements.sysInfo.innerText = `Model: ${config.metadata?.name || 'Unknown'}`;
+            this.uiElements.sysVer.innerText = `Version: ${config.version || '1.0'}`;
+        }
+
         // Priorité à l'URL extraite proactivement dans metadata
         const url = config.metadata?.model_url || config.visual?.model_url;
         
@@ -168,6 +434,31 @@ export class GLBViewer {
 
         // On complète toujours avec la config (pour les pièces/capteurs non présents dans le modèle)
         this.buildFromConfig(config);
+
+        // Integration du panneau de contrôle externe
+        this.integrateExternalUI();
+    }
+
+    /**
+     * Recherche le panneau #control-panel dans le document et l'insère 
+     * dans l'interface unifiée de G-NEURO.
+     */
+    integrateExternalUI() {
+        const external = document.getElementById('control-panel');
+        if (external && this.uiElements.externalContainer) {
+            this.uiElements.externalSection.style.display = 'block';
+            this.uiElements.externalContainer.appendChild(external);
+            
+            // Normalisation des styles pour forcer l'intégration visuelle
+            external.style.position = 'static';
+            external.style.width = '100%';
+            external.style.background = 'transparent';
+            external.style.border = 'none';
+            external.style.boxShadow = 'none';
+            external.style.padding = '0';
+            external.style.margin = '0';
+            external.style.color = 'inherit';
+        }
     }
 
     /**
@@ -224,6 +515,9 @@ export class GLBViewer {
                 const taxelGeom = new THREE.SphereGeometry(0.004, seg, seg);
                 const taxelMat = new THREE.MeshBasicMaterial({ color: 0x330000 });
                 const taxel = new THREE.Mesh(taxelGeom, taxelMat);
+                
+                // Lien explicite pour le Raycaster
+                taxel.userData.actuatorName = act.name;
                 
                 // Positionnement sur la face "interne" de la phalange
                 taxel.position.set(0, (act.primitive.height || 0.04) / 2, 0.006);
@@ -387,6 +681,10 @@ export class GLBViewer {
                 }
             }
             positionAttr.needsUpdate = true;
+            
+            // CRUCIAL : Recalculer les volumes pour que le raycasting suive la déformation
+            geometry.computeBoundingSphere();
+            geometry.computeBoundingBox();
         });
     }
 
