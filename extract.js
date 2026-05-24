@@ -172,7 +172,7 @@ async function extractProactiveConfig(inputPath, outputPath) {
     let variables = {};
     let varCounter = 0;
 
-    const processPotentialActuator = (node, name, translation, group, parentName = 'base') => {
+    const processPotentialActuator = (node, name, translation, rotation, group, parentName = 'base') => {
         const varName = `state_${name.toLowerCase().replace(/[^a-z0-9]/g, '_')}`;
         variables[varName] = varCounter++;
         
@@ -184,6 +184,7 @@ async function extractProactiveConfig(inputPath, outputPath) {
             group: extras.group || group,
             parent: parentName,
             offset: translation,
+            rotationOffset: rotation,
             kinematics: { 
                 type: extras.type || 'revolute', 
                 axis: extras.axis || [1, 0, 0] 
@@ -205,13 +206,15 @@ async function extractProactiveConfig(inputPath, outputPath) {
     const traverse = (node, parentName = 'base') => {
         const name = node.getName() || `node_${node.getUUID().substr(0, 5)}`;
         const translation = node.getTranslation() || [0, 0, 0];
+        const rotation = node.getRotation() || [0, 0, 0, 1]; // [x, y, z, w]
         const mesh = node.getMesh();
 
         // 1. DÉTECTION CINÉMATIQUE (Rigging/FBX)
-        let isActuator = animatedNodes.has(node) || skinJoints.has(node);
+        // On inclut explicitement les "Bones" pour garantir la structure du squelette
+        let isActuator = animatedNodes.has(node) || skinJoints.has(node) || /bone|joint/i.test(name);
 
         if (isActuator) {
-            processPotentialActuator(node, name, translation, "articulation", parentName);
+            processPotentialActuator(node, name, translation, rotation, "articulation", parentName);
         }
         // 2. DÉTECTION PAR SEGMENTATION OU CONTACT
         else if (mesh) {
@@ -234,7 +237,7 @@ async function extractProactiveConfig(inputPath, outputPath) {
                             (island.min[2] + island.max[2]) / 2
                         ];
                         const subName = `${name}_momentum_${pIdx}_${iIdx}`;
-                        processPotentialActuator(node, subName, centroid, /wheel|roue|tire/i.test(name) ? "locomotion" : "articulation", name);
+                        processPotentialActuator(node, subName, centroid, [0,0,0,1], /wheel|roue|tire/i.test(name) ? "locomotion" : "articulation", name);
                     });
                 } 
                 // 3. DÉTECTION PAR PROXIMITÉ (Jointures d'objets séparés)
@@ -245,7 +248,7 @@ async function extractProactiveConfig(inputPath, outputPath) {
                         const parentBox = getNodeAABB(parentNode);
                         if (parentBox && checkAABBContact(myBox, parentBox)) {
                             console.log(`🔗 Jointure par contact détectée entre ${parentName} et ${name}`);
-                            processPotentialActuator(node, name, translation, "articulation", parentName);
+                            processPotentialActuator(node, name, translation, rotation, "articulation", parentName);
                             isActuator = true;
                         }
                     }
@@ -253,7 +256,7 @@ async function extractProactiveConfig(inputPath, outputPath) {
                 
                 // 4. ANALYSE SÉMANTIQUE (Fallback final)
                 if (!isActuator && (name.toLowerCase().includes("wheel") || name.toLowerCase().includes("arm"))) {
-                    processPotentialActuator(node, name, translation, name.includes("wheel") ? "locomotion" : "articulation", parentName);
+                    processPotentialActuator(node, name, translation, rotation, name.includes("wheel") ? "locomotion" : "articulation", parentName);
                 }
             });
             }

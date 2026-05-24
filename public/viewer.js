@@ -205,6 +205,9 @@ export class GLBViewer {
                         act.rotationOffset[1] * Math.PI / 180,
                         act.rotationOffset[2] * Math.PI / 180
                     );
+                } else if (act.rotationOffset.length === 4) { // Quaternion [x, y, z, w]
+                    // glTF-Transform utilise [x, y, z, w], Three.js aussi
+                    mesh.quaternion.fromArray(act.rotationOffset);
                 }
             }
 
