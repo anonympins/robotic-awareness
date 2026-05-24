@@ -16,6 +16,13 @@ const LOD_LEVELS = {
     low: { segments: 0.25, anisotropy: 1, shadows: false, filter: THREE.NearestFilter }
 };
 
+// Objets de travail réutilisables pour éviter le Garbage Collection (Performance)
+const _v1 = new THREE.Vector3();
+const _q1 = new THREE.Quaternion();
+const _m1 = new THREE.Matrix4();
+const _worldPos = new THREE.Vector3();
+const _tempPos = new THREE.Vector3();
+
 export class GLBViewer {
     constructor(containerId) {
         this.container = document.getElementById(containerId);
@@ -54,6 +61,7 @@ export class GLBViewer {
         this.raycaster = new THREE.Raycaster();
         this.mouse = new THREE.Vector2();
         this.selectedObject = null;
+        this.skeletonHelper = null;
         this.originalMaterials = new Map(); // Pour restaurer les couleurs après sélection
 
         // 5. Lumières
@@ -480,7 +488,7 @@ export class GLBViewer {
             }
 
             // Fallback : Si l'actuateur n'est pas dans le modèle 3D, on crée une sphère debug
-            const primitiveData = act.primitive || { type: 'sphere', radius: 0.02, color: 0xff00ff };
+            const primitiveData = act.primitive || { type: 'sphere', radius: 0.005, color: 0xff00ff };
             
             const mesh = this.createPrimitive(primitiveData);
             mesh.name = act.name;
@@ -516,7 +524,7 @@ export class GLBViewer {
                 const taxelMat = new THREE.MeshBasicMaterial({ color: 0x330000 });
                 const taxel = new THREE.Mesh(taxelGeom, taxelMat);
                 
-                // Lien explicite pour le Raycaster
+                // Lien explicite pour le Raycaster sur les primitives ou mesh existants
                 taxel.userData.actuatorName = act.name;
                 
                 // Positionnement sur la face "interne" de la phalange
@@ -532,7 +540,10 @@ export class GLBViewer {
         // 2. Assemblage hiérarchique (Parent -> Enfant)
         config.actuators.forEach(act => {
             const mesh = this.meshes.get(act.name);
-            if (!mesh) return;
+            
+            // CRUCIAL : On ne re-parente QUE les primitives créées par le viewer.
+            // Si le mesh vient du modèle FBX (Bone/Mesh), on respecte sa hiérarchie d'origine.
+            if (!mesh || !mesh.userData.isPrimitive) return;
 
             const parentMesh = this.meshes.get(act.parent);
             if (act.parent === "base" || !parentMesh) {
@@ -564,6 +575,7 @@ export class GLBViewer {
             opacity: 0.9
         });
 
+        const mesh = new THREE.Mesh();
         switch (data.type) {
             case 'box':
                 const size = data.size || [0.1, 0.1, 0.1];
@@ -600,10 +612,14 @@ export class GLBViewer {
                 break;
             default:
                 const sSeg = Math.max(6, Math.floor(16 * lod.segments));
-                geometry = new THREE.SphereGeometry(0.02, sSeg, sSeg);
+                geometry = new THREE.SphereGeometry(data.radius || 0.02, sSeg, sSeg);
         }
 
-        return new THREE.Mesh(geometry, material);
+        mesh.geometry = geometry;
+        mesh.material = material;
+        mesh.userData.isPrimitive = true; // Marqueur pour buildFromConfig
+        
+        return mesh;
     }
 
     /**
@@ -611,29 +627,44 @@ export class GLBViewer {
      * @param {Array} actuators Liste des instances RobotActuator de test.js
      */
     updateJoints(actuators) {
+        if (!actuators) return;
+
         actuators.forEach(act => {
             const mesh = this.meshes.get(act.name);
-            if (!mesh) return;
+            if (!mesh) {
+                // Optionnel : décommenter pour débugger les noms
+                // console.warn(`[Viewer] Noeud introuvable pour l'actuateur : ${act.name}`);
+                return;
+            }
 
             // Support des Bones (SkinnedMesh) ET des Nodes standards
             const target = mesh; 
 
-            const axis = new THREE.Vector3(...act.kinematics.axis).normalize();
-            const angleRad = act.currentValue * (Math.PI / 180);
-            const q = new THREE.Quaternion().setFromAxisAngle(axis, angleRad);
+            // Récupération de la config pour le clamping
+            const actConfig = this.config?.actuators.find(a => a.name === act.name)?.config;
+            let val = act.currentValue;
+            if (actConfig) {
+                val = Math.max(actConfig.min, Math.min(actConfig.max, val));
+            }
+
+            _v1.set(...act.kinematics.axis).normalize();
+            const angleRad = val * (Math.PI / 180);
+            _q1.setFromAxisAngle(_v1, angleRad);
             const initialQ = this.initialQuaternions.get(act.name) || new THREE.Quaternion();
 
             if (act.kinematics.type === 'revolute') {
-                target.quaternion.copy(initialQ).multiply(q);
+                target.quaternion.copy(initialQ).multiply(_q1);
             } else if (act.kinematics.type === 'prismatic') {
                 const dist = act.currentValue / 1000;
-                const offset = new THREE.Vector3(...(act.offset || [0,0,0]));
-                target.position.copy(offset).add(axis.multiplyScalar(dist));
+                target.position.set(...(act.offset || [0,0,0])).addScaledVector(_v1, dist);
             }
         });
 
         // Application du "Neural Bending" sur les maillages monolithiques
         this.applyNeuralDeformation(actuators);
+
+        // Mise à jour globale efficace de la hiérarchie
+        this.scene.updateMatrixWorld(true);
     }
 
     /**
@@ -641,33 +672,42 @@ export class GLBViewer {
      */
     applyNeuralDeformation(actuators) {
         this.meshes.forEach((mesh, name) => {
+            // OPTIMISATION : On ignore les modèles déjà riggés (FBX/GLB avec os) 
+            // et on limite aux maillages de taille raisonnable (< 5000 sommets)
             if (!mesh.isMesh || mesh.isSkinnedMesh || !this.vertexWeights.has(name)) return;
+            
+            const geometry = mesh.geometry;
+            if (geometry.attributes.position.count > 5000) return; 
 
             const weights = this.vertexWeights.get(name);
-            const geometry = mesh.geometry;
             const positionAttr = geometry.attributes.position;
             const initialPos = this.initialPositions.get(name);
 
-            const tempPos = new THREE.Vector3();
             const finalPos = new THREE.Vector3();
-            const worldMatrixInv = mesh.matrixWorld.clone().invert();
+            
+            // Sécurité : éviter l'inversion de matrice nulle
+            const det = mesh.matrixWorld.determinant();
+            if (Math.abs(det) < 0.000001) return;
+            
+            _m1.copy(mesh.matrixWorld).invert();
 
             for (let i = 0; i < positionAttr.count; i++) {
                 finalPos.set(0, 0, 0);
-                tempPos.fromArray(initialPos, i * 3);
+                _tempPos.fromArray(initialPos, i * 3);
                 
                 // Passage en coordonnées monde pour calculer l'influence des joints
-                tempPos.applyMatrix4(mesh.matrixWorld);
+                _tempPos.applyMatrix4(mesh.matrixWorld);
 
                 let totalWeight = 0;
                 const vertexInfluence = weights[i]; // { jointName: weight }
+                if (!vertexInfluence) continue;
 
                 for (const [jointName, weight] of Object.entries(vertexInfluence)) {
                     const joint = this.meshes.get(jointName);
                     if (!joint) continue;
 
                     // On simule le mouvement du vertex comme s'il était attaché au joint
-                    const localToJoint = joint.worldToLocal(tempPos.clone());
+                    const localToJoint = _tempPos.clone().applyMatrix4(joint.matrixWorldInverse || _m1.copy(joint.matrixWorld).invert());
                     const movedPos = localToJoint.applyMatrix4(joint.matrixWorld);
                     
                     finalPos.addScaledVector(movedPos, weight);
@@ -676,7 +716,7 @@ export class GLBViewer {
 
                 if (totalWeight > 0) {
                     // Retour en coordonnées locales pour l'attribut de position
-                    finalPos.applyMatrix4(worldMatrixInv);
+                    finalPos.applyMatrix4(_m1);
                     positionAttr.setXYZ(i, finalPos.x, finalPos.y, finalPos.z);
                 }
             }
@@ -797,18 +837,21 @@ export class GLBViewer {
         console.log(`[Viewer] ${isExtracted ? '🛡️ Modèle stabilisé' : '📦 Modèle brut'} chargé : ${url}`);
 
         // Ajout d'un SkeletonHelper pour debugger le "pliage" (optionnel)
-        const helper = new THREE.SkeletonHelper(model);
-        helper.visible = false; // Activer pour voir les os
-        this.scene.add(helper);
+        if (this.skeletonHelper) this.scene.remove(this.skeletonHelper);
+        this.skeletonHelper = new THREE.SkeletonHelper(model);
+        this.scene.add(this.skeletonHelper);
 
         model.traverse(node => {
             if (node.name) {
-                // Logique de sélection : Priorité aux Bones pour l'articulation
-                // Si un os et un mesh portent le même nom, on préfère l'os pour les contrôles
-                const existing = this.meshes.get(node.name);
+                // Amélioration du mapping : on cherche si ce noeud correspond à un actuateur de la config
+                const match = this.matchNameWithConfig(node.name);
+                const actuatorKey = match ? match.name : node.name;
+
+                // Priorité aux Bones : si on a déjà un Mesh mais qu'on trouve un Bone pour le même nom, on remplace
+                const existing = this.meshes.get(actuatorKey);
                 if (!existing || (!existing.isBone && node.isBone)) {
-                    this.meshes.set(node.name, node);
-                    this.initialQuaternions.set(node.name, node.quaternion.clone());
+                    this.meshes.set(actuatorKey, node);
+                    this.initialQuaternions.set(actuatorKey, node.quaternion.clone());
                 }
 
                 if (node.isMesh) {
@@ -832,8 +875,6 @@ export class GLBViewer {
         this.analyzeProactive(model);
 
         const box = new THREE.Box3().setFromObject(model);
-        // On ne centre pas brutalement si on veut garder l'alignement avec les actuateurs
-        // On utilise le centre pour la caméra, mais on laisse le modèle là où il est défini
         const size = box.getSize(new THREE.Vector3());
         const center = box.getCenter(new THREE.Vector3());
         
@@ -954,6 +995,7 @@ export class GLBViewer {
     animate() {
         requestAnimationFrame(() => this.animate());
         this.controls.update();
+
         this.renderer.render(this.scene, this.camera);
     }
 }
