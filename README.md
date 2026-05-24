@@ -36,57 +36,165 @@ Movement is handled by a robust kinematic chain supporting both Forward (FK) and
 
 ---
 
-## 🏗 Building the Engine
+## 🛠 Quick Start: Control Loop & 3D Sync
 
-The `RobotFactory` is the main entry point to instantiate the entire system from a configuration file.
+To run the system instantly, use the following pattern. It synchronizes your hardware data, bitwise logic, and the 3D visualizer using the same logic as the simulation in `test.js`.
 
 ```javascript
-import { RobotFactory } from './test.js';
+import { RobotFactory, Vector3, Quaternion } from './test.js';
+import { GLBViewer } from './public/viewer.js';
 
-// 1. Build the full stack from JSON
+// 1. Initialize the Engine and 3D Visualizer
 const { 
-    hub,             // Target/Posture manager
-    actuators,       // Array of RobotActuator instances
-    safetyNet,       // Compiled safety logic
-    kinematicChain,  // FK/IK Solver
-    sensorMapper     // Raw data to Bitwise mapper
-} = RobotFactory.build(robotConfiguration);
-```
+    hub, actuators, varMap, safetyNet, behaviorNet, kinematicChain, sensorMapper 
+} = RobotFactory.build(robotConfig);
 
----
+const viewer = new GLBViewer('container-id');
 
-## 🛠 Usage Guide
+async function start() {
+    // Load the GLB model and setup skeletal mapping
+    await viewer.initRobot(robotConfig);
+    
+    // Launch the real-time loop (50Hz)
+    requestAnimationFrame(controlLoop);
+}
 
-### Control Loop Implementation
-Here is how you typically run the control loop to sync logic, sensors, and hardware:
-
-```javascript
 function controlLoop() {
-    // 1. Prepare inputs (from real sensors or state)
-    const decisionInputs = sensorMapper.format(rawHardwareData);
+    const deltaTime = 0.02; // 20ms steps
 
-    // 2. Resolve High-Level Posture (e.g., "GRAB")
+    // 1. Fetch & Map raw sensor data (Analog to Vector)
+    const rawHardwareData = { "idx_p1": 0.8, "torque_wrist": 0.1 };
+    const sensorVector = sensorMapper.format(rawHardwareData);
+
+    // 2. Prepare Bitwise Decision Inputs
+    const decisionInputs = new Uint8Array(Object.keys(varMap).length);
+    // Example: Map raw pressure to binary "contact" variable
+    decisionInputs[varMap.contact] = rawHardwareData.idx_p1 > 0.5 ? 1 : 0;
+
+    // 3. Evaluate Safety Logic (Compiled Bitwise Network)
+    const isSafe = safetyNet.predict(decisionInputs)[0] === 1;
+
+    // 4. Resolve Kinematics & Postures
+    // Set a high-level target state from config
     hub.selectState("index", "GRAB");
-    const target = hub.getTarget("index"); // Returns target orientation/position
+    
+    // Optional: Solve Inverse Kinematics for a 3D coordinate
+    // kinematicChain.solveIK(new Vector3(0.1, 0.2, 0), actuators);
 
-    // 3. Optional: Solve Inverse Kinematics for a 3D point
-    kinematicChain.solveIK(new Vector3(0.1, 0.2, 0), actuators);
-
-    // 4. Update Actuators (PID + Safety + Compliance)
+    // 5. Update Physical Actuators (PID + Compliance + Logic)
     actuators.forEach(actuator => {
+        // Get tactile pressure if a sensor is mapped to this specific joint
+        const sensorInfo = sensorMapper.registry.get(actuator.sensorId);
+        const pressure = sensorInfo ? sensorVector[sensorInfo.globalIndex] : 0;
+
         actuator.update(
             decisionInputs, 
-            target.orientation, 
-            currentLoad,      // Ampere/Torque feedback
-            true              // Global enable
+            hub.getTarget(actuator.group).orientation, 
+            0,          // currentLoad (Torque feedback)
+            isSafe,     // global movement enable
+            null,       // learnedTarget override
+            deltaTime,
+            pressure    // tactile feedback
         );
     });
 
+    // 6. Synchronize 3D Visualizer
+    viewer.updateJoints(actuators);        // Sync joint rotations
+    viewer.updateSensors(rawHardwareData); // Sync sensor heatmaps
+
     requestAnimationFrame(controlLoop);
+}
+
+start();
+```
+
+## 📄 Example Configuration (`robot_config.json`)
+
+This file defines the physical structure, the bitwise logic for safety, and the predefined postures.
+
+```json
+{
+  "version": "1.1",
+  "metadata": { 
+    "name": "G-NEURO-PROTOTYPE-V1",
+    "model_url": "models/robot_hand.glb"
+  },
+  "system_settings": {
+    "loop_frequency_hz": 50,
+    "ik_solver_type": "CCD"
+  },
+  "variables": {
+    "is_active": 0,
+    "contact_detected": 1,
+    "emergency_stop": 2
+  },
+  "sensors": {
+    "tactile_skin": {
+      "type": "analog_array",
+      "mapping": [
+        { "id": "finger_tip_01", "label": "Index Tip Sensor" }
+      ]
+    }
+  },
+  "logic": {
+    "safety_ok": {
+      "type": "AND",
+      "args": [
+        { "type": "NOT", "args": [{ "var": "emergency_stop" }] }
+      ]
+    },
+    "behavior": {
+      "grasp_ready": { 
+        "type": "AND", 
+        "args": [{ "var": "is_active" }, { "var": "contact_detected" }] 
+      }
+    }
+  },
+  "kinematics": {
+    "arm_group": {
+      "states": [
+        { "tag": "REST", "euler": [0, 0, 0], "pos": [0, 0, 0] },
+        { "tag": "GRAB", "euler": [0, 45, 0], "values": { "finger_joint": 70 } }
+      ]
+    }
+  },
+  "actuators": [
+    {
+      "name": "base_joint",
+      "group": "arm_group",
+      "parent": "base",
+      "offset": [0, 0, 0],
+      "kinematics": { "type": "revolute", "axis": [0, 0, 1] },
+      "primitive": { "type": "box", "size": [0.1, 0.1, 0.1], "color": "#00ffff" },
+      "config": { 
+        "min": -180, "max": 180, "speed": 1.0, "kp": 0.8,
+        "safety_rules": [
+          { "condition": { "var": "emergency_stop" }, "action": "HALT", "severity": "CRITICAL" }
+        ]
+      }
+    },
+    {
+      "name": "finger_joint",
+      "group": "arm_group",
+      "parent": "base_joint",
+      "offset": [0, 0.1, 0],
+      "kinematics": { "type": "revolute", "axis": [1, 0, 0] },
+      "primitive": { "type": "cylinder", "radius": 0.02, "height": 0.08, "color": "#ff00ff" },
+      "config": {
+        "min": 0, "max": 90, "speed": 2.0, "sensorId": "finger_tip_01"
+      }
+    }
+  ],
+  "training": {
+    "examples": [
+      { "label": "IDLE", "input": [0], "output": [0, 0] },
+      { "label": "TOUCH", "input": [0.8], "output": [10, 45] }
+    ]
+  }
 }
 ```
 
-### Automated Configuration Extraction
+### 🛠 Automated Configuration Extraction
 If you have a new 3D model (e.g., a rigged FBX hand) and need a starting `robot_config.json`:
 
 ```bash
