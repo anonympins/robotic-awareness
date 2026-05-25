@@ -477,21 +477,22 @@ export class GLBViewer {
 
         // 1. Création de tous les maillons
         config.actuators.forEach(act => {
-            // Si l'objet existe déjà dans le modèle global (par son nom), on ne crée pas de primitive
-            if (this.meshes.has(act.name)) {
-                console.log(`[Viewer] Utilisation du mesh existant pour : ${act.name}`);
-                
-                // Ajout d'une aide visuelle sur le mesh existant pour confirmer le joint
-                const jointMarker = new THREE.AxesHelper(0.05);
-                this.meshes.get(act.name).add(jointMarker);
-                return;
-            }
-
+            let existingMesh = this.meshes.get(act.name);
+            
             // Fallback : Si l'actuateur n'est pas dans le modèle 3D, on crée une sphère debug
             const primitiveData = act.primitive || { type: 'sphere', radius: 0.005, color: 0xff00ff };
             
             const mesh = this.createPrimitive(primitiveData);
             mesh.name = act.name;
+
+            if (existingMesh) {
+                console.log(`[Viewer] Overlay primitive sur mesh existant : ${act.name}`);
+                // On rend la primitive semi-transparente pour voir à travers le modèle original
+                mesh.material.opacity = 0.4;
+                mesh.material.wireframe = true;
+                existingMesh.add(mesh);
+                return;
+            }
             
             // Positionnement initial relatif au parent
             if (act.offset) mesh.position.set(...act.offset);

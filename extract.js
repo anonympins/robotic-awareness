@@ -231,7 +231,7 @@ async function extractProactiveConfig(inputPath, outputPath) {
     let variables = {};
     let varCounter = 0;
 
-    const processPotentialActuator = (node, name, translation, rotation, group, parentName = 'base') => {
+    const processPotentialActuator = (node, name, translation, rotation, group, parentName = 'base', primitive = null) => {
         const varName = `state_${name.toLowerCase().replace(/[^a-z0-9]/g, '_')}`;
         variables[varName] = varCounter++;
         
@@ -244,6 +244,7 @@ async function extractProactiveConfig(inputPath, outputPath) {
             parent: parentName,
             offset: translation,
             rotationOffset: rotation,
+            primitive: primitive || extras.primitive || null,
             kinematics: { 
                 type: extras.type || 'revolute', 
                 axis: extras.axis || [1, 0, 0] 
@@ -289,7 +290,15 @@ async function extractProactiveConfig(inputPath, outputPath) {
             const relT = Mat4.getTranslation(relativeMatrix);
             const relR = Mat4.getRotation(relativeMatrix);
 
-            processPotentialActuator(node, name, relT, relR, "articulation", parentName);
+            // Tentative de récupération de la géométrie locale pour la collision
+            const box = getNodeAABB(node);
+            const primitive = box ? { 
+                type: 'box', 
+                size: [box.max[0] - box.min[0], box.max[1] - box.min[1], box.max[2] - box.min[2]],
+                color: /wheel|tire/i.test(name) ? "#444444" : "#00ffff"
+            } : null;
+
+            processPotentialActuator(node, name, relT, relR, "articulation", parentName, primitive);
             actuatorWorldMatrices.set(name, worldMatrix);
         }
         // 2. DÉTECTION PAR SEGMENTATION OU CONTACT
@@ -313,7 +322,13 @@ async function extractProactiveConfig(inputPath, outputPath) {
                             (island.min[2] + island.max[2]) / 2
                         ];
                         const subName = `${name}_momentum_${pIdx}_${iIdx}`;
-                        processPotentialActuator(node, subName, centroid, [0,0,0,1], /wheel|roue|tire/i.test(name) ? "locomotion" : "articulation", name);
+                        const size = [
+                            island.max[0] - island.min[0],
+                            island.max[1] - island.min[1],
+                            island.max[2] - island.min[2]
+                        ];
+                        const primitive = { type: 'box', size, color: "#ff00ff" };
+                        processPotentialActuator(node, subName, centroid, [0,0,0,1], /wheel|roue|tire/i.test(name) ? "locomotion" : "articulation", name, primitive);
                     });
                 } 
                 // 3. DÉTECTION PAR PROXIMITÉ (Jointures d'objets séparés)
@@ -332,7 +347,22 @@ async function extractProactiveConfig(inputPath, outputPath) {
                 
                 // 4. ANALYSE SÉMANTIQUE (Fallback final)
                 if (!isActuator && (name.toLowerCase().includes("wheel") || name.toLowerCase().includes("arm"))) {
-                    processPotentialActuator(node, name, translation, rotation, name.includes("wheel") ? "locomotion" : "articulation", parentName);
+                    const parentActuatorMatrix = actuatorWorldMatrices.get(parentName);
+                    const invParent = Mat4.invert(parentActuatorMatrix);
+                    const relativeMatrix = Mat4.multiply(invParent, worldMatrix);
+                    const relT = Mat4.getTranslation(relativeMatrix);
+                    const relR = Mat4.getRotation(relativeMatrix);
+
+                    const box = getNodeAABB(node);
+                    const primitive = box ? { 
+                        type: 'box', 
+                        size: [box.max[0] - box.min[0], box.max[1] - box.min[1], box.max[2] - box.min[2]],
+                        color: name.includes("wheel") ? "#444444" : "#00ffff"
+                    } : null;
+
+                    processPotentialActuator(node, name, relT, relR, name.includes("wheel") ? "locomotion" : "articulation", parentName, primitive);
+                    isActuator = true; // Pour la récursion
+                    actuatorWorldMatrices.set(name, worldMatrix);
                 }
             });
             }

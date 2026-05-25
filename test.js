@@ -1161,13 +1161,63 @@ export class MeshAwarenessUtils {
     }
 
     /**
+     * Génère une AABB locale à partir d'une description de primitive.
+     * Aligné sur la logique de pivot du viewer (pivot à la base pour cylinders/boxes).
+     */
+    static getLocalBoxFromPrimitive(primitive) {
+        if (!primitive) return null;
+        let min = [-0.01, -0.01, -0.01], max = [0.01, 0.01, 0.01];
+
+        if (primitive.type === 'box') {
+            const size = primitive.size || [0.1, 0.1, 0.1];
+            // Pivot à la base (centre-bas)
+            min = [-size[0] / 2, 0, -size[2] / 2];
+            max = [size[0] / 2, size[1], size[2] / 2];
+        } else if (primitive.type === 'cylinder' || primitive.type === 'pyramid') {
+            const r = primitive.radius || 0.05;
+            const h = primitive.height || 0.1;
+            min = [-r, 0, -r];
+            max = [r, h, r];
+        } else if (primitive.type === 'sphere') {
+            const r = primitive.radius || 0.02;
+            min = [-r, -r, -r];
+            max = [r, r, r];
+        }
+        return {
+            min: new Vector3(...min),
+            max: new Vector3(...max)
+        };
+    }
+
+    /**
      * Algorithme ultra-rapide d'intersection AABB-AABB (6 comparaisons).
      * C'est l'algorithme au temps d'exécution le plus prédictible pour la 3D.
      */
-    static intersects(boxA, boxB) {
-        return (boxA.min.x <= boxB.max.x && boxA.max.x >= boxB.min.x) &&
-               (boxA.min.y <= boxB.max.y && boxA.max.y >= boxB.min.y) &&
-               (boxA.min.z <= boxB.max.z && boxA.max.z >= boxB.min.z);
+    static intersects(boxA, boxB, padding = 0) {
+        return (boxA.min.x - padding <= boxB.max.x && boxA.max.x + padding >= boxB.min.x) &&
+               (boxA.min.y - padding <= boxB.max.y && boxA.max.y + padding >= boxB.min.y) &&
+               (boxA.min.z - padding <= boxB.max.z && boxA.max.z >= boxB.min.z);
+    }
+
+    /**
+     * Intersection Sphère-Sphère avec marge de sécurité.
+     */
+    static intersectsSphereSphere(s1, s2, padding = 0) {
+        const distSq = s1.center.distanceToSquared(s2.center);
+        const radiusSum = s1.radius + s2.radius + padding;
+        return distSq <= radiusSum * radiusSum;
+    }
+
+    /**
+     * Intersection Sphère-AABB avec marge de sécurité.
+     */
+    static intersectsSphereAABB(sphere, aabb, padding = 0) {
+        const x = Math.max(aabb.min.x, Math.min(sphere.center.x, aabb.max.x));
+        const y = Math.max(aabb.min.y, Math.min(sphere.center.y, aabb.max.y));
+        const z = Math.max(aabb.min.z, Math.min(sphere.center.z, aabb.max.z));
+        const distSq = (x - sphere.center.x) ** 2 + (y - sphere.center.y) ** 2 + (z - sphere.center.z) ** 2;
+        const paddedRadius = sphere.radius + padding;
+        return distSq <= paddedRadius * paddedRadius;
     }
 
     /**
@@ -2009,6 +2059,7 @@ export class RobotActuator {
         this.group = config.group || "default"; // Groupe cinématique
         this.directJointCommand = null; // New: For explicit joint value commands from postures
         this.sensorId = config.sensorId || null; // Capteur tactile associé
+        this.repulsion = config.repulsion !== undefined ? config.repulsion : true; // Répulsion débrayable
 
         // Lissage (Low-pass filter)
         this.filtering = config.filtering || { alpha: 0.05 }; // Plus doux pour éviter les sauts
@@ -2255,6 +2306,8 @@ export class Link {
         this.currentWorldRotation = new Quaternion(); // Orientation de ce joint dans le repère monde
         this.localBox = null; // Box locale
         this.worldAABB = null; // Box calculée dans le monde après FK
+        this.localSpheres = []; // Sphères de collision locales {offset, radius}
+        this.worldSpheres = []; // Sphères transformées dans le monde
     }
 
     // Calcule la transformation locale en réutilisant les objets out
@@ -2283,6 +2336,8 @@ export class KinematicChain {
         this.links = new Map(); // Map<string, Link> pour un accès rapide par nom
         this.baseOffset = new Vector3(...baseOffset); // Position de la base du robot dans le monde
         this.baseRotation = new Quaternion(...baseRotation); // Orientation de la base du robot dans le monde
+        this.safetyPadding = 0.025; // 2.5cm de zone de confort (padding)
+        this.repulsionStrength = 0.4; // Force de poussée du champ répulsif
         this.orderedLinks = []; // Liste ordonnée des maillons pour le calcul FK
         
         // Buffers de calcul pour éviter le GC
@@ -2290,6 +2345,7 @@ export class KinematicChain {
         this._tempTrans = new Vector3();
         this._tempWorldBaseRot = new Quaternion();
         this._tempVec = new Vector3();
+        this._tempVec2 = new Vector3();
         this.worldVelocity = new Vector3(0, 0, 0);
     }
 
@@ -2333,6 +2389,22 @@ export class KinematicChain {
                 actConfig.kinematics.axis,
                 actConfig.primitive || null
             );
+            // Initialisation de la boite de collision locale pour le calcul des AABB
+            link.localBox = MeshAwarenessUtils.getLocalBoxFromPrimitive(actConfig.primitive);
+            
+            // Génération de sphères de collision pour les formes allongées
+            if (actConfig.primitive && (actConfig.primitive.type === 'cylinder' || actConfig.primitive.type === 'box')) {
+                const h = actConfig.primitive.height || (actConfig.primitive.size ? actConfig.primitive.size[1] : 0.1);
+                const r = actConfig.primitive.radius || (actConfig.primitive.size ? Math.min(actConfig.primitive.size[0], actConfig.primitive.size[2])/2 : 0.05);
+                
+                // On répartit 3 sphères le long du segment (base, milieu, haut)
+                for (let step = 0; step <= 1; step += 0.5) {
+                    link.localSpheres.push({
+                        offset: new Vector3(0, h * step, 0),
+                        radius: r
+                    });
+                }
+            }
             this.addLink(link);
         });
 
@@ -2395,6 +2467,14 @@ export class KinematicChain {
                 );
             }
 
+            // Mise à jour des Sphères de collision en coordonnées Monde
+            link.worldSpheres = link.localSpheres.map(ls => {
+                const center = new Vector3();
+                link.currentWorldRotation.rotateVector(ls.offset, center);
+                center.addInPlace(link.currentPosition);
+                return { center, radius: ls.radius };
+            });
+
             link.currentJointValue = jointValue;
         }
 
@@ -2406,18 +2486,35 @@ export class KinematicChain {
 
     /**
      * Vérifie les auto-collisions entre tous les maillons.
-     * Exclut les paires parent-enfant directes (qui se touchent toujours).
+     * Exclut les paires parent-enfant directes (qui sont naturellement en contact).
      */
-    checkSelfCollision() {
+    checkSelfCollision(padding = 0) {
         const collisions = [];
         const linkArray = Array.from(this.links.values());
         for (let i = 0; i < linkArray.length; i++) {
-            for (let j = i + 2; j < linkArray.length; j++) { // i+2 évite le parent direct
+            for (let j = i + 1; j < linkArray.length; j++) {
                 const a = linkArray[i], b = linkArray[j];
-                if (a.worldAABB && b.worldAABB) {
-                    if (MeshAwarenessUtils.intersects(a.worldAABB, b.worldAABB)) {
-                        collisions.push({ a: a.name, b: b.name });
+                if (a.parentName === b.name || b.parentName === a.name) continue;
+
+                let hasCollision = false;
+
+                // Priorité aux sphères pour la précision sur les segments
+                if (a.worldSpheres.length > 0 && b.worldSpheres.length > 0) {
+                    for (const sA of a.worldSpheres) {
+                        for (const sB of b.worldSpheres) {
+                            if (MeshAwarenessUtils.intersectsSphereSphere(sA, sB, padding)) {
+                                hasCollision = true; break;
+                            }
+                        }
+                        if (hasCollision) break;
                     }
+                } else if (a.worldAABB && b.worldAABB) {
+                    // Fallback sur AABB si pas de sphères définies
+                    hasCollision = MeshAwarenessUtils.intersects(a.worldAABB, b.worldAABB, padding);
+                }
+
+                if (hasCollision) {
+                    collisions.push({ a: a.name, b: b.name });
                 }
             }
         }
@@ -2452,6 +2549,9 @@ export class KinematicChain {
                 const currentEE = fk.position;
                 const currentVal = currentJointValues.get(actuator.name);
                 
+                // Sauvegarde pour rollback en cas de collision
+                const prevIkTarget = actuator.ikTarget;
+
                 const distToTarget = currentEE.distanceTo(targetPos);
                 if (distToTarget < convergenceThreshold) return; // Sortie anticipée "propre"
 
@@ -2467,8 +2567,7 @@ export class KinematicChain {
                     // Vecteurs Joint->Effecteur et Joint->Cible normalisés
                     const vEE = currentEE.sub(jointOrigin, this._tempVec).normalize();
                     // On utilise un second buffer pour ne pas écraser le premier
-                    const vTarget = targetPos.sub(jointOrigin, new Vector3()).normalize(); 
-                    // Note: Idéalement, ajoutez _tempVec2 dans le constructeur de KinematicChain
+                    const vTarget = targetPos.sub(jointOrigin, this._tempVec2).normalize(); 
 
                     // Calcul de l'angle nécessaire (produit scalaire)
                     let dot = vEE.dot(vTarget);
@@ -2493,9 +2592,39 @@ export class KinematicChain {
                     actuator.ikTarget = currentVal + (dir * damping * 100);
                 }
 
-                // Application immédiate des limites articulaires (Intégration directe)
-                actuator.ikTarget = Math.max(actuator.min, Math.min(actuator.max, actuator.ikTarget));
+                // --- CHAMP DE POTENTIEL RÉPULSIF ---
+                // On vérifie si la nouvelle cible entre dans la zone de padding
                 currentJointValues.set(actuator.name, actuator.ikTarget);
+                this.calculateFK(currentJointValues);
+                
+                const warnings = this.checkSelfCollision(this.safetyPadding);
+                for (const collision of warnings) {
+                    // On ne repousse que si les deux membres en collision ont la répulsion activée
+                    const actA = allActuators.get(collision.a);
+                    const actB = allActuators.get(collision.b);
+
+                    if (actA && actB && actA.repulsion && actB.repulsion) {
+                        if (actuator.name === collision.a || actuator.name === collision.b) {
+                            const pushDir = actuator.ikTarget > currentVal ? -1 : 1;
+                            const nudge = (actuator.max - actuator.min) * 0.05 * this.repulsionStrength;
+                            actuator.ikTarget += pushDir * nudge;
+                            break; // Un seul nudge par étape suffit
+                        }
+                    }
+                }
+
+                // Application finale des limites articulaires
+                actuator.ikTarget = Math.max(actuator.min, Math.min(actuator.max, actuator.ikTarget));
+
+                // --- ÉVITEMENT DE COLLISION CRITIQUE (Hard Stop) ---
+                currentJointValues.set(actuator.name, actuator.ikTarget);
+                this.calculateFK(currentJointValues);
+                if (this.checkSelfCollision(0).length > 0) {
+                    // Si collision, on revient à l'état précédent (ou au filtre actuel si premier IK)
+                    actuator.ikTarget = prevIkTarget !== null ? prevIkTarget : currentVal;
+                    currentJointValues.set(actuator.name, actuator.ikTarget);
+                    this.calculateFK(currentJointValues); // Restaure l'état FK cohérent
+                }
             }
         }
     }
@@ -2548,6 +2677,12 @@ export class RobotFactory {
         }
         // 3. Construction de la chaîne cinématique
         const kinematicChain = new KinematicChain();
+
+        if (config.system_settings) {
+            if (config.system_settings.safety_padding !== undefined) kinematicChain.safetyPadding = config.system_settings.safety_padding;
+            if (config.system_settings.repulsion_strength !== undefined) kinematicChain.repulsionStrength = config.system_settings.repulsion_strength;
+        }
+
         kinematicChain.buildChain(config.actuators); // Passe les configurations brutes des actuateurs
 
         // 0. Compilation des réseaux logiques (après varMap complet)

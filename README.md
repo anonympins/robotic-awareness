@@ -201,6 +201,99 @@ node extract.js ./models/my-robot.fbx ./my-config.json
 
 ---
 
+## 📚 API & Neuron Documentation
+
+### 1. Mathematical Foundation
+
+#### `Quaternion`
+High-performance 4D complex number class for spatial rotation.
+*   **`fromEuler(x, y, z)`**: Creates a quaternion from degrees.
+*   **`rotateVector(v)`**: Rotates a `Vector3` using an optimized Rodrigues formula (avoids full matrix multiplication).
+*   **`static slerp(q1, q2, t)`**: Performs Spherical Linear Interpolation for smooth motion between two poses.
+
+#### `Vector3`
+Standard 3D vector class optimized for zero-allocation reuse.
+*   **`dot(v)` / `cross(v)`**: Standard vector products.
+*   **`distanceTo(v)`**: Calculates Euclidean distance.
+
+ ---
+
+### 2. Logical & Bitwise Neurons
+
+These neurons process boolean signals using bitwise operators, making them extremely fast on embedded hardware.
+
+#### `MajorityNeuron`
+A neuron that fires based on a weighted vote of its inputs.
+*   **Usage**: `new MajorityNeuron(weights, threshold)`
+*   **Logic**: Returns `1` if `sum(inputs[i] * weights[i]) >= threshold`, else `0`.
+
+#### `MajorityNetwork`
+A multi-layer architecture composed of `MajorityNeurons`.
+*   **`predict(inputs)`**: Propagates boolean signals through all layers.
+*   **`export()`**: Returns the weights and thresholds in a portable JSON format.
+
+#### `StatefulMajorityNetwork`
+A Recurrent Neural Network (RNN) implementation for bitwise logic.
+*   **Memory**: Uses its own previous output as an input for the next cycle.
+*   **Use Case**: Pattern detection (e.g., detecting a double-click or a sequence of sensor events).
+
+#### `BitwiseNetwork`
+A collection of static methods for pure bit-level operations.
+*   **`halfAdder(a, b)`**: Returns `{sum, carry}` using XOR and AND.
+*   **`xor(x1, x2)`**: A 2-layer logical implementation of the XOR gate.
+
+ ---
+
+### 3. Geometric Neurons
+
+#### `SeekerNeuron`
+A "Spatial Neuron" that learns to point in a specific direction.
+*   **Weight**: Its internal weight is a `Quaternion`.
+*   **`predict(inputQ)`**: Returns the alignment (dot product) between its orientation and the input.
+*   **`update(inputQ, error, lr)`**: Adjusts its orientation to reduce spatial error using momentum-based condensation.
+
+#### `QuaternionAttention`
+A spatial attention mechanism.
+*   **Logic**: Uses the dot product of quaternions to weigh information. It accumulates orientations instead of scalar values, preserving 3D phase information.
+
+ ---
+
+### 4. Machine Learning & Sequence Modeling
+
+#### `BinaryTransformer`
+A transformer architecture designed to process bitstreams.
+*   **`MultiHeadAttentionBinary`**: Uses XOR-based causal attention.
+*   **`generate(seed, nTokens)`**: Generates sequences by predicting the next bitstream based on previous context.
+
+#### `StochasticPerceptron`
+A neuron that uses probability-to-bitstream conversion (Bernoulli samples).
+*   **`predictStochastic(xStreams)`**: Performs multiplication via bitwise AND on stochastic streams and counts the result (popcount).
+
+ ---
+
+### 5. Robotic Control (Cerebellum)
+
+#### `AnalogNeuralLayer`
+A continuous-value neuron layer for motor control.
+*   **Standardization**: Automatically tracks `runningMeans` and `runningVars` to normalize sensor data on the fly.
+*   **Momentum**: Uses EMA-based momentum to stabilize learning of physical constraints.
+
+#### `MeshController`
+The "Brain" for smart fabrics or complex sensor meshes.
+*   **`addAnchorsFromExamples(examples)`**: Sets master reference points for interpolation.
+*   **`compute(meshSensors)`**: Uses Inverse Distance Weighting (IDW) to find the optimal actuator response based on the current tactile "skin" deformation.
+
+ ---
+
+### 6. Rule Compiler
+
+#### `RuleInterpreter`
+The compiler that turns human-logic into machine-bitwise code.
+*   **Supported Types**: `AND`, `OR`, `NOT`, `XOR`, `MAJORITY`, `AT_LEAST_N`.
+*   **Optimization**: Automatically transforms complex gates (like XOR) into basic bitwise networks and handles "pass-through" signals between layers.
+
+---
+
 ## 🧠 Advanced Features
 
 ### Neural Skinning
