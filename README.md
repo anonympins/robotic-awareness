@@ -8,7 +8,7 @@ A high-performance framework for robotic control, bitwise logic reasoning, and k
 
 `robotic-awareness` uses a hybrid approach combining **Bitwise Neural Networks** for logic and **Geometric Seeker Neurons** (Quaternions) for spatial awareness. It is designed to run complex robotic hands or multi-joint systems where safety rules and physical constraints must be computed at high frequencies (50Hz+).
 
-## 🧠 Core Intelligence (`test.js`)
+## 🧠 Core Intelligence (`neuro-lib.js`)
 
 The engine is built around several specialized modules that handle everything from boolean safety logic to Inverse Kinematics.
 
@@ -123,7 +123,7 @@ This file defines the physical structure, the bitwise logic for safety, and the 
 
 To simulate a complete control loop to simulate the movement to the pose GRAB : 
 ```javascript
-import { RobotFactory } from './test.js';
+import { RobotFactory } from './neuro-lib.js';
 import fs from 'fs';
 import path from 'path';
 
