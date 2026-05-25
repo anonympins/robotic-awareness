@@ -15,7 +15,7 @@ The engine is built around several specialized modules that handle everything fr
 ### 1. Rule Engine & Bitwise Logic
 The library features a unique way to compile human-readable JSON logic into high-performance bitwise networks.
 
-*   **`RuleInterpreter.interpret(logic, varMap)`**: Compiles an nested JSON logic tree (AND, OR, NOT, XOR, MAJORITY) into a `MajorityNetwork`.
+*   **`RuleInterpreter.ifnterpret(logic, varMap)`**: Compiles an nested JSON logic tree (AND, OR, NOT, XOR, MAJORITY) into a `MajorityNetwork`.
 *   **`MajorityNetwork`**: A multi-layer network of bitwise neurons that processes boolean inputs (sensors/states) in parallel without standard floating-point multiplications.
 *   **`StatefulMajorityNetwork`**: A recurrent version of the network (RNN) capable of memory-based decisions (e.g., "detect if a button was pressed twice").
 
@@ -28,7 +28,6 @@ Movement is handled by a robust kinematic chain supporting both Forward (FK) and
 *   **`RobotActuator`**: Represents a physical joint (Servo, Motor).
     *   `update(...)`: Runs a filtered **PID controller** with Feed-forward.
     *   **Compliance Mode**: Automatically detects stalls (obstacles) and enters a "soft" mode to prevent hardware damage.
-    *   **Safety Integration**: Injects real-time HALT or REDUCE_SPEED commands based on logical safety rules.
 
 ### 3. Geometric Learning
 *   **`SeekerNeuron`**: A "Geometric Neuron" that uses Quaternions to learn spatial orientations. Instead of learning numbers, it learns directions in 3D space.
@@ -128,12 +127,12 @@ import { RobotFactory } from './test.js';
 import fs from 'fs';
 import path from 'path';
 
-// 1. Charger la configuration depuis le fichier JSON fourni
+// 1. Load the configuration from the provided JSON file
 const configPath = 'C:/Dev/robotic-awareness/robot_config.json';
 const robotConfig = JSON.parse(fs.readFileSync(configPath, 'utf8'));
 
-// 2. Utiliser la Factory pour construire les composants
-// C'est ici que sensorMapper est généré !
+// 2. Use the Factory to build the components
+// This is where sensorMapper is generated!
 const { 
     hub, 
     actuators, 
@@ -143,51 +142,51 @@ const {
 } = RobotFactory.build(robotConfig);
 
 console.log("=== G-NEURO STANDALONE DEMO ===");
-console.log(`Modèle chargé : ${robotConfig.metadata.name}`);
-console.log(`Capteurs configurés : ${sensorMapper.inputSize} points d'entrée`);
+console.log(`Model loaded: ${robotConfig.metadata.name}`);
+console.log(`Configured sensors: ${sensorMapper.inputSize} input points`);
 
-// 3. Simulation de données brutes arrivant du Hardware (ex: Arduino/ESP32)
+// 3. Simulation of raw data coming from Hardware (e.g., Arduino/ESP32)
 const rawHardwareData = {
-    "idx_p1": 0.85,    // Pression forte sur l'index
-    "idx_p2": 0.10,
-    "torque_wrist": 0.05
+    "finger_tip_01": 0.85,    // Strong pressure on the sensor defined in the JSON
+    "system_voltage": 12.1
 };
 
-// 4. Transformation des données brutes en vecteur via le sensorMapper
-// Il place 0.85 au bon index correspondant à "idx_p1" défini dans le JSON
+// 4. Transformation of raw data into a vector via the sensorMapper
+// It places 0.85 at the correct index corresponding to "finger_tip_01" defined in the JSON
 const sensorVector = sensorMapper.format(rawHardwareData);
 
-// 5. Préparation des entrées pour la logique binaire (Safety)
+// 5. Preparation of inputs for binary logic (Safety)
 const decisionInputs = new Uint8Array(Object.keys(varMap).length);
 
-// On mappe la pression de l'index sur la variable logique "contact"
-// Si pression > 0.5, alors contact = 1
-decisionInputs[varMap.contact] = rawHardwareData.idx_p1 > 0.5 ? 1 : 0;
-// On simule l'absence de feu
-decisionInputs[varMap.fire_detected] = 0;
+// Map sensors to logical variables defined in "variables"
+decisionInputs[varMap.is_active] = 1;
+decisionInputs[varMap.contact_detected] = rawHardwareData.finger_tip_01 > 0.5 ? 1 : 0;
+decisionInputs[varMap.emergency_stop] = 0; // No emergency stop
 
-// 6. Évaluation de la sécurité via le réseau binaire compilé
+// 6. Safety evaluation via the compiled binary network
 const isSafe = safetyNet.predict(decisionInputs)[0] === 1;
 
-console.log("\n--- Diagnostic Temps Réel ---");
-console.log(`État Logique [contact] : ${decisionInputs[varMap.contact]}`);
-console.log(`Sécurité Globale (safety_ok) : ${isSafe ? "✅ OK" : "❌ DANGER"}`);
+console.log("\n--- Real-Time Diagnostic ---");
+console.log(`Logical State [contact_detected]: ${decisionInputs[varMap.contact_detected]}`);
+console.log(`Global Safety (safety_ok): ${isSafe ? "✅ OK" : "❌ DANGER"}`);
 
-// 7. Mise à jour d'un actuateur spécifique
-const indexP1 = actuators.find(a => a.name === "Index_P1");
+// 7. Update a specific actuator
+const finger = actuators.find(a => a.name === "finger_joint");
 
-if (indexP1) {
-    // On simule un mouvement vers la pose "GRAB"
-    const targetOrientation = hub.getTarget("index").orientation;
-    const pressure = sensorVector[sensorMapper.registry.get("idx_p1").globalIndex];
+if (finger) {
+    // Simulate movement toward the "GRAB" pose
+    hub.selectState("arm_group", "GRAB");
+    const state = hub.getTarget("arm_group");
+    
+    // Inject the direct joint value if it exists in the state (70° for GRAB)
+    if (state.values && state.values[finger.name]) {
+        finger.directJointCommand = state.values[finger.name];
+    }
 
-    indexP1.update(
-        decisionInputs, 
-        targetOrientation, 
-        0, isSafe, null, 0.02, pressure
-    );
+    const pressure = sensorVector[sensorMapper.registry.get("finger_tip_01").globalIndex];
+    finger.update(decisionInputs, state.orientation, 0, isSafe, null, 0.02, pressure);
 
-    console.log(`Position Index_P1 : ${indexP1.currentValue.toFixed(2)}° (Pression tactile: ${pressure})`);
+    console.log(`Position finger_joint: ${finger.currentValue.toFixed(2)}° (Pressure: ${pressure})`);
 }
 ```
 
