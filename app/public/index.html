@@ -1,0 +1,341 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="UTF-8">
+    <title>Gestures - Otsu Real-time</title>
+    <style>
+        body { font-family: sans-serif; display: flex; flex-direction: column; align-items: center; background: #222; color: white; }
+
+        /* STYLES CRITIQUES POUR L'AFFICHAGE */
+        video, canvas {
+            border: 2px solid #555;
+            width: 320px;
+            height: 240px;
+            display: block;  /* Force l'affichage */
+            background: #000; /* Fond noir par défaut */
+            object-fit: cover; /* Important pour la vidéo */
+        }
+
+        .container {
+            display: flex;
+            flex-wrap: wrap;
+            justify-content: center;
+            gap: 20px;
+            margin-top: 20px;
+            padding: 10px;
+            background: #333;
+            border-radius: 10px;
+        }
+
+        .box {
+            text-align: center;
+            background: #2a2a2a;
+            padding: 10px;
+            border-radius: 8px;
+        }
+
+        .debug-info {
+            margin-top: 20px;
+            padding: 10px;
+            background: #111;
+            border-radius: 5px;
+            font-family: monospace;
+            font-size: 12px;
+            max-height: 150px;
+            overflow-y: auto;
+        }
+
+        .action-item {
+            padding: 8px;
+            margin: 4px;
+            background: #444;
+            border-radius: 4px;
+            transition: background 0.4s ease-out, transform 0.2s cubic-bezier(0.175, 0.885, 0.32, 1.275);
+            font-weight: bold;
+            opacity: 0.5;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .action-active {
+            background: #d40000;
+            color: white;
+            opacity: 1;
+            box-shadow: 0 0 10px rgba(255,0,0,0.5);
+            transform: scale(1.05);
+        }
+
+        .sample-badge {
+            background: #222;
+            padding: 2px 6px;
+            border-radius: 10px;
+            font-size: 10px;
+            margin-left: 10px;
+        }
+
+        .btn-del {
+            color: #ff4444;
+            cursor: pointer;
+            border: none;
+            background: none;
+            font-weight: bold;
+            padding: 0 5px;
+        }
+
+        .recording-active {
+            background: #ff4444 !0important;
+            animation: pulse 1s infinite;
+        }
+        @keyframes pulse {
+            0% { opacity: 1; }
+            50% { opacity: 0.5; }
+            100% { opacity: 1; }
+        }
+    </style>
+</head>
+<body>
+<h1>Traitement Otsu en Temps Réel</h1>
+<div class="container">
+    <div class="box">
+        <p>Flux Original (Caméra)</p>
+        <video id="webcam" autoplay playsinline muted></video>
+        <p id="videoStatus" style="font-size: 12px; color: #ff0;">Statut: Initialisation...</p>
+    </div>
+    <div class="box">
+        <p>Flux Traité (Node.js)</p>
+        <canvas id="outputCanvas" width="320" height="240"></canvas>
+    </div>
+    <div class="box" style="min-width: 200px;">
+        <p>Actions G-NEURO</p>
+        <div id="actionContainer"></div>
+        <div style="margin-top: 15px; border-top: 1px solid #555; padding-top: 10px;">
+            <input type="text" id="gestureName" placeholder="Nom du geste..." 
+                   style="background: #111; color: white; border: 1px solid #555; padding: 5px; width: 120px;">
+            <button id="btnStart" style="padding: 5px 10px; cursor: pointer; background: #28a745; color: white; border: none; border-radius: 3px;">Démarrer</button>
+            <button id="btnStop" style="padding: 5px 10px; cursor: pointer; background: #dc3545; color: white; border: none; border-radius: 3px; display: none;">Arrêter</button>
+        </div>
+    </div>
+</div>
+<div class="debug-info" id="debugInfo"></div>
+
+<script>
+    const video = document.getElementById('webcam');
+    const canvas = document.getElementById('outputCanvas');
+    const ctx = canvas.getContext('2d');
+    const videoStatus = document.getElementById('videoStatus');
+    const debugInfo = document.getElementById('debugInfo');
+    const actionContainer = document.getElementById('actionContainer');
+    const btnStart = document.getElementById('btnStart');
+    const btnStop = document.getElementById('btnStop');
+    const gestureInput = document.getElementById('gestureName');
+
+    let ACTIONS = ["IMMOBILE", "MOUVEMENT_H", "MOUVEMENT_V", "PRESENCE_CENTRALE"];
+    let gestureSamples = {};
+    let actionElements = {};
+
+    function buildActionUI() {
+        actionContainer.innerHTML = '';
+        actionElements = {};
+        ACTIONS.forEach(action => {
+            const div = document.createElement('div');
+            div.className = 'action-item';
+            
+            const nameSpan = document.createElement('span');
+            nameSpan.textContent = action.replace('_', ' ');
+            div.appendChild(nameSpan);
+
+            if (gestureSamples[action]) {
+                const count = gestureSamples[action].length;
+                div.innerHTML += `<span class="sample-badge">${count} samples</span>`;
+                div.innerHTML += `<button class="btn-del" onclick="deleteGestureSample('${action}')">×</button>`;
+            }
+
+            actionContainer.appendChild(div);
+            actionElements[action] = div;
+        });
+    }
+
+    window.deleteGestureSample = (name) => {
+        if(confirm(`Supprimer le dernier échantillon de ${name} ?`)) {
+            ws.send(JSON.stringify({ type: 'DELETE_SAMPLE', gesture: name, index: gestureSamples[name].length - 1 }));
+        }
+    };
+
+    buildActionUI();
+
+    btnStart.onclick = () => {
+        const name = gestureInput.value || "GESTE_" + Date.now();
+        ws.send(JSON.stringify({ type: 'START_RECORDING', name: name }));
+        btnStart.style.display = 'none';
+        btnStop.style.display = 'inline-block';
+        btnStop.classList.add('recording-active');
+        updateDebug(`🔴 Enregistrement de : ${name}...`);
+    };
+
+    btnStop.onclick = () => {
+        ws.send(JSON.stringify({ type: 'STOP_RECORDING' }));
+        btnStart.style.display = 'inline-block';
+        btnStop.style.display = 'none';
+        btnStop.classList.remove('recording-active');
+        updateDebug(`✅ Fin de l'enregistrement.`);
+    };
+
+    // Pré-allocation des ressources pour la performance
+    const tempCanvas = document.createElement('canvas');
+    tempCanvas.width = 320;
+    tempCanvas.height = 240;
+    const tempCtx = tempCanvas.getContext('2d', { willReadFrequently: true });
+    const outputImageData = ctx.createImageData(320, 240);
+
+    let localStream = null;
+
+    function updateDebug(msg) {
+        console.log(msg);
+        debugInfo.innerHTML += `<div>${new Date().toLocaleTimeString()}: ${msg}</div>`;
+        debugInfo.scrollTop = debugInfo.scrollHeight;
+    }
+
+    async function setupCamera() {
+        try {
+            updateDebug("Demande d'accès à la caméra...");
+
+            const stream = await navigator.mediaDevices.getUserMedia({
+                video: {
+                    width: { ideal: 320 },
+                    height: { ideal: 240 }
+                }
+            });
+
+            localStream = stream;
+            video.srcObject = stream;
+
+            const videoTrack = stream.getVideoTracks()[0];
+            updateDebug(`✅ Caméra connectée: ${videoTrack.label}`);
+            updateDebug(`État du track: ${videoTrack.readyState}`);
+            updateDebug(`Contraintes:`, videoTrack.getSettings());
+
+            // Attendre que la vidéo soit chargée
+            video.onloadeddata = () => {
+                updateDebug(`📹 Vidéo chargée - Dimensions: ${video.videoWidth}x${video.videoHeight}`);
+
+                // On attend que la vidéo ait réellement des dimensions valides
+                const checkHardware = setInterval(() => {
+                    if (video.videoWidth > 0) {
+                        clearInterval(checkHardware);
+                        videoStatus.textContent = `✅ Actif - ${video.videoWidth}x${video.videoHeight}`;
+                        videoStatus.style.color = "#0f0";
+                        runLocalTest();
+                    }
+                }, 100);
+
+                function runLocalTest() {
+                    const testCanvas = document.createElement('canvas');
+                    testCanvas.width = video.videoWidth;
+                    testCanvas.height = video.videoHeight;
+                    const testCtx = testCanvas.getContext('2d');
+                    testCtx.drawImage(video, 0, 0);
+                    const imageData = testCtx.getImageData(0, 0, video.videoWidth, video.videoHeight);
+                    let sum = 0;
+                    for(let i = 0; i < 400; i+=4) sum += imageData.data[i];
+                    updateDebug(`Test de luminosité locale: ${sum > 300 ? "✅ OK" : "⚠️ Capture vide"}`);
+                }
+            };
+
+            video.onerror = (e) => {
+                updateDebug(`❌ Erreur vidéo: ${e}`);
+                videoStatus.textContent = "❌ Erreur vidéo";
+            };
+
+            await video.play();
+            updateDebug("▶️ Lecture vidéo démarrée");
+
+        } catch (err) {
+            updateDebug(`❌ ERREUR CAMÉRA: ${err.message}`);
+            videoStatus.textContent = `❌ ${err.message}`;
+            videoStatus.style.color = "#f00";
+        }
+    }
+
+    // Démarrer immédiatement
+    setupCamera();
+
+    // WebSocket (comme avant)
+    const ws = new WebSocket(`ws://${location.host}`);
+    ws.binaryType = 'arraybuffer';
+
+    ws.onopen = () => updateDebug("✅ WebSocket connecté");
+    ws.onclose = () => updateDebug("❌ WebSocket fermé");
+
+    let frameSent = 0;
+    let frameReceived = 0;
+
+    // Envoi des frames
+    setInterval(() => {
+        if(ws.readyState === WebSocket.OPEN &&
+            // Utilisation de readyState >= 3 (HAVE_FUTURE_DATA) pour plus de sécurité
+            video.readyState >= 3 && 
+            video.videoWidth > 0) {
+
+            tempCtx.drawImage(video, 0, 0, 320, 240);
+            const imageData = tempCtx.getImageData(0, 0, 320, 240);
+
+            // Création du buffer avec entête
+            const buffer = new Uint8Array(4 + imageData.data.length);
+            const view = new DataView(buffer.buffer);
+            view.setUint16(0, 320);
+            view.setUint16(2, 240);
+            buffer.set(imageData.data, 4);
+
+            ws.send(buffer);
+            frameSent++;
+        }
+    }, 50);
+
+    // Réception
+    ws.onmessage = (event) => {
+        try {
+            if (typeof event.data === 'string') {
+                const msg = JSON.parse(event.data);
+                if (msg.type === 'STATE_UPDATE') {
+                    ACTIONS = msg.actions;
+                    gestureSamples = msg.samples;
+                    buildActionUI();
+                }
+                if (msg.type === 'RECORD_DONE') {
+                    btnStart.style.display = 'inline-block';
+                    btnStop.style.display = 'none';
+                    updateDebug(`🧠 Geste enregistré avec succès !`);
+                }
+                return;
+            }
+
+            frameReceived++;
+            const uint8Array = new Uint8Array(event.data);
+            
+            // Découpage : Image (320*240*4) et Actions (le reste)
+            const imgSize = 320 * 240 * 4;
+            const imgPart = uint8Array.slice(0, imgSize);
+            const actionPart = uint8Array.slice(imgSize);
+
+            // Copie rapide des données dans l'objet ImageData existant
+            outputImageData.data.set(imgPart);
+            ctx.putImageData(outputImageData, 0, 0);
+
+            // Mise à jour de l'UI des actions
+            actionPart.forEach((val, idx) => {
+                const actionName = ACTIONS[idx];
+                if (val === 1) actionElements[actionName].classList.add('action-active');
+                else actionElements[actionName].classList.remove('action-active');
+            });
+
+            if (frameReceived % 100 === 0) {
+                updateDebug(`📊 Sync: Envoyées ${frameSent} | Reçues ${frameReceived}`);
+            }
+        } catch (e) {
+            console.error("Erreur réception frame:", e);
+        }
+    };
+</script>
+</body>
+</html>

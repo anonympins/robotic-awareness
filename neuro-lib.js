@@ -2067,6 +2067,9 @@ export class RobotActuator {
 
         this.collisionBox = null; // Donnée locale AABB
         // Gestion du blocage (Stall / Obstacle Aspirant)
+        this.collisionConfig = config.collision || { response: "none" };
+        this.collisionLockTimer = 0;
+
         this.ikTarget = null; // Cible temporaire injectée par le solveur IK
         this.stallThreshold = config.stall_threshold || 10;
         this.isCompliant = false;
@@ -2095,6 +2098,14 @@ export class RobotActuator {
      * Mise à jour de l'état de l'actuateur
      */
     update(decisionInputs, globalTarget, currentLoad = 0, canMove = true, learnedTarget = null, deltaTime = 0.02, tactilePressure = 0) {
+        // 0. Gestion du blocage sur collision (Freeze temporel)
+        if (this.collisionLockTimer > 0) {
+            this.collisionLockTimer--;
+            this.velocity = 0;
+            this.integralError = 0; // Reset PID pour éviter l'effet ressort au déblocage
+            return this.currentValue;
+        }
+
         // 1. Proprioception : Détection de "souffrance" moteur
         // Si le capteur tactile détecte un contact franc (> 0.5), on simule une charge
         if (this.sensorId && tactilePressure > 0.5) currentLoad += (tactilePressure * 5);
@@ -2230,6 +2241,15 @@ export class RobotActuator {
         this.directJointCommand = null; // Reset direct command for next frame
 
         return this.currentValue;
+    }
+
+    /**
+     * Active le verrouillage de sécurité suite à un contact physique
+     */
+    triggerCollisionLock() {
+        if (this.collisionConfig.response === "freeze" && this.collisionLockTimer <= 0) {
+            this.collisionLockTimer = this.collisionConfig.lockDurationFrames || 15;
+        }
     }
 }
 
@@ -2619,7 +2639,14 @@ export class KinematicChain {
                 // --- ÉVITEMENT DE COLLISION CRITIQUE (Hard Stop) ---
                 currentJointValues.set(actuator.name, actuator.ikTarget);
                 this.calculateFK(currentJointValues);
-                if (this.checkSelfCollision(0).length > 0) {
+                
+                const hardCollisions = this.checkSelfCollision(0);
+                if (hardCollisions.length > 0) {
+                    // On bloque les actuateurs impliqués
+                    hardCollisions.forEach(c => {
+                        allActuators.get(c.a)?.triggerCollisionLock();
+                        allActuators.get(c.b)?.triggerCollisionLock();
+                    });
                     // Si collision, on revient à l'état précédent (ou au filtre actuel si premier IK)
                     actuator.ikTarget = prevIkTarget !== null ? prevIkTarget : currentVal;
                     currentJointValues.set(actuator.name, actuator.ikTarget);
@@ -2630,6 +2657,154 @@ export class KinematicChain {
     }
 }
 
+/**
+ * CNN léger pour le traitement spatio-temporel (Mouvement 3D)
+ * Optimisé pour des grilles de type [Temps, Y, X]
+ */
+export class CNNBrain {
+    constructor(config = {}) {
+        this.inputShape = config.inputShape || [50, 10, 10]; // [T, Y, X]
+        this.numActions = config.numActions || 4;
+
+        // Hyperparamètres
+        this.lr = config.lr || 0.01;
+        this.wd = config.wd || 0.001; // Weight Decay (Régularisation L2)
+
+        // Architecture : 1 Couche de Convolution 3D + 1 Couche Dense
+        // Filtre 3x3x3 pour capturer la direction et la vitesse
+        this.filters = Array.from({ length: 16 }, () => ({
+            weights: new Float32Array(3 * 3 * 3).fill(0).map(() => Math.random() * 2 - 1),
+            bias: 0
+        }));
+
+        // Couche Dense (Sortie)
+        // Après conv 3x3x3 sur 50x10x10, on obtient environ 48x8x8 features par filtre
+        // Pour simplifier, on utilise un Global Average Pooling avant la couche dense
+        this.denseWeights = new Float32Array(this.filters.length * this.numActions).fill(0).map(() => Math.random() * 2 - 1);
+        this.denseBiases = new Float32Array(this.numActions).fill(0);
+    }
+
+    /**
+     * Forward pass optimisé
+     * @param {Uint8Array} input Flux binaire aplati [T * 100]
+     */
+    predict(input) {
+        const featureMap = this._getFeatureMap(input);
+
+        // 1. Calcul des Logits (Sommes brutes)
+        const logits = new Float32Array(this.numActions);
+        let maxLogit = -Infinity;
+        for (let i = 0; i < this.numActions; i++) {
+            let dot = this.denseBiases[i];
+            for (let f = 0; f < this.filters.length; f++) {
+                dot += featureMap[f] * this.denseWeights[i * this.filters.length + f];
+            }
+            logits[i] = dot;
+            if (dot > maxLogit) maxLogit = dot;
+        }
+
+        // 2. Softmax pour forcer la compétition entre les actions
+        const probs = new Float32Array(this.numActions);
+        let sumExp = 0;
+        for (let i = 0; i < this.numActions; i++) {
+            probs[i] = Math.exp(logits[i] - maxLogit);
+            sumExp += probs[i];
+        }
+
+        let bestIdx = -1;
+        let bestProb = 0;
+        for (let i = 0; i < this.numActions; i++) {
+            probs[i] /= sumExp;
+            if (probs[i] > bestProb) {
+                bestProb = probs[i];
+                bestIdx = i;
+            }
+        }
+
+        const results = new Array(this.numActions).fill(0);
+        // Seuil de confiance abaissé à 30% : Si le réseau hésite, 
+        // on préfère qu'il propose la meilleure option plutôt que rien.
+        if (bestIdx !== -1 && bestProb > 0.3) {
+            results[bestIdx] = 1;
+        }
+        return results;
+    }
+
+    _getFeatureMap(input) {
+        const [T, H, W] = this.inputShape;
+        const featureMap = new Float32Array(this.filters.length).fill(0);
+
+        for (let f = 0; f < this.filters.length; f++) {
+            let sum = 0;
+            let counts = 0;
+            const filter = this.filters[f];
+            for (let t = 0; t < T - 3; t += 2) { // Stride temporel réduit
+                for (let y = 0; y < H - 3; y += 1) { // Stride spatial minimal
+                    for (let x = 0; x < W - 3; x += 1) {
+                        let conv = 0;
+                        for (let it = 0; it < 3; it++) {
+                            for (let iy = 0; iy < 3; iy++) {
+                                for (let ix = 0; ix < 3; ix++) {
+                                    const val = input[(t + it) * 100 + (y + iy) * 10 + (x + ix)] || 0;
+                                    conv += val * filter.weights[it * 9 + iy * 3 + ix];
+                                }
+                            }
+                        }
+                        sum += Math.max(0, conv + filter.bias);
+                        counts++;
+                    }
+                }
+            }
+            featureMap[f] = sum / (counts || 1);
+        }
+        return featureMap;
+    }
+
+    /**
+     * Entraînement par renforcement de patterns
+     * @param {Uint8Array} sequence La séquence d'entrée
+     * @param {number} actionIdx L'index de l'action attendue
+     */
+    train(sequence, actionIdx) {
+        const featureMap = this._getFeatureMap(sequence);
+        let totalSampleLoss = 0;
+        
+        // Forward pass pour obtenir les probabilités (Softmax)
+        const logits = new Float32Array(this.numActions);
+        let maxLogit = -Infinity;
+        for (let i = 0; i < this.numActions; i++) {
+            let dot = this.denseBiases[i];
+            for (let f = 0; f < this.filters.length; f++) {
+                dot += featureMap[f] * this.denseWeights[i * this.filters.length + f];
+            }
+            logits[i] = dot;
+            if (dot > maxLogit) maxLogit = dot;
+        }
+
+        const probs = new Float32Array(this.numActions);
+        let sumExp = 0;
+        for (let i = 0; i < this.numActions; i++) {
+            probs[i] = Math.exp(logits[i] - maxLogit);
+            sumExp += probs[i];
+        }
+        for (let i = 0; i < this.numActions; i++) probs[i] /= sumExp;
+
+        // Backpropagation simple (Logits gradient: pred - target)
+        for (let i = 0; i < this.numActions; i++) {
+            const target = (i === actionIdx) ? 1 : 0;
+            const error = target - probs[i];
+            totalSampleLoss += error * error; // Somme des carrés de l'erreur
+            const wdFactor = 1 - this.wd;
+
+            for (let f = 0; f < this.filters.length; f++) {
+                // On applique le Weight Decay : le poids tend vers 0 légèrement à chaque mise à jour
+                this.denseWeights[i * this.filters.length + f] = (this.denseWeights[i * this.filters.length + f] * wdFactor) + (this.lr * error * featureMap[f]);
+            }
+            this.denseBiases[i] = (this.denseBiases[i] * wdFactor) + (this.lr * error);
+        }
+        return totalSampleLoss / this.numActions;
+    }
+}
 /**
  * Usine de montage du robot à partir d'une configuration JSON
  */
