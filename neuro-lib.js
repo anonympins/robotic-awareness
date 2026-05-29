@@ -2738,9 +2738,9 @@ export class CNNBrain {
             let sum = 0;
             let counts = 0;
             const filter = this.filters[f];
-            for (let t = 0; t < T - 3; t += 2) { // Stride temporel réduit
-                for (let y = 0; y < H - 3; y += 1) { // Stride spatial minimal
-                    for (let x = 0; x < W - 3; x += 1) {
+            for (let t = 0; t < T - 3; t += 4) { // Stride temporel augmenté (vitesse x2)
+                for (let y = 0; y < H - 3; y += 2) { // Stride spatial augmenté (vitesse x2)
+                    for (let x = 0; x < W - 3; x += 2) {
                         let conv = 0;
                         for (let it = 0; it < 3; it++) {
                             for (let iy = 0; iy < 3; iy++) {
@@ -2761,12 +2761,38 @@ export class CNNBrain {
     }
 
     /**
+     * Ajuste les filtres (les "yeux") pour mieux capturer le mouvement
+     */
+    _updateFilters(sequence, filterIdx, error) {
+        const filter = this.filters[filterIdx];
+        const [T, H, W] = this.inputShape;
+        const lr = this.lr * 0.1; // Apprentissage plus lent pour les filtres
+
+        // On ajuste les poids du filtre selon la séquence qui a causé l'erreur
+        // C'est une forme simplifiée de backpropagation spatio-temporelle
+        for (let it = 0; it < 3; it++) {
+            for (let iy = 0; iy < 3; iy++) {
+                for (let ix = 0; ix < 3; ix++) {
+                    // On prend un échantillon au milieu de la séquence pour ajuster
+                    const midT = Math.floor(T / 2);
+                    const midY = Math.floor(H / 2);
+                    const midX = Math.floor(W / 2);
+                    const val = sequence[(midT + it) * 100 + (midY + iy) * 10 + (midX + ix)] || 0;
+                    
+                    filter.weights[it * 9 + iy * 3 + ix] += lr * error * val;
+                }
+            }
+        }
+        filter.bias += lr * error;
+    }
+
+    /**
      * Entraînement par renforcement de patterns
      * @param {Uint8Array} sequence La séquence d'entrée
      * @param {number} actionIdx L'index de l'action attendue
      */
     train(sequence, actionIdx) {
-        const featureMap = this._getFeatureMap(sequence);
+        let featureMap = this._getFeatureMap(sequence);
         let totalSampleLoss = 0;
         
         // Forward pass pour obtenir les probabilités (Softmax)
@@ -2789,16 +2815,31 @@ export class CNNBrain {
         }
         for (let i = 0; i < this.numActions; i++) probs[i] /= sumExp;
 
-        // Backpropagation simple (Logits gradient: pred - target)
+        // --- ENTRAÎNEMENT DISCRIMINATIF À MARGE ---
+        const MARGIN = 0.25; // Distance minimale entre le gagnant et les autres
+        const targetProb = probs[actionIdx];
+
         for (let i = 0; i < this.numActions; i++) {
-            const target = (i === actionIdx) ? 1 : 0;
-            const error = target - probs[i];
-            totalSampleLoss += error * error; // Somme des carrés de l'erreur
+            const isCorrect = (i === actionIdx);
+            const target = isCorrect ? 1 : 0;
+            // Calcul de l'erreur brute
+            let error = target - probs[i];
+
+            // Logique de Marge : Si une classe incorrecte est trop "proche" du target,
+            if (!isCorrect && probs[i] > (targetProb - MARGIN)) {
+                error *= 1.8; // Amplification du gradient de répulsion
+            }
+
+            totalSampleLoss += error * error;
             const wdFactor = 1 - this.wd;
 
             for (let f = 0; f < this.filters.length; f++) {
-                // On applique le Weight Decay : le poids tend vers 0 légèrement à chaque mise à jour
                 this.denseWeights[i * this.filters.length + f] = (this.denseWeights[i * this.filters.length + f] * wdFactor) + (this.lr * error * featureMap[f]);
+                
+                // Mise à jour des filtres intégrée dans la boucle f
+                if (isCorrect && Math.abs(error) > 0.1) {
+                    this._updateFilters(sequence, f, error);
+                }
             }
             this.denseBiases[i] = (this.denseBiases[i] * wdFactor) + (this.lr * error);
         }
