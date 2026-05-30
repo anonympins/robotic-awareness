@@ -2670,18 +2670,31 @@ export class CNNBrain {
         this.lr = config.lr || 0.01;
         this.wd = config.wd || 0.001; // Weight Decay (Régularisation L2)
 
-        // Architecture : 1 Couche de Convolution 3D + 1 Couche Dense
-        // Filtre 3x3x3 pour capturer la direction et la vitesse
+        // Architecture : 1 Couche de Convolution 2D + TSM + 1 Couche Dense
+        // Filtre 3x3 (2D) - TSM (Temporal Shift Module) permet de capturer
+        // les dépendances temporelles sans le coût d'une convolution 3D.
         this.filters = Array.from({ length: 16 }, () => ({
-            weights: new Float32Array(3 * 3 * 3).fill(0).map(() => Math.random() * 2 - 1),
-            bias: 0
+            weights: new Float32Array(3 * 3).fill(0).map(() => Math.random() * 2 - 1),
+            bias: 0,
+            m_w: new Float32Array(9).fill(0), // Adam: 1er moment
+            v_w: new Float32Array(9).fill(0), // Adam: 2ème moment
+            m_b: 0, v_b: 0
         }));
 
         // Couche Dense (Sortie)
-        // Après conv 3x3x3 sur 50x10x10, on obtient environ 48x8x8 features par filtre
-        // Pour simplifier, on utilise un Global Average Pooling avant la couche dense
         this.denseWeights = new Float32Array(this.filters.length * this.numActions).fill(0).map(() => Math.random() * 2 - 1);
         this.denseBiases = new Float32Array(this.numActions).fill(0);
+
+        // --- OPTIMISEUR ADAPTATIF (Adam) ---
+        // Poids denses
+        this.m_weights = new Float32Array(this.denseWeights.length).fill(0);
+        this.v_weights = new Float32Array(this.denseWeights.length).fill(0);
+        // Biais denses
+        this.m_bias_dense = new Float32Array(this.numActions).fill(0);
+        this.v_bias_dense = new Float32Array(this.numActions).fill(0);
+
+        this.beta1 = 0.9; this.beta2 = 0.999; this.eps = 1e-8;
+        this.t = 0; // Compteur d'itérations
     }
 
     /**
@@ -2722,32 +2735,44 @@ export class CNNBrain {
         }
 
         const results = new Array(this.numActions).fill(0);
-        // Seuil de confiance abaissé à 30% : Si le réseau hésite, 
-        // on préfère qu'il propose la meilleure option plutôt que rien.
-        if (bestIdx !== -1 && bestProb > 0.3) {
+        // --- AJUSTEMENT : SEUIL DE CONFIANCE ÉQUILIBRÉ ---
+        // 0.45 est un bon compromis pour laisser passer les gestes appris rapidement
+        if (bestIdx !== -1 && bestProb > 0.6) { // Seuil augmenté pour éviter les faux positifs
             results[bestIdx] = 1;
         }
         return results;
     }
 
     _getFeatureMap(input) {
-        const [T, H, W] = this.inputShape;
-        const featureMap = new Float32Array(this.filters.length).fill(0);
+        const T = this.inputShape[0];
+        // Calcul dynamique de la résolution spatiale (H et W)
+        const spatialFlatSize = input.length / T;
+        const H = Math.sqrt(spatialFlatSize);
+        const W = H; 
 
-        for (let f = 0; f < this.filters.length; f++) {
+        const numFilters = this.filters.length;
+        const featureMap = new Float32Array(numFilters).fill(0);
+        const spatialSize = spatialFlatSize;
+
+        for (let f = 0; f < numFilters; f++) {
             let sum = 0;
             let counts = 0;
             const filter = this.filters[f];
-            for (let t = 0; t < T - 3; t += 4) { // Stride temporel augmenté (vitesse x2)
+
+            // --- TSM (Temporal Shift Module) Logic ---
+            // On décale l'index temporel selon le filtre pour donner une "vision" du temps
+            const shift = (f % 4 === 1) ? -1 : (f % 4 === 2 ? 1 : 0);
+
+            for (let t = 0; t < T; t += 4) { 
+                const tEff = Math.max(0, Math.min(T - 1, t + shift));
+
                 for (let y = 0; y < H - 3; y += 2) { // Stride spatial augmenté (vitesse x2)
                     for (let x = 0; x < W - 3; x += 2) {
                         let conv = 0;
-                        for (let it = 0; it < 3; it++) {
-                            for (let iy = 0; iy < 3; iy++) {
-                                for (let ix = 0; ix < 3; ix++) {
-                                    const val = input[(t + it) * 100 + (y + iy) * 10 + (x + ix)] || 0;
-                                    conv += val * filter.weights[it * 9 + iy * 3 + ix];
-                                }
+                        for (let iy = 0; iy < 3; iy++) {
+                            for (let ix = 0; ix < 3; ix++) {
+                                const val = input[tEff * spatialSize + (y + iy) * W + (x + ix)] || 0;
+                                conv += val * filter.weights[iy * 3 + ix];
                             }
                         }
                         sum += Math.max(0, conv + filter.bias);
@@ -2765,25 +2790,39 @@ export class CNNBrain {
      */
     _updateFilters(sequence, filterIdx, error) {
         const filter = this.filters[filterIdx];
-        const [T, H, W] = this.inputShape;
-        const lr = this.lr * 0.1; // Apprentissage plus lent pour les filtres
+        const T = this.inputShape[0];
+        const spatialFlatSize = sequence.length / T;
+        const H = Math.sqrt(spatialFlatSize);
+        const W = H;
 
-        // On ajuste les poids du filtre selon la séquence qui a causé l'erreur
-        // C'est une forme simplifiée de backpropagation spatio-temporelle
-        for (let it = 0; it < 3; it++) {
-            for (let iy = 0; iy < 3; iy++) {
-                for (let ix = 0; ix < 3; ix++) {
-                    // On prend un échantillon au milieu de la séquence pour ajuster
-                    const midT = Math.floor(T / 2);
-                    const midY = Math.floor(H / 2);
-                    const midX = Math.floor(W / 2);
-                    const val = sequence[(midT + it) * 100 + (midY + iy) * 10 + (midX + ix)] || 0;
-                    
-                    filter.weights[it * 9 + iy * 3 + ix] += lr * error * val;
-                }
+        const lr = this.lr * 0.5; // Gain local
+        const spatialSize = spatialFlatSize;
+
+        const midT = Math.floor(T / 2);
+        const midY = Math.floor(H / 2);
+        const midX = Math.floor(W / 2);
+
+        for (let iy = 0; iy < 3; iy++) {
+            for (let ix = 0; ix < 3; ix++) {
+                const val = sequence[midT * spatialSize + (midY + iy) * W + (midX + ix)] || 0;
+                const grad = error * val;
+                const idx = iy * 3 + ix;
+
+                // --- ADAM (Filtre Weights) ---
+                filter.m_w[idx] = this.beta1 * filter.m_w[idx] + (1 - this.beta1) * grad;
+                filter.v_w[idx] = this.beta2 * filter.v_w[idx] + (1 - this.beta2) * (grad * grad);
+                const m_hat = filter.m_w[idx] / (1 - Math.pow(this.beta1, this.t));
+                const v_hat = filter.v_w[idx] / (1 - Math.pow(this.beta2, this.t));
+                filter.weights[idx] += lr * m_hat / (Math.sqrt(v_hat) + this.eps);
             }
         }
-        filter.bias += lr * error;
+        
+        // --- ADAM (Filtre Bias) ---
+        filter.m_b = this.beta1 * filter.m_b + (1 - this.beta1) * error;
+        filter.v_b = this.beta2 * filter.v_b + (1 - this.beta2) * (error * error);
+        const mb_hat = filter.m_b / (1 - Math.pow(this.beta1, this.t));
+        const vb_hat = filter.v_b / (1 - Math.pow(this.beta2, this.t));
+        filter.bias += lr * mb_hat / (Math.sqrt(vb_hat) + this.eps);
     }
 
     /**
@@ -2794,7 +2833,8 @@ export class CNNBrain {
     train(sequence, actionIdx) {
         let featureMap = this._getFeatureMap(sequence);
         let totalSampleLoss = 0;
-        
+        this.t++;
+
         // Forward pass pour obtenir les probabilités (Softmax)
         const logits = new Float32Array(this.numActions);
         let maxLogit = -Infinity;
@@ -2816,32 +2856,56 @@ export class CNNBrain {
         for (let i = 0; i < this.numActions; i++) probs[i] /= sumExp;
 
         // --- ENTRAÎNEMENT DISCRIMINATIF À MARGE ---
-        const MARGIN = 0.25; // Distance minimale entre le gagnant et les autres
+        const MARGIN = 0.45; // Augmentation de la marge de sécurité entre les classes
         const targetProb = probs[actionIdx];
 
         for (let i = 0; i < this.numActions; i++) {
             const isCorrect = (i === actionIdx);
             const target = isCorrect ? 1 : 0;
             // Calcul de l'erreur brute
-            let error = target - probs[i];
+            let error = (target - probs[i]);
 
-            // Logique de Marge : Si une classe incorrecte est trop "proche" du target,
-            if (!isCorrect && probs[i] > (targetProb - MARGIN)) {
-                error *= 1.8; // Amplification du gradient de répulsion
+            // Logique de Marge : Augmente la répulsion si une mauvaise classe est trop confiante
+            if (!isCorrect && probs[i] > 0.3) {
+                error *= 1.5; 
             }
+
+            // --- GRADIENT CLIPPING ADOUCI ---
+            // On limite moins l'erreur pour permettre un apprentissage initial plus franc
+            error = Math.max(-1.0, Math.min(1.0, error));
 
             totalSampleLoss += error * error;
-            const wdFactor = 1 - this.wd;
-
             for (let f = 0; f < this.filters.length; f++) {
-                this.denseWeights[i * this.filters.length + f] = (this.denseWeights[i * this.filters.length + f] * wdFactor) + (this.lr * error * featureMap[f]);
+                const idx = i * this.filters.length + f;
+                let grad = error * featureMap[f];
+
+                // Mise à jour adaptative (Adam)
+                this.m_weights[idx] = this.beta1 * this.m_weights[idx] + (1 - this.beta1) * grad;
+                this.v_weights[idx] = this.beta2 * this.v_weights[idx] + (1 - this.beta2) * (grad * grad);
                 
-                // Mise à jour des filtres intégrée dans la boucle f
-                if (isCorrect && Math.abs(error) > 0.1) {
-                    this._updateFilters(sequence, f, error);
+                const m_hat = this.m_weights[idx] / (1 - Math.pow(this.beta1, this.t));
+                const v_hat = this.v_weights[idx] / (1 - Math.pow(this.beta2, this.t));
+
+                // Application correcte du Weight Decay (AdamW style)
+                this.denseWeights[idx] -= this.lr * this.wd * this.denseWeights[idx];
+                // Mise à jour Adam
+                this.denseWeights[idx] += this.lr * m_hat / (Math.sqrt(v_hat) + this.eps);
+                
+                // --- THÉORIE : STABILITÉ SYNAPTIQUE ---
+                // On augmente le multiplicateur à 0.5 (au lieu de 0.2) pour que 
+                // les filtres puissent réellement évoluer.
+                if (isCorrect && Math.abs(error) > 0.15) {
+                    const filterError = error * 0.5; 
+                    this._updateFilters(sequence, f, filterError);
                 }
             }
-            this.denseBiases[i] = (this.denseBiases[i] * wdFactor) + (this.lr * error);
+            // --- ADAM (Dense Bias) ---
+            this.m_bias_dense[i] = this.beta1 * this.m_bias_dense[i] + (1 - this.beta1) * error;
+            this.v_bias_dense[i] = this.beta2 * this.v_bias_dense[i] + (1 - this.beta2) * (error * error);
+            const mb_hat = this.m_bias_dense[i] / (1 - Math.pow(this.beta1, this.t));
+            const vb_hat = this.v_bias_dense[i] / (1 - Math.pow(this.beta2, this.t));
+            
+            this.denseBiases[i] += this.lr * mb_hat / (Math.sqrt(vb_hat) + this.eps);
         }
         return totalSampleLoss / this.numActions;
     }
