@@ -635,26 +635,51 @@ export class StatefulMajorityNetwork {
         this.outputSize = this.ruleNetwork.layers[this.ruleNetwork.layers.length - 1].length;
         this.state = new Uint8Array(this.outputSize).fill(0);
         this.currentInputSize = currentInputSize;
+        
+        // Pré-allocation du buffer d'entrée global pour éviter les réallocations
+        this._globalInputsBuffer = new Uint8Array(this.maxIndex + 1);
+
+        // Pré-compilation des instructions de mappage pour éviter les opérations sur les chaînes et les boucles coûteuses
+        this._mappingInstructions = [];
+        const names = Object.keys(this.varMap);
+        
+        // Tri des noms pour garantir un mappage déterministe et un ordre cohérent des inputs
+        names.sort((a, b) => {
+            const aIsPrev = a.startsWith('prev_');
+            const bIsPrev = b.startsWith('prev_');
+            if (aIsPrev && !bIsPrev) return 1; // Les variables d'état précédentes viennent après les inputs actuels
+            if (!aIsPrev && bIsPrev) return -1; // Les inputs actuels viennent avant les variables d'état précédentes
+            return this.varMap[a] - this.varMap[b]; // Ensuite, tri par index numérique
+        });
+
+        let currentInputCounter = 0; // Compteur pour les indices des inputs actuels
+        for (const name of names) {
+            const targetIdx = this.varMap[name];
+            if (name.startsWith('prev_')) { // Variable d'état précédente
+                const stateIdx = parseInt(name.split('_').pop()) - 1 || 0;
+                this._mappingInstructions.push({ type: 'prevState', stateIdx: stateIdx, targetIdx: targetIdx });
+            } else { // Input actuel
+                this._mappingInstructions.push({ type: 'currentInput', sourceIdx: currentInputCounter, targetIdx: targetIdx });
+                currentInputCounter++;
+            }
+        }
     }
 
     predict(currentInputs) {
-        // Création d'un vecteur d'entrée global aligné sur le varMap
-        const globalInputs = new Uint8Array(this.maxIndex + 1);
+        // Réutilisation du buffer pré-alloué et réinitialisation à zéro
+        const globalInputs = this._globalInputsBuffer;
+        globalInputs.fill(0);
 
-        // On mappe les entrées actuelles en premier (pour garder l'ordre du varMap)
-        const names = Object.keys(this.varMap);
-        let inputIdx = 0;
-
-        names.forEach((name) => {
-            const targetIdx = this.varMap[name];
-            if (name.startsWith('prev_')) {
-                // On cherche l'index de l'état (ex: prev_state_1 -> index 0 de l'état)
-                const stateIdx = parseInt(name.split('_').pop()) - 1 || 0;
-                globalInputs[targetIdx] = this.state[stateIdx] || 0;
-            } else if (!name.startsWith('prev_') && inputIdx < currentInputs.length) {
-                globalInputs[targetIdx] = currentInputs[inputIdx++];
+        // Application des instructions de mappage pré-compilées
+        for (const instruction of this._mappingInstructions) {
+            if (instruction.type === 'prevState') {
+                globalInputs[instruction.targetIdx] = this.state[instruction.stateIdx] || 0;
+            } else if (instruction.type === 'currentInput') {
+                if (instruction.sourceIdx < currentInputs.length) {
+                    globalInputs[instruction.targetIdx] = currentInputs[instruction.sourceIdx];
+                }
             }
-        });
+        }
 
         const newOutput = this.ruleNetwork.predict(globalInputs, false);
         this.state = newOutput; // Met à jour l'état pour la prochaine itération
@@ -1297,7 +1322,13 @@ export class BitwiseNeuralCipher {
         this.generator = new StatefulMajorityNetwork(config.logic, config.map, 0);
         this.initialState = config.seed;
 
-        this.authKey = 0n; // Clé d'authentification dérivée (H dans GCM)
+        // Ajout d'un buffer pour le flux de clé généré par le réseau
+        this._keyStreamBuffer = new Uint8Array(Math.ceil(this.generator.outputSize / 8));
+        this._keyStreamBufferIndex = 0; // Index courant dans le buffer (en octets)
+        this._keyStreamBytesAvailable = 0; // Nombre d'octets valides dans le buffer
+
+        this.authKey = 0n; // Clé d'authentification dérivée (H dans GCM), sera initialisée dans _reset
+        this.processedLength = 0n; // Longueur cumulée pour le GHASH
         this.runningTag = 0n; // Accumulateur de tag (GHASH-like)
     }
 
@@ -1365,15 +1396,6 @@ export class BitwiseNeuralCipher {
     _reset(iv = null) {
         this.generator.reset();
         const state = new Uint8Array(this.initialState);
-        
-        // Reset de l'accumulateur haute précision avec un sel dérivé de l'IV
-        let ivSeed = iv ? iv.reduce((acc, v) => (acc << 8n) | BigInt(v), 0n) : 0n;
-        this.highPrecisionState = ivSeed ^ 0x55555555555555555555555555555555n;
-
-        // Dérivation d'une authKey unique pour ce message (similaire au H d'AES-GCM)
-        // On fait tourner le réseau à vide pour extraire 128 bits de pure entropie "clé"
-        this.authKey = this._generateInternal128BitKey();
-        this.runningTag = 0n;
 
         if (iv) {
             for (let i = 0; i < Math.min(state.length, iv.length); i++) {
@@ -1381,6 +1403,21 @@ export class BitwiseNeuralCipher {
             }
         }
         this.generator.state = state;
+
+        // Reset de l'accumulateur haute précision avec un sel dérivé de l'IV
+        let ivSeed = iv ? iv.reduce((acc, v) => (acc << 8n) | BigInt(v), 0n) : 0n;
+        this.highPrecisionState = ivSeed ^ 0x55555555555555555555555555555555n;
+
+        // Réinitialisation du buffer de flux de clé
+        this._keyStreamBufferIndex = 0;
+        this._keyStreamBytesAvailable = 0;
+
+        // Dérivation d'une authKey unique pour ce message BASÉE sur le nouvel état (IV inclus)
+        this.authKey = this._generateInternal128BitKey();
+        
+        this.processedLength = 0n; // CORRECTIF : Reset impératif pour la validation du Tag
+        this.runningTag = 0n;
+
         return this;
     }
 
@@ -1390,12 +1427,40 @@ export class BitwiseNeuralCipher {
     _generateInternal128BitKey() {
         let key = 0n;
         for (let i = 0; i < 16; i++) {
-            const bits = this.generator.predict(new Uint8Array(0));
-            let byte = 0;
-            for (let b = 0; b < 8; b++) byte |= (bits[b] << b);
-            key = (key << 8n) | BigInt(byte);
+            const byte = this._getNextKeyByte(); // Utilise la méthode optimisée
+            key = (key << 8n) | BigInt(byte); // Accumule les octets pour former la clé
         }
         return key;
+    }
+
+    /**
+     * Génère et fournit le prochain octet du flux de clé.
+     * Recharge le buffer interne si nécessaire en appelant le générateur.
+     */
+    _getNextKeyByte() {
+        // Si le buffer est vide ou que tous les octets ont été consommés, génère un nouveau bloc
+        if (this._keyStreamBufferIndex >= this._keyStreamBytesAvailable) {
+            const keyBits = this.generator.predict(new Uint8Array(0)); // Génère un nouveau bloc de bits (Uint8Array de 0s et 1s)
+            
+            this._keyStreamBufferIndex = 0; // Réinitialise l'index pour le nouveau bloc
+            this._keyStreamBytesAvailable = Math.floor(keyBits.length / 8); // Calcule le nombre d'octets complets disponibles
+
+            // Convertit les bits en octets et les stocke dans le buffer
+            for (let i = 0; i < this._keyStreamBytesAvailable; i++) {
+                let byte = 0;
+                for (let b = 0; b < 8; b++) {
+                    // S'assure de ne pas lire au-delà de la taille de keyBits
+                    if ((i * 8 + b) < keyBits.length) {
+                        byte |= (keyBits[i * 8 + b] << b);
+                    }
+                }
+                this._keyStreamBuffer[i] = byte;
+            }
+        }
+        // Retourne l'octet courant et avance l'index
+        const byte = this._keyStreamBuffer[this._keyStreamBufferIndex];
+        this._keyStreamBufferIndex++;
+        return byte;
     }
 
     /**
@@ -1451,8 +1516,10 @@ export class BitwiseNeuralCipher {
 
     _generateRandomIV() {
         const iv = new Uint8Array(this.ivSize);
-        if (typeof crypto !== 'undefined' && crypto.getRandomValues) {
-            crypto.getRandomValues(iv);
+        if (typeof crypto !== 'undefined' && (crypto.getRandomValues || crypto.webcrypto?.getRandomValues)) {
+            for (let i = 0; i < iv.length; i += 65536) {
+                (crypto.getRandomValues ? crypto : crypto.webcrypto).getRandomValues(iv.subarray(i, Math.min(i + 65536, iv.length)));
+            }
         } else {
             // Fallback Node.js simple si nécessaire
             for(let i=0; i<this.ivSize; i++) iv[i] = Math.floor(Math.random() * 256);
@@ -1471,11 +1538,8 @@ export class BitwiseNeuralCipher {
         const LARGE_PRIME = 0xffffffffffffffffffffffffffffff43n;
 
         for (let i = 0; i < data.length; i++) {
-            const keyBits = this.generator.predict(new Uint8Array(0));
-            let rawByte = 0;
-            for (let b = 0; b < Math.min(8, keyBits.length); b++) {
-                rawByte |= (keyBits[b] << b);
-            }
+            // Obtient le prochain octet du flux de clé de manière optimisée
+            const rawByte = this._getNextKeyByte();
 
             // --- DÉFENSE ANTI-SAT : Whitening Haute Précision ---
             // On utilise une transformation non-linéaire sur 128 bits minimum.
@@ -1505,6 +1569,7 @@ export class BitwiseNeuralCipher {
 
             output[i] = isEncrypt ? cipherByte : plainByte;
         }
+        this.processedLength += BigInt(data.length);
         return output;
     }
 
@@ -1512,9 +1577,9 @@ export class BitwiseNeuralCipher {
         // Finalisation du tag : on mélange le runningTag avec l'état final du réseau
         // pour éviter les attaques sur le message vide ou les extensions de longueur.
         const LARGE_PRIME = 0xffffffffffffffffffffffffffffff43n;
-        const finalState = this.generator.state.reduce((acc, v, i) => acc ^ (BigInt(v) << BigInt(i % 120)), 0n);
+        const finalState = this.generator.state.reduce((acc, v, i) => acc ^ (BigInt(v) << BigInt(i % 128)), 0n);
         
-        const finalizedTag = (this.runningTag ^ finalState) % LARGE_PRIME;
+        const finalizedTag = (this.runningTag ^ this.processedLength ^ finalState) % LARGE_PRIME;
         
         const tagBytes = new Uint8Array(16);
         let temp = finalizedTag;
@@ -3967,7 +4032,70 @@ export class BitwiseSequenceLearner {
 // ============================================================
 // EXEMPLE D'UTILISATION : CHIFFREMENT NEURONAL AUTHENTIFIÉ
 // ============================================================
+function _runCipherBenchmark() {
+    console.log("\n=== BENCHMARK: BitwiseNeuralCipher Performance ===");
 
+    const passphrase = "benchmark-key-123-for-speed-test";
+    const complexity = 128;
+    const cipher = new BitwiseNeuralCipher(passphrase, { complexity });
+
+    const dataSizeKB = 1; // 100 KB
+    const dataSize = dataSizeKB * 1024; // in bytes
+    const iterations = 100; // Number of times to encrypt/decrypt the data
+
+    // Generate random data
+    const plaintext = new Uint8Array(dataSize);
+    if (typeof crypto !== 'undefined' && (crypto.getRandomValues || crypto.webcrypto?.getRandomValues)) {
+        for (let i = 0; i < plaintext.length; i += 65536) {
+            (crypto.getRandomValues ? crypto : crypto.webcrypto).getRandomValues(plaintext.subarray(i, Math.min(i + 65536, plaintext.length)));
+        }
+    } else {
+        // Fallback for Node.js if crypto is not available (though it usually is)
+        for (let i = 0; i < dataSize; i++) plaintext[i] = Math.floor(Math.random() * 256);
+    }
+
+    console.log(`Benchmarking with ${dataSizeKB} KB of random data, ${iterations} iterations.`);
+
+    // --- Encryption Benchmark ---
+    let totalEncryptTime = 0;
+    let encryptedData = null; // Store the last encrypted data for decryption
+
+    const encryptStart = process.hrtime.bigint();
+    for (let i = 0; i < iterations; i++) {
+        encryptedData = cipher.encrypt(plaintext);
+        console.log('encrypt');
+    }
+    const encryptEnd = process.hrtime.bigint();
+    totalEncryptTime = Number(encryptEnd - encryptStart) / 1_000_000; // ms
+
+    const encryptThroughput = (dataSizeKB * iterations) / (totalEncryptTime / 1000); // KB/s
+    console.log(`Encryption: ${totalEncryptTime.toFixed(2)} ms total for ${iterations} iterations.`);
+    console.log(`Encryption Throughput: ${encryptThroughput.toFixed(2)} KB/s (${(encryptThroughput / 1024).toFixed(2)} MB/s)`);
+
+    // --- Decryption Benchmark ---
+    let totalDecryptTime = 0;
+    let decryptedData = null;
+
+    const decryptStart = process.hrtime.bigint();
+    for (let i = 0; i < iterations; i++) {
+        // Use the last encryptedData from the encryption loop
+        decryptedData = cipher.decrypt(encryptedData);
+    }
+    const decryptEnd = process.hrtime.bigint();
+    totalDecryptTime = Number(decryptEnd - decryptStart) / 1_000_000; // ms
+
+    const decryptThroughput = (dataSizeKB * iterations) / (totalDecryptTime / 1000); // KB/s
+    console.log(`Decryption: ${totalDecryptTime.toFixed(2)} ms total for ${iterations} iterations.`);
+    console.log(`Decryption Throughput: ${decryptThroughput.toFixed(2)} KB/s (${(decryptThroughput / 1024).toFixed(2)} MB/s)`);
+
+    // --- Verification ---
+    const originalString = new TextDecoder().decode(plaintext);
+    const decryptedString = decryptedData.toString();
+    console.log(`Verification: ${originalString === decryptedString ? '✅ Success' : '❌ Failure'}`);
+}
+
+// Run the benchmark
+_runCipherBenchmark();
 const cipher = new BitwiseNeuralCipher("secret-robot-key-2024", { complexity: 128 });
 const originalMessage = "Directive 42: Protéger l'intégrité du maillage neuronal.";
 

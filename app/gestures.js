@@ -17,8 +17,13 @@ function processFrame(buffer, width, height) {
 
     // 3. Application du seuil binaire et préparation du retour RGBA
     const output = Buffer.alloc(buffer.length);
+    const binaryMask = new Uint8Array(grayscale.length);
+
     for (let i = 0; i < grayscale.length; i++) {
-        const val = grayscale[i] > threshold ? 255 : 0;
+        const isWhite = grayscale[i] > threshold;
+        const val = isWhite ? 255 : 0;
+        binaryMask[i] = isWhite ? 1 : 0;
+        
         const idx = i * 4;
         output[idx] = val;     // R
         output[idx + 1] = val; // G
@@ -26,7 +31,7 @@ function processFrame(buffer, width, height) {
         output[idx + 3] = 255; // A
     }
 
-    return output;
+    return { output, binaryMask };
 }
 
 function computeOtsuThreshold(data) {

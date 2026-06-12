@@ -3,9 +3,113 @@ import path from 'path';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
 import { WebSocketServer } from 'ws';
+import zlib from 'zlib';
 
 // Importation des outils G-NEURO pour le traitement neuronal
-import { RuleInterpreter, DataWrapper, CNNBrain } from './neuro-lib.js';
+import { 
+    RuleInterpreter, DataWrapper, CNNBrain,
+    ProjectiveBrain, OBJParser, VisionBenchmark,
+    Quaternion, Vector3, BitwiseMeshMapper, FBXParser
+} from './neuro-lib.js';
+
+let globalVertices = [];
+let projectiveBrain = new ProjectiveBrain(5); // 5 points d'intérêt pour la reconstruction
+
+// --- CONFIGURATION GÉOMÉTRIQUE BITWISE (Pose 60-bits) ---
+const SAMPLES_COUNT = 200;
+const BITS_PER_COMPONENT = 10;
+const TOTAL_POSE_BITS = 60; // [X, Y, Z, Nx, Ny, Nz] * 10
+const SIGNATURE_SIZE = 28;
+const INPUT_FLAT_SIZE = SIGNATURE_SIZE * SIGNATURE_SIZE;
+
+const meshMapper = new BitwiseMeshMapper(INPUT_FLAT_SIZE, TOTAL_POSE_BITS);
+
+// Seuils pour l'encodage Thermomètre (10 niveaux par composante)
+const tPos = Array.from({length: 10}, (_, i) => -0.5 + (i * 0.1));
+const tDepth = Array.from({length: 10}, (_, i) => 1.0 + (i * 0.15));
+const tNormal = Array.from({length: 10}, (_, i) => -1.0 + (i * 0.2));
+
+// --- GÉNÉRATEUR D'ARCHÉTYPES ---
+/**
+ * Crée une signature visuelle synthétique (un disque blanc sur fond noir)
+ */
+function createSyntheticSignature(cx, cy, radius) {
+    const sig = new Uint8Array(INPUT_FLAT_SIZE);
+    for (let y = 0; y < SIGNATURE_SIZE; y++) {
+        for (let x = 0; x < SIGNATURE_SIZE; x++) {
+            const dx = (x / SIGNATURE_SIZE) - cx;
+            const dy = (y / SIGNATURE_SIZE) - cy;
+            if (Math.sqrt(dx * dx + dy * dy) < radius) {
+                sig[y * SIGNATURE_SIZE + x] = 1;
+            }
+        }
+    }
+    return sig;
+}
+
+/**
+ * Génère une collection de poses 3D prédites en variant les paramètres visuels
+ */
+function generateArchetypes() {
+    const archetypes = [];
+    // On varie la taille (échelle) et la position horizontale pour simuler 
+    // différentes perspectives apprises par le réseau.
+    for (let scale = 0.15; scale <= 0.45; scale += 0.1) {
+        for (let posX = 0.2; posX <= 0.8; posX += 0.2) {
+            const sig = createSyntheticSignature(posX, 0.5, scale);
+            const meshBits = meshMapper.predict(sig);
+            
+            archetypes.push({
+                posX: posX.toFixed(2),
+                scale: scale.toFixed(2),
+                pos: decodePose(meshBits.slice(0, 30), "POS"),
+                normal: decodePose(meshBits.slice(30, 60), "NORMAL")
+            });
+        }
+    }
+    return archetypes;
+}
+
+// --- PERSISTANCE DES DONNÉES ---
+const GESTURES_FILE = path.join(process.cwd(), 'trained_gestures.json');
+const MAPPER_FILE = path.join(process.cwd(), 'trained_mesh_mapper.json');
+
+function saveTrainedData() {
+    // Sauvegarde des gestes (Conversion Float32Array -> Array pour JSON)
+    const exportableGestures = {};
+    for (const [name, samples] of Object.entries(gestureSamples)) {
+        exportableGestures[name] = samples.map(s => Array.from(s));
+    }
+    fs.writeFileSync(GESTURES_FILE, JSON.stringify({ actions: ACTIONS, samples: exportableGestures }));
+    
+    // Sauvegarde du Mapper 3D
+    fs.writeFileSync(MAPPER_FILE, JSON.stringify(meshMapper.exportState()));
+    console.log("💾 Données neuronales sauvegardées sur le disque.");
+}
+
+function loadTrainedData() {
+    try {
+        if (fs.existsSync(GESTURES_FILE)) {
+            const data = JSON.parse(fs.readFileSync(GESTURES_FILE, 'utf8'));
+            ACTIONS = data.actions;
+            gestureSamples = {};
+            for (const [name, samples] of Object.entries(data.samples)) {
+                gestureSamples[name] = samples.map(s => new Float32Array(s));
+            }
+            console.log(`📂 ${ACTIONS.length} actions chargées depuis le disque.`);
+            updateMotionBrain();
+        }
+        
+        if (fs.existsSync(MAPPER_FILE)) {
+            const mapperState = JSON.parse(fs.readFileSync(MAPPER_FILE, 'utf8'));
+            meshMapper.importState(mapperState);
+            console.log("📂 État du BitwiseMeshMapper restauré.");
+        }
+    } catch (e) {
+        console.error("⚠️ Erreur lors du chargement des données persistantes:", e);
+    }
+}
+
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -37,8 +141,6 @@ app.get('/config', (req, res) => {
 let ACTIONS = ["IMMOBILE", "MOUVEMENT_H", "MOUVEMENT_V", "PRESENCE_CENTRALE"];
 
 const WINDOW_SIZE = 1; // Passage en mode "Empreinte" (Footprint unique par geste)
-const SIGNATURE_SIZE = 28; // Résolution 28x28 (Standard Vision : Ratio Performance/Détail optimal)
-const INPUT_FLAT_SIZE = SIGNATURE_SIZE * SIGNATURE_SIZE;
 const CONFIRMATION_THRESHOLD = 3;
 const PERSISTENCE_FRAMES = 8;
 
@@ -138,7 +240,12 @@ function updateMotionBrain() {
 }
 
 function broadcastState() {
-    const payload = JSON.stringify({ type: 'STATE_UPDATE', actions: ACTIONS, samples: gestureSamples });
+    // Conversion des Float32Array en tableaux standards pour une sérialisation JSON fluide
+    const exportableSamples = {};
+    for (const [name, samples] of Object.entries(gestureSamples)) {
+        exportableSamples[name] = samples.map(s => s instanceof Float32Array ? Array.from(s) : s);
+    }
+    const payload = JSON.stringify({ type: 'STATE_UPDATE', actions: ACTIONS, samples: exportableSamples });
     wss.clients.forEach(client => {
         if (client.readyState === 1) { // WebSocket.OPEN
             client.send(payload);
@@ -164,12 +271,32 @@ wss.on('connection', (ws) => {
     ws.persistenceCounters = {};   // Pour la persistance visuelle
     ws.motionAccumulator = null;   // Buffer pour la persistance du mouvement (MEI)
     ws.boxHistory = [];           // Mémoire temporelle des zones de mouvement
+    ws.isStreaming3D = false;     // Mode reconstruction active
 
     ws.on('message', (data) => {
-        // Gestion des commandes JSON (Enregistrement de geste)
         try {
-            const textData = data.toString();
-            if (textData.startsWith('{')) {
+            // --- DÉTECTION DU PROTOCOLE BINAIRE ---
+            // Si le message commence par "MESH" (0x4D 0x45 0x53 0x48)
+            if (data.length > 5 && data[0] === 77 && data[1] === 69 && data[2] === 83 && data[3] === 72) {
+                const nameLen = data[4];
+                const filename = data.slice(5, 5 + nameLen).toString();
+                const content = data.slice(5 + nameLen);
+                
+                const ext = filename.split('.').pop().toLowerCase();
+                if (ext === 'obj') {
+                    globalVertices = OBJParser.parse(content.toString());
+                } else if (ext === 'fbx') {
+                    globalVertices = FBXParser.parse(content, zlib);
+                }
+                
+                console.log(`📦 Modèle Binaire ${filename} reçu : ${globalVertices.length} sommets.`);
+                ingestMeshGeometry(globalVertices);
+                return;
+            }
+
+            // Commandes JSON classiques
+            if (data[0] === 123) { // 123 = '{'
+                const textData = data.toString();
                 const cmd = JSON.parse(textData);
                 if (cmd.type === 'START_RECORDING') {
                     ws.pendingGestureName = cmd.name.toUpperCase().replace(/\s/g, '_');
@@ -193,8 +320,30 @@ wss.on('connection', (ws) => {
                         }
                         
                         updateMotionBrain();
+                        saveTrainedData();
                         broadcastState();
                     }
+                }
+                if (cmd.type === 'TRAIN_3D_POSE') {
+                    ws.isTraining3D = true;
+                    ws.target3DPose = cmd.target;
+                    console.log(`📸 Capture de pose 3D pour entraînement : Z=${cmd.target.z}m`);
+                }
+                if (cmd.type === 'TOGGLE_3D_STREAM') {
+                    ws.isStreaming3D = cmd.active;
+                }
+                if (cmd.type === 'BENCHMARK_3D') {
+                    if (globalVertices.length === 0) {
+                        ws.send(JSON.stringify({ type: 'BENCHMARK_RESULT', error: "Aucun modèle OBJ chargé." }));
+                    } else {
+                        VisionBenchmark.runTrainingSession(projectiveBrain, globalVertices, 5000).then(time => {
+                            ws.send(JSON.stringify({ type: 'BENCHMARK_RESULT', time: time }));
+                        });
+                    }
+                }
+                if (cmd.type === 'GENERATE_ARCHETYPES') {
+                    const archetypes = generateArchetypes();
+                    ws.send(JSON.stringify({ type: 'ARCHETYPES_LIST', data: archetypes }));
                 }
                 return;
             }
@@ -250,6 +399,45 @@ wss.on('connection', (ws) => {
 
                 // Affiche uniquement la signature (le patch) envoyée au réseau de manière centrée
                 drawLargeSignature(processed, signature, SIGNATURE_SIZE, width, height);
+
+                // --- ESTIMATION 3D & ENTRAÎNEMENT ---
+                const focal = 500;
+                const centerX = (globalBox.minX + globalBox.maxX) / 2;
+                const centerY = (globalBox.minY + globalBox.maxY) / 2;
+                
+                if (ws.isTraining3D) {
+                    // On entraîne le premier seeker (point principal) sur la profondeur cible
+                    const seeker = projectiveBrain.seekers[0];
+                    const depth = ws.target3DPose.z;
+                    
+                    // Le neurone Seeker apprend la direction (quaternion neutre ici) pondéré par l'erreur de profondeur
+                    seeker.pose.update(new Quaternion(), depth * 0.1, 0.05);
+                    
+                    ws.isTraining3D = false;
+                    ws.send(JSON.stringify({ type: '3D_TRAIN_DONE' }));
+                }
+
+                // --- ESTIMATION 3D PAR MAPPING BITWISE ---
+                if (ws.isStreaming3D) {
+                    const meshBits = meshMapper.predict(signature);
+                    
+                    // Décodage des positions (Bits 0-29)
+                    const bX = DataWrapper.bitsToAnalog(meshBits.slice(0, 10), -0.5, 0.5);
+                    const bY = DataWrapper.bitsToAnalog(meshBits.slice(10, 20), -0.5, 0.5);
+                    const bZ = DataWrapper.bitsToAnalog(meshBits.slice(20, 30), 1.0, 2.5);
+                    
+                    // Décodage des normales / orientation (Bits 30-59)
+                    const nX = DataWrapper.bitsToAnalog(meshBits.slice(30, 40), -1.0, 1.0);
+                    const nY = DataWrapper.bitsToAnalog(meshBits.slice(40, 50), -1.0, 1.0);
+                    const nZ = DataWrapper.bitsToAnalog(meshBits.slice(50, 60), -1.0, 1.0);
+                    
+                    ws.send(JSON.stringify({ 
+                        type: '3D_ESTIMATE', 
+                        pos: { x: bX.toFixed(2), y: bY.toFixed(2), z: bZ.toFixed(2) },
+                        normal: { x: nX.toFixed(2), y: nY.toFixed(2), z: nZ.toFixed(2) },
+                        reliability: (meshBits.reduce((a, b) => a + b, 0) / TOTAL_POSE_BITS).toFixed(2)
+                    }));
+                }
 
                 // --- LOGIQUE D'APPRENTISSAGE ---
                 if (ws.pendingGestureName) {
@@ -315,6 +503,108 @@ wss.on('connection', (ws) => {
 });
 
 /**
+ * Génère des vues synthétiques de l'objet pour l'ingestion neuronale bit à bit
+ */
+function ingestMeshGeometry(vertices) {
+    console.log(`🧠 Ingestion Bitwise : Démarrage sur ${SAMPLES_COUNT} vues (${vertices.length} sommets)...`);
+
+    const focal = 500, w = 320, h = 240;
+    const _tempV = new Vector3();
+    const _tempV2 = new Vector3();
+    const forward = new Vector3(0, 0, 1);
+    const signature = new Uint8Array(INPUT_FLAT_SIZE);
+    const targetBits = new Uint8Array(TOTAL_POSE_BITS);
+
+    let i = 0;
+
+    const processBatch = () => {
+        const batchSize = 5; // Traitement par petits paquets pour libérer l'Event Loop
+        const end = Math.min(i + batchSize, SAMPLES_COUNT);
+
+        for (; i < end; i++) {
+            // 1. Pose aléatoire
+            const q = Quaternion.random();
+            const pos = new Vector3((Math.random() - 0.5), (Math.random() - 0.5), 1.0 + Math.random() * 1.5);
+
+            // 2. Projection optimisée (sans allocation d'objets dans la boucle v)
+            signature.fill(0);
+            for (let j = 0; j < vertices.length; j++) {
+                const v = vertices[j];
+                q.rotateVector(v, _tempV);
+                _tempV.add(pos, _tempV2);
+                
+                const z = (_tempV2.z <= 0) ? 0.001 : _tempV2.z;
+                const factor = focal / z;
+                const gx = ((_tempV2.x * factor + w / 2) / w * SIGNATURE_SIZE) | 0;
+                const gy = ((-_tempV2.y * factor + h / 2) / h * SIGNATURE_SIZE) | 0;
+
+                if (gx >= 0 && gx < SIGNATURE_SIZE && gy >= 0 && gy < SIGNATURE_SIZE) {
+                    signature[gy * SIGNATURE_SIZE + gx] = 1;
+                }
+            }
+
+            // 3. Encodage et Entraînement
+            const normal = q.rotateVector(forward, _tempV);
+            targetBits.set(DataWrapper.numberToBits(pos.x, tPos), 0);
+            targetBits.set(DataWrapper.numberToBits(pos.y, tPos), 10);
+            targetBits.set(DataWrapper.numberToBits(pos.z, tDepth), 20);
+            targetBits.set(DataWrapper.numberToBits(normal.x, tNormal), 30);
+            targetBits.set(DataWrapper.numberToBits(normal.y, tNormal), 40);
+            targetBits.set(DataWrapper.numberToBits(normal.z, tNormal), 50);
+
+            meshMapper.train(signature, targetBits);
+        }
+
+        // Feedback visuel immédiat dans la console
+        process.stdout.write(`\r   ... Progression : ${((i/SAMPLES_COUNT)*100).toFixed(0)}% (${i}/${SAMPLES_COUNT} vues)`);
+
+        if (i < SAMPLES_COUNT) {
+            setImmediate(processBatch); // Laisse Node.js traiter les autres événements
+        } else {
+            console.log("\n✅ Cartographie Bitwise terminée.");
+            saveTrainedData();
+            broadcastState();
+        }
+    };
+
+    processBatch();
+}
+
+/**
+ * Utilitaire de décodage des bits vers un objet 3D lisible
+ */
+function decodePose(bits, type) {
+    if (type === "POS") {
+        return {
+            x: DataWrapper.bitsToAnalog(bits.slice(0, 10), -0.5, 0.5).toFixed(3),
+            y: DataWrapper.bitsToAnalog(bits.slice(10, 20), -0.5, 0.5).toFixed(3),
+            z: DataWrapper.bitsToAnalog(bits.slice(20, 30), 1.0, 2.5).toFixed(3)
+        };
+    } else {
+        return {
+            x: DataWrapper.bitsToAnalog(bits.slice(0, 10), -1.0, 1.0).toFixed(3),
+            y: DataWrapper.bitsToAnalog(bits.slice(10, 20), -1.0, 1.0).toFixed(3),
+            z: DataWrapper.bitsToAnalog(bits.slice(20, 30), -1.0, 1.0).toFixed(3)
+        };
+    }
+}
+
+/**
+ * Évalue la précision de l'entraînement bit à bit sur les normales
+ */
+function evaluateBitwiseGeometry(signature, targetNormal) {
+    const prediction = motionBrain.predict(signature);
+    // Ici on comparerait la sortie du réseau avec les bits de DataWrapper
+    // Pour l'instant, on utilise les classes de vues comme proxy
+    const predictedViewIdx = prediction.indexOf(1);
+    if (predictedViewIdx !== -1) {
+        const viewName = ACTIONS[predictedViewIdx];
+        return `Estimation : ${viewName}`;
+    }
+    return "Inconnu";
+}
+
+/**
  * Finalise l'enregistrement et tronque/valide la séquence
  */
 function finalizeRecording(ws) {
@@ -348,6 +638,7 @@ function finalizeRecording(ws) {
 
     gestureSamples[ws.pendingGestureName].push(footprint);
     updateMotionBrain();
+    saveTrainedData();
 
     console.log(`🧠 GESTE RÉDUIT À UNE EMPREINTE : ${ws.pendingGestureName}`);
     broadcastState();
@@ -626,3 +917,6 @@ function drawGlobalBox(buffer, box, width) {
         drawPixel(buffer, box.maxX - 1, y, width, color);
     }
 }
+// Chargement au démarrage
+loadTrainedData();
+s
