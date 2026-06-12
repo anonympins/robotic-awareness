@@ -1287,15 +1287,18 @@ export class BitwiseNeuralCipher {
     constructor(passphrase, options = {}) {
         this.complexity = options.complexity || 64;
         this.ivSize = options.ivSize || 16;
-        this.tagSize = 8; // Fixé par la logique du hachage d'état
+        this.tagSize = 16; // Tag de 128 bits (GCM-like)
+
+        // INITIALISATION PRIORITAIRE : On doit initialiser le BigInt avant 
+        // d'appeler _deriveConfigFromKey car cette méthode l'utilise.
+        this.highPrecisionState = 0n;
         
         const config = this._deriveConfigFromKey(passphrase, this.complexity);
         this.generator = new StatefulMajorityNetwork(config.logic, config.map, 0);
         this.initialState = config.seed;
 
-        // Accumulateur de haute précision (BigInt) pour briser la cohérence algébrique
-        // On initialise avec une constante issue de la clé pour la cohérence
-        this.highPrecisionState = BigInt(0);
+        this.authKey = 0n; // Clé d'authentification dérivée (H dans GCM)
+        this.runningTag = 0n; // Accumulateur de tag (GHASH-like)
     }
 
     /**
@@ -1367,6 +1370,11 @@ export class BitwiseNeuralCipher {
         let ivSeed = iv ? iv.reduce((acc, v) => (acc << 8n) | BigInt(v), 0n) : 0n;
         this.highPrecisionState = ivSeed ^ 0x55555555555555555555555555555555n;
 
+        // Dérivation d'une authKey unique pour ce message (similaire au H d'AES-GCM)
+        // On fait tourner le réseau à vide pour extraire 128 bits de pure entropie "clé"
+        this.authKey = this._generateInternal128BitKey();
+        this.runningTag = 0n;
+
         if (iv) {
             for (let i = 0; i < Math.min(state.length, iv.length); i++) {
                 state[i] ^= (iv[i] & 1);
@@ -1374,6 +1382,20 @@ export class BitwiseNeuralCipher {
         }
         this.generator.state = state;
         return this;
+    }
+
+    /**
+     * Génère une clé de 128 bits à partir du générateur pour l'authentification.
+     */
+    _generateInternal128BitKey() {
+        let key = 0n;
+        for (let i = 0; i < 16; i++) {
+            const bits = this.generator.predict(new Uint8Array(0));
+            let byte = 0;
+            for (let b = 0; b < 8; b++) byte |= (bits[b] << b);
+            key = (key << 8n) | BigInt(byte);
+        }
+        return key;
     }
 
     /**
@@ -1387,11 +1409,12 @@ export class BitwiseNeuralCipher {
         const iv = customIv || this._generateRandomIV();
         
         this._reset(iv);
-        const encrypted = this._transform(input);
+        // En mode encryption, on hash le ciphertext produit
+        const encrypted = this._transform(input, true);
         const tag = this._getIntegrityTag();
 
-        // Assemblage final : IV + DATA + TAG
-        const combined = new Uint8Array(iv.length + encrypted.length + tag.length);
+        // Le tag GHASH-like fait 16 octets (128 bits)
+        const combined = new Uint8Array(iv.length + encrypted.length + 16);
         combined.set(iv, 0);
         combined.set(encrypted, iv.length);
         combined.set(tag, iv.length + encrypted.length);
@@ -1405,14 +1428,16 @@ export class BitwiseNeuralCipher {
      */
     decrypt(combinedData) {
         const input = combinedData instanceof NeuralTransformResult ? combinedData.raw : combinedData;
+        const TAG_SIZE = 16;
         
         // Extraction des segments
         const iv = input.slice(0, this.ivSize);
-        const tagReceived = input.slice(-this.tagSize);
-        const encrypted = input.slice(this.ivSize, -this.tagSize);
+        const tagReceived = input.slice(-TAG_SIZE);
+        const encrypted = input.slice(this.ivSize, -TAG_SIZE);
 
         this._reset(iv);
-        const decrypted = this._transform(encrypted);
+        // En mode décryptage, on hash le ciphertext AVANT XOR
+        const decrypted = this._transform(encrypted, false);
         const tagCalculated = this._getIntegrityTag();
 
         // Vérification d'intégrité (Authentification)
@@ -1438,10 +1463,12 @@ export class BitwiseNeuralCipher {
     /**
      * Coeur de la transformation (XOR Stream)
      * @param {Uint8Array} data 
+     * @param {boolean} isEncrypt
      * @returns {Uint8Array}
      */
-    _transform(data) {
+    _transform(data, isEncrypt) {
         const output = new Uint8Array(data.length);
+        const LARGE_PRIME = 0xffffffffffffffffffffffffffffff43n;
 
         for (let i = 0; i < data.length; i++) {
             const keyBits = this.generator.predict(new Uint8Array(0));
@@ -1455,7 +1482,6 @@ export class BitwiseNeuralCipher {
             // 1. On mélange l'état neural (rawByte) dans l'accumulateur géant.
             // 2. On utilise une constante de Weyl (nombre irrationnel simulé) pour la diffusion.
             const WEYL_CONSTANT = 0x3504f333f3d62ded70214131n; // Fraction de la racine de 2
-            const LARGE_PRIME = 0xffffffffffffffffffffffffffffff43n; // Premier de Mersenne-like
             
             // Évolution de l'état : Multiplication modulaire + XOR sur 128 bits
             this.highPrecisionState = (this.highPrecisionState + BigInt(rawByte) + WEYL_CONSTANT) % LARGE_PRIME;
@@ -1469,21 +1495,34 @@ export class BitwiseNeuralCipher {
             // On réinjecte le résultat pour la prochaine itération (Feedback)
             this.highPrecisionState ^= BigInt(finalKeyByte) << 64n;
 
-            output[i] = data[i] ^ finalKeyByte;
+            const cipherByte = isEncrypt ? (data[i] ^ finalKeyByte) : data[i];
+            const plainByte = isEncrypt ? data[i] : (data[i] ^ finalKeyByte);
+            
+            // --- NEURAL-GHASH ---
+            // On authentifie le ciphertext (comme dans GCM)
+            // On traite chaque octet comme un coefficient du polynôme
+            this.runningTag = ((this.runningTag ^ BigInt(cipherByte)) * this.authKey) % LARGE_PRIME;
+
+            output[i] = isEncrypt ? cipherByte : plainByte;
         }
         return output;
     }
 
     _getIntegrityTag() {
-        const state = this.generator.state;
-        const tag = new Uint8Array(8);
-        for (let i = 0; i < state.length; i++) {
-            const rot = (i % 7);
-            const val = state[i];
-            tag[i % 8] ^= (val << rot) | (val >> (8 - rot));
-            tag[i % 8] = (tag[i % 8] + i) & 0xFF;
+        // Finalisation du tag : on mélange le runningTag avec l'état final du réseau
+        // pour éviter les attaques sur le message vide ou les extensions de longueur.
+        const LARGE_PRIME = 0xffffffffffffffffffffffffffffff43n;
+        const finalState = this.generator.state.reduce((acc, v, i) => acc ^ (BigInt(v) << BigInt(i % 120)), 0n);
+        
+        const finalizedTag = (this.runningTag ^ finalState) % LARGE_PRIME;
+        
+        const tagBytes = new Uint8Array(16);
+        let temp = finalizedTag;
+        for (let i = 0; i < 16; i++) {
+            tagBytes[i] = Number(temp & 0xFFn);
+            temp >>= 8n;
         }
-        return tag;
+        return tagBytes;
     }
 }
 
@@ -3924,3 +3963,39 @@ export class BitwiseSequenceLearner {
 //     console.log(`  Input Sensors: [${relativeData[0].input.map(s => s.toFixed(2))}]`);
 //     console.log(`  Delta Actuators: ${relativeData[0].deltaOutput[0].toFixed(4)}`);
 // }
+
+// ============================================================
+// EXEMPLE D'UTILISATION : CHIFFREMENT NEURONAL AUTHENTIFIÉ
+// ============================================================
+
+const cipher = new BitwiseNeuralCipher("secret-robot-key-2024", { complexity: 128 });
+const originalMessage = "Directive 42: Protéger l'intégrité du maillage neuronal.";
+
+console.log("\n=== Test BitwiseNeuralCipher (Authenticated Stream Cipher) ===");
+console.log("Message Original :", originalMessage);
+
+// 1. Chiffrement (Génère IV + Ciphertext + Tag GHASH)
+const encrypted = cipher.encrypt(originalMessage);
+console.log("Chiffré (Hex)    :", encrypted.toHex());
+console.log("Format           : [IV (16 bytes)] + [Data] + [Tag (16 bytes)]");
+
+// 2. Déchiffrement et Validation
+try {
+    const decrypted = cipher.decrypt(encrypted);
+    console.log("Déchiffré        :", decrypted.toString());
+    console.log("Statut           : ✅ Intégrité vérifiée, clé valide.");
+} catch (e) {
+    console.error("❌ Erreur :", e.message);
+}
+
+// 3. Test de Résilience (Simulation d'une attaque bit-flipping)
+console.log("\n--- Simulation d'une altération de données ---");
+const tamperedData = new Uint8Array(encrypted.buffer);
+tamperedData[20] ^= 0x01; // On altère un seul bit du message chiffré
+
+try {
+    cipher.decrypt(tamperedData);
+} catch (e) {
+    console.log("Résultat attendu : 🛡️ Blocage de sécurité réussi !");
+    console.log("Détail           :", e.message);
+}
