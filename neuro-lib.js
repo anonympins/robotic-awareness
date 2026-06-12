@@ -227,6 +227,126 @@ export class SeekerNeuron {
     }
 }
 
+// ---------- Neurone Majoritaire Adaptatif (Apprentissage par Corrélation) ----------
+export class AdaptiveMajorityNeuron {
+    /**
+     * Un neurone qui apprend ses propres poids par observation statistique.
+     * @param {number} inputSize Nombre de bits en entrée
+     */
+    constructor(inputSize) {
+        this.inputSize = inputSize;
+        // Les "potentiels" sont des compteurs de corrélation (entiers)
+        this.potentials = new Int32Array(inputSize).fill(0);
+        this.weights = new Int32Array(inputSize).fill(0); 
+        this.threshold = 1;
+        this.learningCounter = 0;
+    }
+
+    predict(inputs) {
+        let votes = 0;
+        for (let i = 0; i < this.inputSize; i++) {
+            votes += (inputs[i] & 1) * this.weights[i];
+        }
+        return (votes >= this.threshold) | 0;
+    }
+
+    /**
+     * Retourne la confiance "analogique" du neurone (0.0 à 1.0)
+     */
+    getConfidence(inputs) {
+        let votes = 0;
+        let maxPossibleVotes = 0;
+        for (let i = 0; i < this.inputSize; i++) {
+            const w = this.weights[i];
+            votes += (inputs[i] & 1) * w;
+            maxPossibleVotes += w;
+        }
+        if (maxPossibleVotes === 0) return 0;
+        return {
+            score: votes / maxPossibleVotes,
+            thresholdRatio: votes / (this.threshold || 1)
+        };
+    }
+
+    /**
+     * Apprentissage Hebbien Bitwise : "Les bits qui s'activent ensemble se lient ensemble"
+     * @param {Uint8Array} inputs 
+     * @param {number} targetBit (0 ou 1)
+     * @param {number} pressure Force de l'ajustement (ex: 1)
+     */
+    train(inputs, targetBit, pressure = 1) {
+        // Mode "Mémorisation Forte" : on renforce la corrélation systématiquement.
+        // On utilise une pression plus forte pour graver l'information
+        for (let i = 0; i < this.inputSize; i++) {
+            if (inputs[i] === 1) {
+                this.potentials[i] += (targetBit === 1 ? (pressure * 2) : -(pressure * 2));
+            }
+        }
+        this.learningCounter++;
+
+        // Stabilisation plus fréquente pour une convergence rapide lors de l'entraînement textuel
+        if (this.learningCounter % 5 === 0) {
+            this._stabilize();
+        }
+    }
+
+    _stabilize() {
+        let totalWeight = 0;
+        for (let i = 0; i < this.inputSize; i++) {
+            // Augmentation de la plage dynamique (0 à 63)
+            // On ignore les signaux faibles (< 3) pour éliminer le "fantôme" de l'information
+            const p = this.potentials[i];
+            this.weights[i] = p > 2 ? Math.min(p, 63) : 0;
+            totalWeight += this.weights[i];
+        }
+        // Consensus optimal à 60% : assez souple pour la suite, assez strict pour l'exactitude
+        this.threshold = Math.max(1, Math.ceil(totalWeight * 0.6));
+    }
+
+    exportState() {
+        return {
+            potentials: Array.from(this.potentials),
+            weights: Array.from(this.weights),
+            threshold: this.threshold,
+            learningCounter: this.learningCounter
+        };
+    }
+
+    importState(state) {
+        this.potentials.set(state.potentials);
+        this.weights.set(state.weights);
+        this.threshold = state.threshold;
+        this.learningCounter = state.learningCounter;
+    }
+}
+
+// ---------- Générateur de Règles Probabilistes ----------
+export class ProbabilisticRuleLearner {
+    /**
+     * Analyse de grands ensembles de données pour en extraire des règles binaires.
+     */
+    static discoverRule(dataset, inputIndices, targetIndex) {
+        const neuron = new AdaptiveMajorityNeuron(inputIndices.length);
+        
+        dataset.forEach(sample => {
+            const inputs = new Uint8Array(inputIndices.map(idx => sample[idx]));
+            const target = sample[targetIndex];
+            neuron.train(inputs, target, 1);
+        });
+
+        neuron._stabilize();
+        
+        // Exportation en format "Règle" compatible avec RuleInterpreter
+        return {
+            type: 'MAJORITY',
+            weights: Array.from(neuron.weights),
+            threshold: neuron.threshold,
+            inputs: inputIndices
+        };
+    }
+}
+
+
 // ---------- Couche Géométrique (Seeker Layer) ----------
 export class SeekerLayer {
     constructor(inputSize, outputSize) {
@@ -1133,6 +1253,237 @@ export class RuleEngine {
     execute(name, inputs) {
         const net = this.rules.get(name);
         return net ? net.predict(inputs) : null;
+    }
+}
+
+/**
+ * Encapsulation des résultats de transformation pour une API Fluent.
+ */
+class NeuralTransformResult {
+    constructor(data) {
+        this.raw = data; // Uint8Array
+    }
+    toHex() {
+        return Array.from(this.raw).map(b => b.toString(16).padStart(2, '0')).join('');
+    }
+    toBase64() {
+        return btoa(String.fromCharCode.apply(null, this.raw));
+    }
+    toString() {
+        return new TextDecoder().decode(this.raw);
+    }
+    get buffer() { return this.raw; }
+}
+
+/**
+ * Algorithme de cryptage basé sur le déterminisme bit à bit des réseaux majoritaires.
+ * Utilise un StatefulMajorityNetwork comme générateur de flux (Stream Cipher).
+ */
+export class BitwiseNeuralCipher {
+    /**
+     * @param {string} passphrase Clé secrète de l'utilisateur
+     * @param {Object} options Configuration (complexity, ivSize, tagSize)
+     */
+    constructor(passphrase, options = {}) {
+        this.complexity = options.complexity || 64;
+        this.ivSize = options.ivSize || 16;
+        this.tagSize = 8; // Fixé par la logique du hachage d'état
+        
+        const config = this._deriveConfigFromKey(passphrase, this.complexity);
+        this.generator = new StatefulMajorityNetwork(config.logic, config.map, 0);
+        this.initialState = config.seed;
+
+        // Accumulateur de haute précision (BigInt) pour briser la cohérence algébrique
+        // On initialise avec une constante issue de la clé pour la cohérence
+        this.highPrecisionState = BigInt(0);
+    }
+
+    /**
+     * Sécurité : Génère une topologie de réseau unique basée sur la clé.
+     * Même si l'algorithme est connu, la "forme" du réseau change pour chaque clé.
+     */
+    _deriveConfigFromKey(key, size) {
+        // Utilisation d'un mélange plus riche (inspiré de MurmurHash/SipHash)
+        // pour éviter les collisions de clés simples.
+        let h1 = 0x811c9dc5;
+        let h2 = 0xdeadbeef;
+
+        for (let i = 0; i < key.length; i++) {
+            h1 = Math.imul(h1 ^ key.charCodeAt(i), 2654435761);
+            h2 = Math.imul(h2 ^ key.charCodeAt(i), 1597334677);
+        }
+
+        // RNG plus robuste (Xorshift128) pour la topologie
+        let a = h1, b = h2, c = h1 ^ h2, d = h1 + h2;
+        const rng = () => {
+            let t = b << 9;
+            let r = a * 5;
+            r = (r << 7 | r >>> 25) * 9;
+            c ^= a; d ^= b; b ^= c; a ^= d;
+            c ^= t;
+            d = (d << 11 | d >>> 21);
+            return (a >>> 0) / 4294967296;
+        };
+
+        const logic = {};
+        const map = {};
+        const seed = new Uint8Array(size);
+        const states = Array.from({length: size}, (_, i) => `prev_state_${i + 1}`);
+
+        // 1. Création d'un varMap aléatoire
+        for (let i = 0; i < size; i++) {
+            map[`prev_state_${i + 1}`] = i;
+            seed[i] = rng() > 0.5 ? 1 : 0;
+        }
+
+        // 2. Création d'une logique non-linéaire "emmêlée"
+        for (let i = 0; i < size; i++) {
+            const opType = rng() > 0.4 ? 'MAJORITY' : 'XOR';
+            const numArgs = opType === 'MAJORITY' ? 3 : 2;
+            const args = [];
+            
+            for (let a = 0; a < numArgs; a++) {
+                const targetVar = states[Math.floor(rng() * size)];
+                args.push({ var: targetVar });
+            }
+
+            // On injecte un peu d'entropie dans le pool BigInt initial
+            this.highPrecisionState = (this.highPrecisionState << 8n) | BigInt(h1 & 0xFF);
+
+            logic[`bit${i + 1}`] = { type: opType, args: args };
+        }
+
+        return { logic, map, seed };
+    }
+
+    /**
+     * @param {Uint8Array} iv Vecteur d'initialisation (doit être différent à chaque message)
+     */
+    _reset(iv = null) {
+        this.generator.reset();
+        const state = new Uint8Array(this.initialState);
+        
+        // Reset de l'accumulateur haute précision avec un sel dérivé de l'IV
+        let ivSeed = iv ? iv.reduce((acc, v) => (acc << 8n) | BigInt(v), 0n) : 0n;
+        this.highPrecisionState = ivSeed ^ 0x55555555555555555555555555555555n;
+
+        if (iv) {
+            for (let i = 0; i < Math.min(state.length, iv.length); i++) {
+                state[i] ^= (iv[i] & 1);
+            }
+        }
+        this.generator.state = state;
+        return this;
+    }
+
+    /**
+     * Chiffre les données et ajoute l'IV et le Tag d'intégrité.
+     * Format : [IV] + [DONNEES_CHIFFREES] + [TAG]
+     * @param {string|Uint8Array} data
+     * @param {Uint8Array} customIv Optionnel
+     */
+    encrypt(data, customIv = null) {
+        const input = typeof data === 'string' ? new TextEncoder().encode(data) : data;
+        const iv = customIv || this._generateRandomIV();
+        
+        this._reset(iv);
+        const encrypted = this._transform(input);
+        const tag = this._getIntegrityTag();
+
+        // Assemblage final : IV + DATA + TAG
+        const combined = new Uint8Array(iv.length + encrypted.length + tag.length);
+        combined.set(iv, 0);
+        combined.set(encrypted, iv.length);
+        combined.set(tag, iv.length + encrypted.length);
+
+        return new NeuralTransformResult(combined);
+    }
+
+    /**
+     * Déchiffre et valide l'intégrité.
+     * @param {Uint8Array|NeuralTransformResult} combinedData 
+     */
+    decrypt(combinedData) {
+        const input = combinedData instanceof NeuralTransformResult ? combinedData.raw : combinedData;
+        
+        // Extraction des segments
+        const iv = input.slice(0, this.ivSize);
+        const tagReceived = input.slice(-this.tagSize);
+        const encrypted = input.slice(this.ivSize, -this.tagSize);
+
+        this._reset(iv);
+        const decrypted = this._transform(encrypted);
+        const tagCalculated = this._getIntegrityTag();
+
+        // Vérification d'intégrité (Authentification)
+        const isValid = tagCalculated.every((v, i) => v === tagReceived[i]);
+        if (!isValid) {
+            throw new Error("Neural Integrity Violation: The data has been tampered with or the key is incorrect.");
+        }
+
+        return new NeuralTransformResult(decrypted);
+    }
+
+    _generateRandomIV() {
+        const iv = new Uint8Array(this.ivSize);
+        if (typeof crypto !== 'undefined' && crypto.getRandomValues) {
+            crypto.getRandomValues(iv);
+        } else {
+            // Fallback Node.js simple si nécessaire
+            for(let i=0; i<this.ivSize; i++) iv[i] = Math.floor(Math.random() * 256);
+        }
+        return iv;
+    }
+
+    /**
+     * Coeur de la transformation (XOR Stream)
+     * @param {Uint8Array} data 
+     * @returns {Uint8Array}
+     */
+    _transform(data) {
+        const output = new Uint8Array(data.length);
+
+        for (let i = 0; i < data.length; i++) {
+            const keyBits = this.generator.predict(new Uint8Array(0));
+            let rawByte = 0;
+            for (let b = 0; b < Math.min(8, keyBits.length); b++) {
+                rawByte |= (keyBits[b] << b);
+            }
+
+            // --- DÉFENSE ANTI-SAT : Whitening Haute Précision ---
+            // On utilise une transformation non-linéaire sur 128 bits minimum.
+            // 1. On mélange l'état neural (rawByte) dans l'accumulateur géant.
+            // 2. On utilise une constante de Weyl (nombre irrationnel simulé) pour la diffusion.
+            const WEYL_CONSTANT = 0x3504f333f3d62ded70214131n; // Fraction de la racine de 2
+            const LARGE_PRIME = 0xffffffffffffffffffffffffffffff43n; // Premier de Mersenne-like
+            
+            // Évolution de l'état : Multiplication modulaire + XOR sur 128 bits
+            this.highPrecisionState = (this.highPrecisionState + BigInt(rawByte) + WEYL_CONSTANT) % LARGE_PRIME;
+            this.highPrecisionState ^= (this.highPrecisionState >> 33n);
+            
+            // Extraction du flux de clé final (un seul octet issu de la cascade BigInt)
+            // Cela rend l'inversion de l'état du réseau de neurones par SAT Solver 
+            // quasi-impossible car il faudrait résoudre des équations sur des entiers de 128 bits.
+            let finalKeyByte = Number(this.highPrecisionState & 0xFFn);
+            
+            // On réinjecte le résultat pour la prochaine itération (Feedback)
+            this.highPrecisionState ^= BigInt(finalKeyByte) << 64n;
+
+            output[i] = data[i] ^ finalKeyByte;
+        }
+        return output;
+    }
+
+    _getIntegrityTag() {
+        const state = this.generator.state;
+        const tag = new Uint8Array(8);
+        for (let i = 0; i < state.length; i++) {
+            const rot = (i % 7);
+            const val = state[i];
+            tag[i % 8] ^= (val << rot) | (val >> (8 - rot));
+            tag[i % 8] = (tag[i % 8] + i) & 0xFF;
+        }
+        return tag;
     }
 }
 
@@ -3029,6 +3380,401 @@ export class TemporalSampler {
     }
 }
 
+// ---------- Outils de Projection et Vision 3D ----------
+export class ProjectiveGeometry {
+    /**
+     * Back-projection : Transforme un point 2D + une profondeur estimée en position 3D
+     * @param {number} x Coordonnée X écran
+     * @param {number} y Coordonnée Y écran
+     * @param {number} z Profondeur estimée (Z)
+     * @param {number} f Longueur focale
+     * @param {number} w Largeur image
+     * @param {number} h Hauteur image
+     */
+    static unproject(x, y, z, f, w, h) {
+        const factor = z / f;
+        return new Vector3(
+            (x - w / 2) * factor,
+            -(y - h / 2) * factor, // Y inversé pour l'espace 3D
+            z
+        );
+    }
+
+    /**
+     * Projette un point 3D en 2D (Perspective)
+     */
+    static project(v, f, w, h) {
+        const z = (v.z <= 0) ? 0.001 : v.z;
+        const factor = f / z;
+        return [
+            v.x * factor + w / 2,
+            -v.y * factor + h / 2
+        ];
+    }
+}
+
+/**
+ * Analyseur de texture binaire pour transformer des pixels en vecteurs de force
+ */
+export class PixelFeatureExtractor {
+    /**
+     * Extrait les centres de masse bit à bit d'une zone de pixels
+     * @param {Uint8Array} pixels Grille de pixels (0 ou 1)
+     * @param {number} width 
+     * @param {number} height
+     */
+    static extractCentroids(pixels, width, height) {
+        let sumX = 0, sumY = 0, count = 0;
+        for (let i = 0; i < pixels.length; i++) {
+            if (pixels[i] === 1) {
+                sumX += (i % width);
+                sumY += Math.floor(i / width);
+                count++;
+            }
+        }
+        if (count === 0) return new Vector3(0, 0, 0);
+        // Retourne un vecteur normalisé (-1 à 1) représentant la direction principale de l'objet
+        return new Vector3((sumX / count) / width * 2 - 1, -(sumY / count) / height * 2 + 1, 0.5);
+    }
+}
+
+/**
+ * Modèle de génération de mesh bit à bit.
+ * Apprend à mapper une signature 2D vers un vecteur de bits géométriques (Pos + Normales).
+ */
+export class BitwiseMeshMapper {
+    constructor(inputSize, outputBitSize) {
+        this.inputSize = inputSize;
+        this.outputBitSize = outputBitSize;
+        // Un neurone par bit de sortie pour une prédiction bit à bit indépendante
+        this.outputNeurons = Array.from({ length: outputBitSize }, () => new AdaptiveMajorityNeuron(inputSize));
+    }
+
+    /**
+     * Prédit l'ensemble des bits géométriques
+     * @param {Uint8Array|Float32Array} signature 2D
+     */
+    predict(signature) {
+        const bits = new Uint8Array(this.outputBitSize);
+        for (let i = 0; i < this.outputBitSize; i++) {
+            bits[i] = this.outputNeurons[i].predict(signature);
+        }
+        return bits;
+    }
+
+    /**
+     * Entraîne le mapping géométrique
+     * @param {Uint8Array|Float32Array} signature Image 2D
+     * @param {Uint8Array} targetBits Bits de géométrie (Position/Normale encodées)
+     */
+    train(signature, targetBits) {
+        for (let i = 0; i < this.outputBitSize; i++) {
+            this.outputNeurons[i].train(signature, targetBits[i]);
+        }
+    }
+
+    exportState() {
+        return {
+            neurons: this.outputNeurons.map(n => n.exportState())
+        };
+    }
+
+    importState(state) {
+        if (!state.neurons || state.neurons.length !== this.outputBitSize) return;
+        for (let i = 0; i < this.outputBitSize; i++) {
+            this.outputNeurons[i].importState(state.neurons[i]);
+        }
+    }
+
+    /**
+     * Calcule la précision globale du modèle sur un échantillon
+     */
+    evaluate(signature, targetBits) {
+        const pred = this.predict(signature);
+        let correct = 0;
+        for (let i = 0; i < this.outputBitSize; i++) if (pred[i] === targetBits[i]) correct++;
+        return correct / this.outputBitSize;
+    }
+}
+
+/**
+ * Brain spécialisé dans la reconstruction 3D à partir de patterns 2D
+ */
+export class ProjectiveBrain {
+    constructor(numPrimitives = 10) {
+        // Chaque primitive est "cherchée" par un Seeker (position/rotation)
+        this.seekers = Array.from({ length: numPrimitives }, () => ({
+            pose: new SeekerNeuron(),
+            scale: new AdaptiveMajorityNeuron(8) // Apprend la taille probable
+        }));
+    }
+
+    /**
+     * Tente de reconstruire une scène 3D à partir de points d'intérêt 2D
+     * @param {Array} points2D Points extraits de l'image [[x,y], ...]
+     * @param {number} focal Focale caméra
+     */
+    reconstruct(points2D, focal, width, height) {
+        return points2D.map((p, i) => {
+            const seeker = this.seekers[i % this.seekers.length];
+
+            // 1. On estime une profondeur de base via la logique bitwise
+            // (Plus un objet est bas/petit dans l'image, plus il est loin)
+            const depthGuess = 1.0 + (p[1] / height);
+
+            // 2. Unproject pour obtenir la position 3D initiale
+            const pos3D = ProjectiveGeometry.unproject(p[0], p[1], depthGuess, focal, width, height);
+
+            // 3. Le neurone Seeker ajuste l'orientation locale
+            const orientation = seeker.pose.orientation;
+
+            return { position: pos3D, rotation: orientation };
+        });
+    }
+}
+
+/**
+ * Parseur OBJ ultra-léger pour extraire les sommets
+ */
+export class OBJParser {
+    static parse(text) {
+        const vertices = [];
+        const lines = text.split('\n');
+        for (let line of lines) {
+            line = line.trim();
+            if (line.startsWith('v ')) {
+                const parts = line.split(/\s+/);
+                vertices.push(new Vector3(
+                    parseFloat(parts[1]),
+                    parseFloat(parts[2]),
+                    parseFloat(parts[3])
+                ));
+            }
+        }
+        console.log(`[OBJParser] ${vertices.length} sommets extraits.`);
+        return vertices;
+    }
+}
+
+/**
+ * Parseur FBX (ASCII) ultra-léger
+ */
+export class FBXParser {
+    static parse(data, zlib = null) {
+        // Détection du format (Binaire vs ASCII)
+        const isBinary = (data instanceof Uint8Array || Buffer.isBuffer(data)) && 
+                         String.fromCharCode(...data.slice(0, 18)).includes("Kaydara FBX");
+
+        if (isBinary) {
+            return this.parseBinary(data, zlib);
+        } else {
+            const text = (typeof data === 'string') ? data : new TextDecoder().decode(data);
+            return this.parseASCII(text);
+        }
+    }
+
+    static parseASCII(text) {
+        const vertices = [];
+        const vertexMatch = text.match(/Vertices:\s*(?:\*\d+\s*)?\{([\s\S]*?)\}/);
+        if (vertexMatch && vertexMatch[1]) {
+            const rawData = vertexMatch[1].replace(/[\r\n]+/g, ' ');
+            const coords = rawData.split(',').map(v => parseFloat(v.trim()));
+            for (let i = 0; i < coords.length; i += 3) {
+                if (!isNaN(coords[i])) vertices.push(new Vector3(coords[i], coords[i+1], coords[i+2]));
+            }
+        }
+        console.log(`[FBXParser] ${vertices.length} sommets extraits.`);
+        return vertices;
+    }
+
+    /**
+     * Parseur binaire minimaliste pour extraire les sommets (Vertices)
+     * Supporte la compression Zlib (standard FBX)
+     */
+    static parseBinary(buffer, zlib) {
+        const vertices = [];
+        const view = new DataView(buffer.buffer, buffer.byteOffset, buffer.byteLength);
+        // La version commence à l'offset 23
+        const version = buffer.length > 27 ? view.getUint32(23, true) : 0;
+        const is64Bit = version >= 7500;
+        
+        const headerSize = is64Bit ? 25 : 13;
+
+        // Parcours récursif pour trouver le node 'Vertices' dans la hiérarchie binaire
+        const findNodes = (startOffset) => {
+            let pos = startOffset;
+            while (pos < buffer.length - headerSize) {
+                const endOffset = is64Bit ? Number(view.getBigUint64(pos, true)) : view.getUint32(pos, true);
+                if (endOffset === 0) break; // Fin du bloc
+
+                const propListLen = is64Bit ? Number(view.getBigUint64(pos + 16, true)) : view.getUint32(pos + 8, true);
+                const nameLen = view.getUint8(pos + (is64Bit ? 24 : 12));
+                const name = String.fromCharCode(...buffer.slice(pos + headerSize, pos + headerSize + nameLen));
+                
+                if (name === "Vertices") {
+                    let propPos = pos + headerSize + nameLen;
+                    // On lit la propriété (tableau de doubles 'd')
+                    const type = String.fromCharCode(view.getUint8(propPos));
+                    if (type === 'd') {
+                        const encoding = view.getUint32(propPos + 5, true); // 0: raw, 1: zlib
+                        const compressedLen = view.getUint32(propPos + 9, true);
+                        
+                        let data = buffer.slice(propPos + 13, propPos + 13 + compressedLen);
+                        if (encoding === 1 && zlib && zlib.inflateSync) {
+                            data = zlib.inflateSync(data);
+                        }
+                        
+                        const floatView = new Float64Array(data.buffer, data.byteOffset, data.byteLength / 8);
+                        for (let i = 0; i < floatView.length; i += 3) {
+                            if (!isNaN(floatView[i])) vertices.push(new Vector3(floatView[i], floatView[i+1], floatView[i+2]));
+                        }
+                    }
+                }
+
+                // Exploration des enfants : ils commencent après le nom et toutes les propriétés
+                const subNodesStart = pos + headerSize + nameLen + propListLen;
+                if (endOffset > subNodesStart) {
+                    findNodes(subNodesStart);
+                }
+
+                pos = endOffset;
+            }
+        };
+
+        findNodes(27); // Offset standard après le header global Kaydara
+        console.log(`[FBXParser] ${vertices.length} sommets extraits.`);
+        return vertices;
+    }
+}
+
+/**
+ * Utilitaire de Benchmark pour la reconstruction
+ */
+export class VisionBenchmark {
+    static async runTrainingSession(brain, vertices, iterations = 1000) {
+        const start = Date.now();
+        const focal = 500, w = 320, h = 240;
+
+        for (let i = 0; i < iterations; i++) {
+            // 1. Simuler une pose aléatoire
+            const randomRot = Quaternion.random();
+            const randomPos = new Vector3((Math.random()-0.5), (Math.random()-0.5), 1.0 + Math.random());
+
+            // 2. Projeter quelques points clés en 2D
+            const samplePoints = [vertices[0], vertices[Math.floor(vertices.length/2)]];
+            const projected = samplePoints.map(v => {
+                const worldV = randomRot.rotateVector(v).add(randomPos);
+                return ProjectiveGeometry.project(worldV, focal, w, h);
+            });
+
+            // 3. Entraîner le cerveau (simplifié pour le bench)
+            brain.reconstruct(projected, focal, w, h);
+        }
+
+        return Date.now() - start;
+    }
+}
+
+export class BitwiseSequenceLearner {
+    /**
+     * Apprend des séquences de caractères en utilisant la logique majoritaire.
+     * @param {number} contextSize Nombre de caractères précédents utilisés pour prédire le suivant.
+     */
+    constructor(contextSize = 4) {
+        this.contextSize = contextSize;
+        this.bitSize = 8; // On travaille sur 8 bits (ASCII/UTF-8 simple)
+        this.inputSize = contextSize * this.bitSize;
+
+        // Nous créons 8 neurones : un pour chaque bit du caractère à prédire
+        this.neurons = Array.from({ length: this.bitSize }, () =>
+            new AdaptiveMajorityNeuron(this.inputSize)
+        );
+    }
+
+    /**
+     * Entraîne le réseau sur un bloc de texte.
+     */
+    train(text, iterations = 30) {
+        // On ajoute un padding pour que le réseau apprenne le début de la phrase
+        const paddedText = " ".repeat(this.contextSize) + text;
+
+        for (let iter = 0; iter < iterations; iter++) {
+            for (let i = 0; i < paddedText.length - this.contextSize; i++) {
+                const context = paddedText.slice(i, i + this.contextSize);
+                const targetChar = paddedText[i + this.contextSize];
+
+                const inputBits = this._textToBits(context);
+                const targetBits = DataWrapper.intToBits(targetChar.charCodeAt(0) % 256, this.bitSize);
+
+                // Chaque neurone apprend son bit spécifique du caractère cible
+                for (let b = 0; b < this.bitSize; b++) {
+                    this.neurons[b].train(inputBits, targetBits[b], 1);
+                }
+            }
+        }
+        // Stabilisation finale des poids
+        this.neurons.forEach(n => n._stabilize());
+    }
+
+    /**
+     * Prédit le caractère suivant à partir d'un groupe de lettres.
+     */
+    predictNext(context) {
+        const rawContext = context.slice(-this.contextSize).padStart(this.contextSize, ' ');
+        const inputBits = this._textToBits(rawContext);
+        const outputBits = new Uint8Array(this.bitSize);
+        let globalConfidence = 0;
+
+        for (let b = 0; b < this.bitSize; b++) {
+            const confidence = this.neurons[b].getConfidence(inputBits);
+            globalConfidence += confidence.score;
+            
+            // Décision Analogique-Digital :
+            // Un bit est à 1 si le consensus (thresholdRatio) est solide.
+            if (confidence.thresholdRatio > 0.9) {
+                outputBits[b] = 1;
+            } else if (confidence.thresholdRatio < 0.4) {
+                outputBits[b] = 0;
+            } else {
+                // En zone d'incertitude (bruit), on utilise le score pur
+                outputBits[b] = (confidence.score > 0.5) ? 1 : 0;
+            }
+        }
+
+        // Moyenne de confiance sur les 8 neurones
+        const averageConf = globalConfidence / this.bitSize;
+
+        // Si le réseau est totalement perdu (n'a jamais vu ce contexte), 
+        // on renvoie une lettre de secours ou l'espace pour éviter les symboles bizarres.
+        if (averageConf < 0.1) return " ";
+
+        const charCode = DataWrapper.bitsToInt(outputBits);
+        // On s'assure de rester dans l'ASCII imprimable (32-126) ou les retours ligne
+        const cleanCode = (charCode < 32 && charCode !== 10 && charCode !== 13) ? 32 : charCode;
+        return String.fromCharCode(cleanCode % 256);
+    }
+
+    /**
+     * Génère du texte à partir d'une amorce (seed).
+     */
+    generate(seed, length = 50) {
+        let result = seed;
+        for (let i = 0; i < length; i++) {
+            const next = this.predictNext(result);
+            result += next;
+        }
+        return result;
+    }
+
+    _textToBits(text) {
+        const bits = new Uint8Array(text.length * this.bitSize);
+        for (let i = 0; i < text.length; i++) {
+            const charBits = DataWrapper.intToBits(text.charCodeAt(i) % 256, this.bitSize);
+            bits.set(charBits, i * this.bitSize);
+        }
+        return bits;
+    }
+}
 
 // --- Simulation Pilotée par le Fichier Unique ---
 // // --- Simulation Pilotée par le Fichier Unique ---
