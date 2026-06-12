@@ -20,7 +20,28 @@ The library features a unique way to compile human-readable JSON logic into high
 *   **`StatefulMajorityNetwork`**: A recurrent version of the network (RNN) capable of memory-based decisions (e.g., "detect if a button was pressed twice").
 
 ### 2. Kinematics & Spatial Control
-Movement is handled by a robust kinematic chain supporting both Forward (FK) and Inverse Kinematics (IK).
+The movement is handled by a robust kinematic chain supporting both Forward (FK) and Inverse Kinematics (IK).
+
+### 3. Authenticated Neural Encryption (`BitwiseNeuralCipher`)
+The library includes a high-performance authenticated stream cipher. It uses the deterministic, high-entropy output of a `StatefulMajorityNetwork` as a keystream generator.
+
+#### How Encryption Works:
+1.  **IV Seeding**: A random 16-byte Initialization Vector (IV) is generated. This IV is XORed into the neural network's initial state, ensuring that the same passphrase produces a unique keystream for every message.
+2.  **Auth-Key Derivation**: A 128-bit internal key (`authKey`) is derived from the network's state immediately after seeding. This key is used for the integrity tag.
+3.  **Turbo Keystream Generation**: The network generates bits in parallel. These bits are consumed in 8-bit blocks to form a raw keystream.
+4.  **High-Precision Whitening (Anti-SAT)**: To prevent cryptanalysis (like SAT solvers) from reversing the neural state, each byte is processed through a 128-bit non-linear accumulator using **Weyl constants** and modular arithmetic. This "whitening" ensures maximum diffusion.
+5.  **XOR & Tagging**: The plaintext is XORed with the final keystream. As ciphertext bytes are produced, they are fed into a **Neural-GHASH** accumulator to calculate an integrity tag.
+6.  **Packing**: The final output is formatted as: `[IV] + [Ciphertext] + [Tag]`.
+
+#### How Decryption Works:
+1.  **Synchronization**: The IV and Tag are extracted from the data packet. The local neural network is reset and seeded with the received IV.
+2.  **Keystream Reconstruction**: Because the network is deterministic, it reconstructs the exact same whitened keystream.
+3.  **Verification**: The ciphertext is XORed with the keystream to recover the plaintext. Simultaneously, a new integrity tag is calculated.
+4.  **Security Gate**: If the calculated tag does not match the received tag, a `Neural Integrity Violation` is thrown. The data is treated as tampered with and is never returned to the application.
+
+### 4. Geometric Learning
+*   **`SeekerNeuron`**: A "Geometric Neuron" that uses Quaternions to learn spatial orientations. Instead of learning numbers, it learns directions in 3D space.
+*   **`MeshController`**: Mapped to a sensor "skin", it learns to correlate complex tactile patterns to specific actuator positions.
 
 *   **`KinematicChain`**: Manages the hierarchy of robot links.
     *   `calculateFK(jointValues)`: Computes the 3D position/orientation of every part.
@@ -29,7 +50,7 @@ Movement is handled by a robust kinematic chain supporting both Forward (FK) and
     *   `update(...)`: Runs a filtered **PID controller** with Feed-forward.
     *   **Compliance Mode**: Automatically detects stalls (obstacles) and enters a "soft" mode to prevent hardware damage.
 
-### 3. Geometric Learning
+### 5. Geometric Learning
 *   **`SeekerNeuron`**: A "Geometric Neuron" that uses Quaternions to learn spatial orientations. Instead of learning numbers, it learns directions in 3D space.
 *   **`MeshController`**: Mapped to a sensor "skin", it learns to correlate complex tactile patterns to specific actuator positions.
 
@@ -230,6 +251,12 @@ A neuron that fires based on a weighted vote of its inputs.
 A multi-layer architecture composed of `MajorityNeurons`.
 *   **`predict(inputs)`**: Propagates boolean signals through all layers.
 *   **`export()`**: Returns the weights and thresholds in a portable JSON format.
+
+#### `BitwiseNeuralCipher`
+An authenticated encryption engine leveraging neural determinism.
+*   **`encrypt(data)`**: Returns a `NeuralTransformResult` containing IV, ciphertext, and Tag.
+*   **`decrypt(combinedData)`**: Validates integrity and returns the original data. Throws error on failure.
+
 
 #### `StatefulMajorityNetwork`
 A Recurrent Neural Network (RNN) implementation for bitwise logic.
