@@ -1179,6 +1179,64 @@ export class BitwiseRelationalMemory {
 }
 
 /**
+ * COUCHE D'ATTENTION SÉMANTIQUE
+ * Gère l'évolution des états des concepts et l'équivalence.
+ */
+export class SemanticAttentionLayer {
+    constructor() {
+        this.states = new Map(); // Concept (Ancre) -> { valeur, saillance, metadata }
+        this.equivalences = new Map(); // Synonymes ou concepts liés
+    }
+
+    /**
+     * Définit ou met à jour l'état d'un concept.
+     * Permet à "Batterie" de rester l'ancre pendant que la valeur évolue.
+     */
+    updateState(anchor, value, saillance = 1.0) {
+        const currentState = this.states.get(anchor) || { history: [] };
+        
+        // On garde une trace de l'évolution (linéarité temporelle)
+        if (currentState.valeur !== value) {
+            currentState.history.push({ valeur: currentState.valeur, t: Date.now() });
+        }
+
+        this.states.set(anchor, {
+            ...currentState,
+            valeur: value,
+            saillance,
+            lastUpdate: Date.now()
+        });
+    }
+
+    /**
+     * Définit que 'A' équivaut à 'B' pour le pont d'action
+     */
+    setEquivalence(concept, targetConcept) {
+        this.equivalences.set(concept, targetConcept);
+    }
+
+    getResolvedState(concept) {
+        const target = this.equivalences.get(concept) || concept;
+        return this.states.get(target);
+    }
+
+    /**
+     * Retourne les concepts les plus "brillants" (saillants) actuellement
+     */
+    getActiveFocus(threshold = 0.5) {
+        return Array.from(this.states.entries())
+            .filter(([_, data]) => data.saillance >= threshold)
+            .sort((a, b) => b[1].saillance - a[1].saillance);
+    }
+
+    decay(factor = 0.95) {
+        for (let [key, data] of this.states) {
+            data.saillance *= factor;
+        }
+    }
+}
+
+/**
  * MÉMOIRE RELATIONNELLE SÉMANTIQUE
  * Aligne la structure bit à bit sur des unités de sens (Tokens).
  */
@@ -1214,8 +1272,9 @@ export class SemanticRelationalMemory {
 
     /**
      * Prédit la suite non pas par lettre, mais par concept
+     * @param {Object} options { depth, focusBias: Map<ID, weight> }
      */
-    predictSense(seedSentence, depth = 10) {
+    predictSense(seedSentence, depth = 10, options = {}) {
         const tokens = seedSentence.toLowerCase().match(/\w+|[^\w\s]/g) || [];
         this.bitEngine.resetContext();
         
@@ -1233,6 +1292,13 @@ export class SemanticRelationalMemory {
                 const bit = this.bitEngine.predictBit() || 0;
                 predictedId |= (bit << b);
                 this.bitEngine.shift(bit);
+            }
+
+            // Mécanisme d'attention optionnelle :
+            // Si un focus externe est fourni, on peut corriger/orienter la prédiction
+            if (options.focusMap && options.focusMap.has(predictedId)) {
+                // Ici on pourrait implémenter une logique de "re-routing"
+                // pour forcer la restitution vers un état plus actuel
             }
 
             const word = this.reverseVocab.get(predictedId);

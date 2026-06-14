@@ -2,7 +2,7 @@
 // ============================================================
 // EXEMPLE D'UTILISATION : CHIFFREMENT NEURONAL AUTHENTIFIÉ
 // ============================================================
-import {BitwiseNeuralCipher, BitwiseWordLearner, BitwiseLosslessCompressor, BitwiseRelationalMemory, SemanticRelationalMemory} from "./neuro-lib.js";
+import {BitwiseNeuralCipher, BitwiseWordLearner, BitwiseLosslessCompressor, BitwiseRelationalMemory, SemanticRelationalMemory, SemanticAttentionLayer} from "./neuro-lib.js";
 
 function _runCipherBenchmark() {
     console.log("\n=== BENCHMARK: BitwiseNeuralCipher Performance ===");
@@ -406,32 +406,44 @@ semanticTests.forEach(({amorce, profondeur, attendu}) => {
 // ============================================================
 
 console.log("\n=== Vers la Conscience Robotique (Action-Mapping) ===");
+const attention = new SemanticAttentionLayer();
 
 /**
- * On associe un concept sémantique à une cible pour les actuateurs.
- * Si le robot "comprend" le mot 'Batterie', il active le Seeker vers la base.
+ * On définit des équivalences (Intelligence sémantique)
  */
-const actionBridge = new Map([
-    ["batterie", { target: [0, -1, 0], group: "base" }],
-    ["collision", { target: [1, 1, 1], group: "bras" }],
-    ["statut", { target: [0, 0, 0], group: "camera" }]
-]);
+attention.setEquivalence("accumulateur", "batterie");
+attention.setEquivalence("énergie", "batterie");
 
-const testSentence = "Robot : Batterie critique.";
-const sensedTokens = testSentence.toLowerCase().match(/\w+/g);
+function processInstruction(sentence) {
+    const tokens = sentence.toLowerCase().match(/\w+/g) || [];
+    console.log(`Analyse de la phrase : "${sentence}"`);
 
-console.log(`Analyse de la phrase : "${testSentence}"`);
-
-sensedTokens.forEach(token => {
-    if (actionBridge.has(token)) {
-        const action = actionBridge.get(token);
-        console.log(`[Pont Sémantique] Mot clé détecté : "${token}"`);
-        console.log(`[Action] Mise à jour de la cible pour le groupe "${action.group}" vers [${action.target}]`);
+    // Détection d'ancres et de valeurs
+    if (tokens.includes("batterie") || tokens.includes("accumulateur")) {
+        const anchor = "batterie";
+        // On cherche la valeur associée dans la phrase
+        const value = tokens.find(t => ["critique", "down", "optimale"].includes(t)) || "inconnue";
         
-        // Ici, on injecterait la cible dans le SeekerNeuron de l'actuateur
-        // actuator.seeker.update(Quaternion.fromVec3(action.target), 0.1, 0.05);
+        attention.updateState(anchor, value, 1.0);
+        
+        const state = attention.getResolvedState(anchor);
+        console.log(`[Attention] État mis à jour pour "${anchor}" : ${state.valeur.toUpperCase()}`);
+        
+        // Le pont d'action devient dynamique
+        const actionMap = {
+            "critique": { target: [0, -1, 0], speed: 0.1 },
+            "down": { target: [0, -1, 0], speed: 0.0, msg: "ARRÊT D'URGENCE" }
+        };
+
+        if (actionMap[state.valeur]) {
+            const action = actionMap[state.valeur];
+            console.log(`[Action] Exécution : ${action.msg || "Navigation base"}`);
+        }
     }
-});
+}
+
+processInstruction("Robot : Batterie critique.");
+processInstruction("Alerte : L'accumulateur est maintenant down.");
 
 console.log("\nProchaine étape : L'Apprentissage par Renforcement des Unités de Sens.");
 
