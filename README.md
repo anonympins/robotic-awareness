@@ -6,7 +6,7 @@ A high-performance framework for robotic control, bitwise logic reasoning, and k
 
 ## 🚀 General Overview
 
-`robotic-awareness` uses a hybrid approach combining **Bitwise Neural Networks** for logic and **Geometric Seeker Neurons** (Quaternions) for spatial awareness. It is designed to run complex robotic hands or multi-joint systems where safety rules and physical constraints must be computed at high frequencies (50Hz+).
+`robotic-awareness` uses a hybrid approach combining **Bitwise Neural Networks** for logic, **Geometric Seeker Neurons** (Quaternions) for spatial awareness, and **Relational Memory** for lossless data compression and semantic understanding. It is designed to run complex robotic systems where safety, physical constraints, and cognitive mapping must be computed in real-time.
 
 ## 🧠 Core Intelligence (`neuro-lib.js`)
 
@@ -33,13 +33,22 @@ The library includes a high-performance authenticated stream cipher. It uses the
 5.  **XOR & Tagging**: The plaintext is XORed with the final keystream. As ciphertext bytes are produced, they are fed into a **Neural-GHASH** accumulator to calculate an integrity tag.
 6.  **Packing**: The final output is formatted as: `[IV] + [Ciphertext] + [Tag]`.
 
-#### How Decryption Works:
-1.  **Synchronization**: The IV and Tag are extracted from the data packet. The local neural network is reset and seeded with the received IV.
-2.  **Keystream Reconstruction**: Because the network is deterministic, it reconstructs the exact same whitened keystream.
-3.  **Verification**: The ciphertext is XORed with the keystream to recover the plaintext. Simultaneously, a new integrity tag is calculated.
-4.  **Security Gate**: If the calculated tag does not match the received tag, a `Neural Integrity Violation` is thrown. The data is treated as tampered with and is never returned to the application.
+### 4. Lossless Neural Compression (`BitwiseLosslessCompressor`)
+The library implements a state-of-the-art **Neural Arithmetic Compressor**. It uses a bit-by-bit predictor to estimate the probability of the next bit, which is then encoded using an arithmetic range.
+*   **Predictive Engine**: Can switch between a fast `NeuralBitPredictor` (hashed table) and a `BitwiseRelationalMemory` (exact match).
+*   **Verbatim Restitution**: Capable of 100% perfect reproduction of training data, used for storing robotic "directives" or critical code sequences.
+*   **Massive Restitution**: Optimized for large scale memory storage where the "brain" can memorize hundreds of unique sequences without catastrophic forgetting.
 
-### 4. Geometric Learning
+### 5. Memory Systems
+*   **`BitwiseRelationalMemory` (Zero Forgetting)**: A high-precision "Vault" that stores bit-level transitions. It guarantees zero collisions and allows for perfect recall of patterns given a small "seed" or context.
+*   **`SemanticRelationalMemory` (Conceptual Hierarchy)**: Operates at the token level (words/concepts) rather than bits. It maps semantic units to binary IDs, allowing the robot to predict "meaning" over long temporal distances (e.g., predicting a battery alert after a terrain analysis).
+
+### 6. The Semantic-Action Bridge
+This is the link between "understanding" and "moving".
+*   **Action Mapping**: Semantic tokens are mapped to specific robotic targets (e.g., the concept "Battery" triggers a navigation target toward the charging base).
+*   **Cognitive Bridge**: Uses the output of the Semantic Memory to update `SeekerNeurons` in real-time, allowing the robot to react to verbal or logical directives.
+
+### 7. Geometric Learning
 *   **`SeekerNeuron`**: A "Geometric Neuron" that uses Quaternions to learn spatial orientations. Instead of learning numbers, it learns directions in 3D space.
 *   **`MeshController`**: Mapped to a sensor "skin", it learns to correlate complex tactile patterns to specific actuator positions.
 
@@ -47,13 +56,6 @@ The library includes a high-performance authenticated stream cipher. It uses the
     *   `calculateFK(jointValues)`: Computes the 3D position/orientation of every part.
     *   `solveIK(targetPos, actuators)`: Uses **CCD (Cyclic Coordinate Descent)** to move the end-effector to a target while respecting joint limits and damping.
 *   **`RobotActuator`**: Represents a physical joint (Servo, Motor).
-    *   `update(...)`: Runs a filtered **PID controller** with Feed-forward.
-    *   **Compliance Mode**: Automatically detects stalls (obstacles) and enters a "soft" mode to prevent hardware damage.
-
-### 5. Geometric Learning
-*   **`SeekerNeuron`**: A "Geometric Neuron" that uses Quaternions to learn spatial orientations. Instead of learning numbers, it learns directions in 3D space.
-*   **`MeshController`**: Mapped to a sensor "skin", it learns to correlate complex tactile patterns to specific actuator positions.
-
 ---
 
 ## 📄 Example Configuration (`robot_config.json`)
@@ -294,6 +296,16 @@ A transformer architecture designed to process bitstreams.
 #### `StochasticPerceptron`
 A neuron that uses probability-to-bitstream conversion (Bernoulli samples).
 *   **`predictStochastic(xStreams)`**: Performs multiplication via bitwise AND on stochastic streams and counts the result (popcount).
+
+#### `BitwiseWordLearner`
+A specialized model for verbatim text memorization.
+*   **`trainVerbatim(text, iterations)`**: Uses high-pressure weight adjustment to "carve" transitions into the network.
+*   **`generate(seed, length)`**: Predicts the next word based on a multi-token bitwise context.
+
+#### `BitwiseLosslessCompressor`
+*   **`compress(data)`**: Turns a byte array into a dense neural bitstream.
+*   **`decompress(compressed, length)`**: Exact reconstruction using the internal predictor.
+*   **`complete(seed, bytes)`**: Predictive completion of a partial sequence.
 
  ---
 
