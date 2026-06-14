@@ -279,7 +279,10 @@ export class AdaptiveMajorityNeuron {
         // On utilise une pression plus forte pour graver l'information
         for (let i = 0; i < this.inputSize; i++) {
             if (inputs[i] === 1) {
-                this.potentials[i] += (targetBit === 1 ? (pressure * 2) : -(pressure * 2));
+                // Apprentissage asymétrique avec CLAMPING (Saturation)
+                // On sature rapidement pour que les nouveaux apprentissages ne "noient" pas les anciens
+                let change = (targetBit === 1 ? (pressure * 2) : -(pressure * 20));
+                this.potentials[i] = Math.max(-127, Math.min(127, this.potentials[i] + change));
             }
         }
         this.learningCounter++;
@@ -1078,6 +1081,297 @@ export class MultiHeadAttentionBinary {
         }
 
         return result;
+    }
+}
+
+/**
+ * PRÉDICTEUR NEURONAL DÉTERMINISTE (Le "Cerveau" du Compresseur)
+ * Utilise un contexte de bits pour prédire la probabilité du bit suivant.
+ */
+class NeuralBitPredictor {
+    constructor(contextSize = 16) {
+        this.contextSize = contextSize;
+        this.context = 0n; // Utilisation de BigInt pour dépasser 32 bits
+        this.mask = (1n << BigInt(contextSize)) - 1n;
+        // Table de compteurs : chaque entrée est [nb_zeros, nb_uns]
+        this.counts = new Map();
+    }
+
+    predictBit() {
+        const stats = this.counts.get(this.context) || [1, 1];
+        return stats[1] > stats[0] ? 1 : 0;
+    }
+
+    getProbability() {
+        const stats = this.counts.get(this.context) || [1, 1]; // Initialisation (Laplace Smoothing)
+        const total = stats[0] + stats[1];
+        return Math.floor((stats[1] * 4096) / total);
+    }
+
+    /**
+     * Met à jour le cerveau après avoir vu le bit réel
+     */
+    update(bit) {
+        let stats = this.counts.get(this.context);
+        if (!stats) {
+            stats = [1, 1];
+            this.counts.set(this.context, stats);
+        }
+        stats[bit]++;
+        
+        // Augmentation du plafond de saturation pour le benchmark massif
+        // On passe à 65535 pour une mémorisation quasi-absolue sans "oubli" statistique
+        // sur des centaines de séquences répétitives.
+        if (stats[0] + stats[1] > 65535) {
+            stats[0] = Math.max(1, stats[0] >> 4);
+            stats[1] = Math.max(1, stats[1] >> 4);
+        }
+
+        // Mise à jour du contexte (Shift register en BigInt)
+        // On injecte le nouveau bit et on applique le masque de taille contextSize
+        this.context = ((this.context << 1n) | BigInt(bit)) & this.mask;
+    }
+
+    /**
+     * Capture l'état actuel de la mémoire pour synchronisation
+     */
+    getState() {
+        // Les BigInt ne sont pas sérialisables par défaut, on convertit les clés en String
+        const entries = Array.from(this.counts.entries()).map(([k, v]) => [k.toString(), v]);
+        return JSON.stringify(entries);
+    }
+
+    /**
+     * Restaure un état de mémoire précis
+     */
+    setState(stateStr) {
+        // On convertit les clés String en BigInt lors de la restauration
+        const entries = JSON.parse(stateStr).map(([k, v]) => [BigInt(k), v]);
+        this.counts = new Map(entries);
+    }
+
+    /**
+     * @param {boolean} clearMemory Si vrai, efface tout ce qui a été appris. 
+     * Sinon, réinitialise seulement le contexte glissant.
+     */
+    reset(clearMemory = false) {
+        this.context = 0n;
+        if (clearMemory) this.counts.clear();
+    }
+}
+
+/**
+ * COMPRESSEUR ARITHMÉTIQUE NEURONAL (Sans Destruction)
+ * Transforme les prédictions en un flux binaire compact et réversible.
+ */
+export class BitwiseLosslessCompressor {
+    constructor(contextSize = 12) {
+        this.predictor = new NeuralBitPredictor(contextSize);
+        this.PRECISION = 32n;
+        this.MAX_RANGE = (1n << this.PRECISION) - 1n;
+    }
+
+    /**
+     * Entraîne le réseau sur un bloc de données sans produire de sortie.
+     * Utile pour "nourrir" le cerveau avant compression ou restitution.
+     */
+    train(data) {
+        const bits = this._toBitArray(data);
+        for (const bit of bits) {
+            this.predictor.update(bit);
+        }
+        this.predictor.reset(false); // On reset le contexte, pas la mémoire
+    }
+
+    /**
+     * Restitue la suite d'un message à partir d'une amorce (seed).
+     * @param {string|Uint8Array} seed L'amorce du texte
+     * @param {number} bytesToPredict Nombre d'octets à générer
+     * @param {boolean} verbose Si vrai, affiche les scores de confiance
+     */
+    complete(seed, bytesToPredict, verbose = false) {
+        const input = typeof seed === 'string' ? new TextEncoder().encode(seed) : seed;
+        const seedBits = this._toBitArray(input);
+        
+        this.predictor.reset(false);
+        // On injecte l'amorce pour caler le contexte
+        for (const bit of seedBits) {
+            this.predictor.update(bit);
+        }
+
+        let resultBits = [];
+        for (let i = 0; i < bytesToPredict * 8; i++) {
+            const stats = this.predictor.counts.get(this.predictor.context) || [1, 1];
+            const bit = stats[1] > stats[0] ? 1 : 0;
+            
+            if (verbose && i % 8 === 0) {
+                const prob = (stats[1] / (stats[0] + stats[1]) * 100).toFixed(1);
+                console.log(`      [Predict] Byte ${Math.floor(i/8)}: Contexte ${this.predictor.context} | P(1)=${prob}% -> Choix: ${bit}`);
+            }
+
+            resultBits.push(bit);
+            this.predictor.update(bit);
+        }
+
+        return new Uint8Array(this._packBits(resultBits));
+    }
+
+    getState() {
+        return this.predictor.getState();
+    }
+
+    setState(state) {
+        this.predictor.setState(state);
+    }
+
+    reset(clearMemory = false) {
+        this.predictor.reset(clearMemory);
+    }
+
+    /**
+     * Compresse un Uint8Array en un flux de bits compact.
+     */
+    compress(data) {
+        this.predictor.reset(false);
+        let low = 0n;
+        let high = this.MAX_RANGE;
+        let pendingBits = 0;
+        let output = []; // Pour simplifier, on stocke en tableau de bits
+        
+        const bits = this._toBitArray(data);
+        const half = 1n << (this.PRECISION - 1n);
+        const quarter = 1n << (this.PRECISION - 2n);
+        
+        for (const bit of bits) {
+            let prob1 = BigInt(this.predictor.getProbability());
+            const range = high - low + 1n;
+            
+            // Sécurité : évite l'effondrement de la plage sur les très petits segments
+            let split = (range * (4096n - prob1)) / 4096n;
+            if (split <= 0n) split = 1n;
+            if (split >= range) split = range - 1n;
+            const mid = low + split - 1n;
+
+            if (bit === 0) high = mid;
+            else low = mid + 1n;
+
+            // Renormalisation avec gestion de l'underflow (E3 mapping)
+            while (true) {
+                if (high < half) {
+                    this._emitBit(0, pendingBits, output);
+                    pendingBits = 0;
+                } else if (low >= half) {
+                    this._emitBit(1, pendingBits, output);
+                    pendingBits = 0;
+                    low -= half;
+                    high -= half;
+                } else if (low >= quarter && high < 3n * quarter) {
+                    pendingBits++;
+                    low -= quarter;
+                    high -= quarter;
+                } else {
+                    break;
+                }
+                low = (low << 1n) & this.MAX_RANGE;
+                high = ((high << 1n) | 1n) & this.MAX_RANGE;
+            }
+            
+            this.predictor.update(bit);
+        }
+        
+        // Finalisation (Flush) : On garantit que le décodeur reçoit assez de bits 
+        // pour terminer la lecture du dernier caractère.
+        pendingBits++;
+        if (low < quarter) this._emitBit(0, pendingBits, output);
+        else this._emitBit(1, pendingBits, output);
+
+        return new Uint8Array(this._packBits(output));
+    }
+
+    /**
+     * Décompresse et restitue l'original mot pour mot.
+     */
+    decompress(compressedData, originalLength) {
+        this.predictor.reset(false);
+        const bits = this._toBitArray(compressedData);
+        let low = 0n;
+        let high = this.MAX_RANGE;
+        let value = 0n;
+
+        const half = 1n << (this.PRECISION - 1n);
+        const quarter = 1n << (this.PRECISION - 2n);
+        
+        // Initialisation de la fenêtre de lecture
+        let bitIdx = 0;
+        for (let i = 0; i < Number(this.PRECISION); i++) {
+            value = (value << 1n) | BigInt(bits[bitIdx++] || 0);
+        }
+
+        let decodedBits = [];
+        const totalBits = originalLength * 8;
+
+        for (let i = 0; i < totalBits; i++) {
+            let prob1 = BigInt(this.predictor.getProbability());
+            const range = high - low + 1n;
+            
+            let split = (range * (4096n - prob1)) / 4096n;
+            if (split <= 0n) split = 1n;
+            if (split >= range) split = range - 1n;
+            const mid = low + split - 1n;
+
+            const bit = (value <= mid) ? 0 : 1;
+            decodedBits.push(bit);
+
+            if (bit === 0) high = mid;
+            else low = mid + 1n;
+
+            while (true) {
+                if (high < half) {
+                    // MSB est 0, rien à soustraire
+                } else if (low >= half) {
+                    value -= half;
+                    low -= half;
+                    high -= half;
+                } else if (low >= quarter && high < 3n * quarter) {
+                    value -= quarter;
+                    low -= quarter;
+                    high -= quarter;
+                } else {
+                    break;
+                }
+                low = (low << 1n) & this.MAX_RANGE;
+                high = ((high << 1n) | 1n) & this.MAX_RANGE;
+                value = ((value << 1n) | BigInt(bits[bitIdx++] || 0)) & this.MAX_RANGE;
+            }
+
+            this.predictor.update(bit);
+        }
+
+        return new Uint8Array(this._packBits(decodedBits));
+    }
+
+    _toBitArray(data) {
+        let bits = [];
+        for (let byte of data) {
+            for (let i = 7; i >= 0; i--) bits.push((byte >> i) & 1);
+        }
+        return bits;
+    }
+
+    _packBits(bits) {
+        let bytes = [];
+        for (let i = 0; i < bits.length; i += 8) {
+            let byte = 0;
+            for (let j = 0; j < 8; j++) byte |= (bits[i + j] || 0) << (7 - j);
+            bytes.push(byte);
+        }
+        return bytes;
+    }
+
+    _emitBit(bit, pending, output) {
+        output.push(bit);
+        const opposite = bit ^ 1;
+        for (let i = 0; i < pending; i++) output.push(opposite);
     }
 }
 export class BinaryTransformer {
@@ -3880,6 +4174,126 @@ export class BitwiseSequenceLearner {
     }
 }
 
+/**
+ * Optimisé pour le langage naturel au niveau des mots.
+ */
+export class BitwiseWordLearner {
+    constructor(contextSize = 3) {
+        this.contextSize = contextSize;
+        this.vocab = ["<PAD>", "<UNK>"];
+        this.wordToId = new Map();
+        this.bitSize = 12; // Supporte jusqu'à 4096 mots uniques
+        this.inputSize = contextSize * this.bitSize;
+        this.neurons = Array.from({ length: this.bitSize }, () => new AdaptiveMajorityNeuron(this.inputSize));
+    }
+
+    _tokenize(text) {
+        // Regex robuste : capture les mots accentués et l'élision (l'unité, d'accord) en un seul bloc
+        return text.toLowerCase().match(/[a-z0-9àâäéèêëïîôöùûüç]+(?:['][a-z0-9àâäéèêëïîôöùûüç]*)?|[^\w\s]/g) || [];
+    }
+
+    _getWordId(word) {
+        if (!this.wordToId.has(word)) {
+            if (this.vocab.length < Math.pow(2, this.bitSize)) {
+                this.wordToId.set(word, this.vocab.length);
+                this.vocab.push(word);
+            } else return 1; // <UNK>
+        }
+        return this.wordToId.get(word);
+    }
+
+    _wordsToBits(words) {
+        const bits = new Uint8Array(this.inputSize);
+        words.forEach((word, i) => {
+            const id = this.wordToId.get(word) || 1;
+            const wordBits = DataWrapper.intToBits(id, this.bitSize);
+            bits.set(wordBits, i * this.bitSize);
+        });
+        return bits;
+    }
+
+    /**
+     * Entraînement intensif pour la restitution exacte (Verbatim)
+     */
+    trainVerbatim(text, iterations = 50) {
+        const words = this._tokenize(text);
+        const tokens = [...Array(this.contextSize).fill("<PAD>"), ...words];
+
+        // 1. Construction du vocabulaire
+        words.forEach(w => this._getWordId(w));
+
+        // 2. Entraînement à haute pression
+        for (let iter = 0; iter < iterations; iter++) {
+            for (let i = 0; i < tokens.length - this.contextSize; i++) {
+                const context = tokens.slice(i, i + this.contextSize);
+                const targetWord = tokens[i + this.contextSize];
+                
+                const inputBits = this._wordsToBits(context);
+                const targetId = this._getWordId(targetWord);
+                const targetBits = DataWrapper.intToBits(targetId, this.bitSize);
+
+                for (let b = 0; b < this.bitSize; b++) {
+                    this.neurons[b].train(inputBits, targetBits[b], 10);
+                }
+            }
+        }
+
+        // 3. Stabilisation en "Mémoire Associative Pure"
+        const MAX_STRENGTH = 63;
+        this.neurons.forEach(n => {
+            for (let i = 0; i < n.inputSize; i++) {
+                const p = n.potentials[i];
+                // Seuil de stabilité strict pour le mode verbatim
+                const isStable = p > 15; 
+                n.weights[i] = isStable ? MAX_STRENGTH : 0;
+            }
+            
+            // CORRECTIF CRUCIAL : Le seuil de déclenchement (Threshold)
+            // Dans un compresseur binaire, on veut que le neurone s'active si 
+            // une "partie suffisante" de la signature d'UN mot est présente.
+            // Comme chaque mot possède environ 1 à 4 bits à '1' dans son ID (sur 12 bits),
+            // un seuil fixe bas (ex: 40-50) permet de détecter la transition 
+            // sans être étouffé par le poids total du neurone.
+            
+            // On demande qu'au moins 1.5 "bits de signature" soient présents pour valider le bit suivant.
+            n.threshold = Math.floor(1.5 * MAX_STRENGTH); 
+        });
+    }
+
+    generate(seedText, length = 20) {
+        let currentWords = this._tokenize(seedText);
+        let result = [...currentWords];
+
+        for (let i = 0; i < length; i++) {
+            const context = result.slice(-this.contextSize);
+            // Pad if context is too small
+            while(context.length < this.contextSize) context.unshift("<PAD>");
+            
+            const inputBits = this._wordsToBits(context);
+            const outputBits = new Uint8Array(this.bitSize);
+
+            for (let b = 0; b < this.bitSize; b++) {
+                outputBits[b] = this.neurons[b].predict(inputBits);
+            }
+
+            const nextId = DataWrapper.bitsToInt(outputBits);
+            const nextWord = this.vocab[nextId] || ".";
+            
+            // Sécurité : Si le réseau prédit un ID inconnu ou <UNK>, on tente de prendre 
+            // le mot le plus probable ou on arrête la phrase proprement.
+            if (nextId <= 1 && i > 0) break; 
+
+            if (nextWord === "<PAD>") break;
+            result.push(nextWord);
+        }
+
+        // Nettoyage des espaces pour les apostrophes (l'unité au lieu de l ' unité)
+        return result.join(' ')
+            .replace(/\s([,.;!])/g, '$1');
+    }
+}
+
+
 // --- Simulation Pilotée par le Fichier Unique ---
 // // --- Simulation Pilotée par le Fichier Unique ---
 // // Note: En production, on ferait require('./robot_config.json')
@@ -4028,102 +4442,3 @@ export class BitwiseSequenceLearner {
 //     console.log(`  Input Sensors: [${relativeData[0].input.map(s => s.toFixed(2))}]`);
 //     console.log(`  Delta Actuators: ${relativeData[0].deltaOutput[0].toFixed(4)}`);
 // }
-
-// ============================================================
-// EXEMPLE D'UTILISATION : CHIFFREMENT NEURONAL AUTHENTIFIÉ
-// ============================================================
-function _runCipherBenchmark() {
-    console.log("\n=== BENCHMARK: BitwiseNeuralCipher Performance ===");
-
-    const passphrase = "benchmark-key-123-for-speed-test";
-    const complexity = 128;
-    const cipher = new BitwiseNeuralCipher(passphrase, { complexity });
-
-    const dataSizeKB = 1; // 100 KB
-    const dataSize = dataSizeKB * 1024; // in bytes
-    const iterations = 100; // Number of times to encrypt/decrypt the data
-
-    // Generate random data
-    const plaintext = new Uint8Array(dataSize);
-    if (typeof crypto !== 'undefined' && (crypto.getRandomValues || crypto.webcrypto?.getRandomValues)) {
-        for (let i = 0; i < plaintext.length; i += 65536) {
-            (crypto.getRandomValues ? crypto : crypto.webcrypto).getRandomValues(plaintext.subarray(i, Math.min(i + 65536, plaintext.length)));
-        }
-    } else {
-        // Fallback for Node.js if crypto is not available (though it usually is)
-        for (let i = 0; i < dataSize; i++) plaintext[i] = Math.floor(Math.random() * 256);
-    }
-
-    console.log(`Benchmarking with ${dataSizeKB} KB of random data, ${iterations} iterations.`);
-
-    // --- Encryption Benchmark ---
-    let totalEncryptTime = 0;
-    let encryptedData = null; // Store the last encrypted data for decryption
-
-    const encryptStart = process.hrtime.bigint();
-    for (let i = 0; i < iterations; i++) {
-        encryptedData = cipher.encrypt(plaintext);
-        console.log('encrypt');
-    }
-    const encryptEnd = process.hrtime.bigint();
-    totalEncryptTime = Number(encryptEnd - encryptStart) / 1_000_000; // ms
-
-    const encryptThroughput = (dataSizeKB * iterations) / (totalEncryptTime / 1000); // KB/s
-    console.log(`Encryption: ${totalEncryptTime.toFixed(2)} ms total for ${iterations} iterations.`);
-    console.log(`Encryption Throughput: ${encryptThroughput.toFixed(2)} KB/s (${(encryptThroughput / 1024).toFixed(2)} MB/s)`);
-
-    // --- Decryption Benchmark ---
-    let totalDecryptTime = 0;
-    let decryptedData = null;
-
-    const decryptStart = process.hrtime.bigint();
-    for (let i = 0; i < iterations; i++) {
-        // Use the last encryptedData from the encryption loop
-        decryptedData = cipher.decrypt(encryptedData);
-    }
-    const decryptEnd = process.hrtime.bigint();
-    totalDecryptTime = Number(decryptEnd - decryptStart) / 1_000_000; // ms
-
-    const decryptThroughput = (dataSizeKB * iterations) / (totalDecryptTime / 1000); // KB/s
-    console.log(`Decryption: ${totalDecryptTime.toFixed(2)} ms total for ${iterations} iterations.`);
-    console.log(`Decryption Throughput: ${decryptThroughput.toFixed(2)} KB/s (${(decryptThroughput / 1024).toFixed(2)} MB/s)`);
-
-    // --- Verification ---
-    const originalString = new TextDecoder().decode(plaintext);
-    const decryptedString = decryptedData.toString();
-    console.log(`Verification: ${originalString === decryptedString ? '✅ Success' : '❌ Failure'}`);
-}
-
-// Run the benchmark
-_runCipherBenchmark();
-const cipher = new BitwiseNeuralCipher("secret-robot-key-2024", { complexity: 128 });
-const originalMessage = "Directive 42: Protéger l'intégrité du maillage neuronal.";
-
-console.log("\n=== Test BitwiseNeuralCipher (Authenticated Stream Cipher) ===");
-console.log("Message Original :", originalMessage);
-
-// 1. Chiffrement (Génère IV + Ciphertext + Tag GHASH)
-const encrypted = cipher.encrypt(originalMessage);
-console.log("Chiffré (Hex)    :", encrypted.toHex());
-console.log("Format           : [IV (16 bytes)] + [Data] + [Tag (16 bytes)]");
-
-// 2. Déchiffrement et Validation
-try {
-    const decrypted = cipher.decrypt(encrypted);
-    console.log("Déchiffré        :", decrypted.toString());
-    console.log("Statut           : ✅ Intégrité vérifiée, clé valide.");
-} catch (e) {
-    console.error("❌ Erreur :", e.message);
-}
-
-// 3. Test de Résilience (Simulation d'une attaque bit-flipping)
-console.log("\n--- Simulation d'une altération de données ---");
-const tamperedData = new Uint8Array(encrypted.buffer);
-tamperedData[20] ^= 0x01; // On altère un seul bit du message chiffré
-
-try {
-    cipher.decrypt(tamperedData);
-} catch (e) {
-    console.log("Résultat attendu : 🛡️ Blocage de sécurité réussi !");
-    console.log("Détail           :", e.message);
-}
