@@ -1185,15 +1185,65 @@ export class BitwiseRelationalMemory {
 export class SemanticAttentionLayer {
     constructor() {
         this.states = new Map(); // Concept (Ancre) -> { valeur, saillance, metadata }
-        this.identities = new Map(); // Nom Identity -> Set de mots/concepts associés
         this.equivalences = new Map(); // Synonymes ou concepts liés
+        
+        // Matrice de corrélation bit à bit (ID -> ID)
+        // Utilise un Uint32Array pour compter les co-occurrences entre IDs
+        this.correlationMatrix = new Map(); 
     }
 
     /**
-     * Définit un "Je suis" : un ensemble de mots qui définissent une personnalité.
+     * Apprend la corrélation binaire entre plusieurs concepts (IDs)
+     * sans utiliser de chaînes de caractères.
      */
-    setIdentity(name, concepts) {
-        this.identities.set(name, new Set(concepts.map(c => c.toLowerCase())));
+    correlate(ids) {
+        for (let i = 0; i < ids.length; i++) {
+            for (let j = 0; j < ids.length; j++) {
+                if (i === j) continue;
+                const a = ids[i], b = ids[j];
+                if (!this.correlationMatrix.has(a)) this.correlationMatrix.set(a, new Map());
+                const targets = this.correlationMatrix.get(a);
+                targets.set(b, (targets.get(b) || 0) + 1);
+            }
+        }
+    }
+
+    /**
+     * Calcule le "poids de probabilité" pour chaque bit (0-11) 
+     * basé sur les corrélations des IDs présents dans le contexte.
+     */
+    getBitBias(activeIds, identityIds = []) {
+        // Utilisation de deux accumulateurs pour gérer la superposition
+        const posBias = new Float32Array(12).fill(0);
+        const negBias = new Float32Array(12).fill(0);
+        let totalWeight = 0;
+
+        for (const activeId of activeIds) {
+            // Auto-résonance massive pour l'identité (le "vouloir")
+            // Le contexte reste à 0.5 pour éviter l'écho, l'identité monte à 5.0
+            const isIdentity = identityIds.includes(activeId);
+            const selfWeight = isIdentity ? 5.0 : 0.5;
+
+            for (let b = 0; b < 12; b++) {
+                if ((activeId >> b) & 1) posBias[b] += selfWeight; else negBias[b] += selfWeight;
+            }
+            totalWeight += selfWeight;
+
+            const correlations = this.correlationMatrix.get(activeId);
+            if (!correlations) continue;
+
+            for (const [correlatedId, strength] of correlations) {
+                for (let b = 0; b < 12; b++) {
+                    if ((correlatedId >> b) & 1) posBias[b] += strength;
+                    else negBias[b] += strength;
+                }
+                totalWeight += strength;
+            }
+        }
+
+        const finalBias = new Float32Array(12);
+        for (let b = 0; b < 12; b++) finalBias[b] = posBias[b] - negBias[b];
+        return { bias: finalBias, totalWeight };
     }
 
     /**
@@ -1255,15 +1305,23 @@ export class SemanticRelationalMemory {
         this.vocabulary = new Map(); // Mot -> ID binaire
         this.reverseVocab = new Map(); // ID binaire -> Mot
         this.nextId = 1;
+        this.attention = null;
+        // Regex centralisée supportant les accents et l'élision
+        this.tokenizer = /[a-z0-9àâäéèêëïîôöùûüç]+(?:['][a-z0-9àâäéèêëïîôöùûüç]*)?|[^\w\s]/g;
+    }
+
+    attachAttention(layer) {
+        this.attention = layer;
     }
 
     /**
      * Transforme une phrase en unités de sens avant de les mémoriser
      */
     learnSense(sentence) {
-        const tokens = sentence.toLowerCase().match(/[a-z0-9àâäéèêëïîôöùûüç]+(?:['][a-z0-9àâäéèêëïîôöùûüç]*)?|[^\w\s]/g) || [];
+        const tokens = sentence.toLowerCase().match(this.tokenizer) || [];
         
         this.bitEngine.resetContext();
+        const ids = [];
         
         for (const token of tokens) {
             let id = this.vocabulary.get(token);
@@ -1273,9 +1331,13 @@ export class SemanticRelationalMemory {
                 this.reverseVocab.set(id, token);
             }
             
+            ids.push(id);
             // On injecte l'ID du token (l'unité de sens) dans le moteur de bits
             this._updateId(id);
         }
+
+        // Automatisation : On corrèle tous les IDs de la phrase entre eux dans la matrice
+        if (this.attention) this.attention.correlate(ids);
     }
 
     /**
@@ -1283,26 +1345,33 @@ export class SemanticRelationalMemory {
      * @param {Object} options { depth, focusBias: Map<ID, weight> }
      */
     predictSense(seedSentence, depth = 10, options = {}) {
-        const tokens = seedSentence.toLowerCase().match(/[a-z0-9àâäéèêëïîôöùûüç]+(?:['][a-z0-9àâäéèêëïîôöùûüç]*)?|[^\w\s]/g) || [];
+        const tokens = seedSentence.toLowerCase().match(this.tokenizer) || [];
         this.bitEngine.resetContext();
         
+        const activeIds = [];
+        
+        // INJECTION D'IDENTITÉ : On ajoute l'ID de l'identité aux IDs actifs 
+        // Support multi-identités (ex: "protecteur explorateur")
+        const identityIds = [];
+        if (options.identity) {
+            const roles = options.identity.toLowerCase().split(/\s+/);
+            roles.forEach(role => {
+                const id = this.vocabulary.get(role);
+                if (id !== undefined) { activeIds.push(id); identityIds.push(id); }
+            });
+        }
+
         // Préchauffage avec le sens de l'amorce
         for (const token of tokens) {
             const id = this.vocabulary.get(token) || 0;
+            if (id > 0) activeIds.push(id);
             this._shiftId(id);
         }
 
-        const identityName = options.identity;
-        const attLayer = options.attention;
-        const preferredIds = new Set();
-
-        // On récupère les IDs des mots liés à l'identité pour orienter la génération
-        if (identityName && attLayer && attLayer.identities.has(identityName)) {
-            for (const word of attLayer.identities.get(identityName)) {
-                const id = this.vocabulary.get(word);
-                if (id !== undefined) preferredIds.add(id);
-            }
-        }
+        const attLayer = options.attention || this.attention;
+        // On récupère le biais sémantique binaire basé sur les corrélations apprises
+        const { bias, totalWeight } = attLayer ? 
+            attLayer.getBitBias(activeIds, identityIds) : { bias: null, totalWeight: 0 };
 
         let result = [];
         const creativity = options.creativity || 0.2; // Facteur d'invention (0 à 1)
@@ -1315,20 +1384,23 @@ export class SemanticRelationalMemory {
                 const prob1 = this.bitEngine.getConfidence(); // 0.0 à 1.0
                 let chosenBit = (prob1 >= 0.5) ? 1 : 0;
 
-                // LOGIQUE D'ORIENTATION PAR IDENTITÉ :
-                // On augmente le biais si :
-                // 1. Le réseau hésite (proche de 0.5)
-                // 2. OU on est au tout début de la génération (i === 0) pour forcer le choix du chemin
-                if (preferredIds.size > 0 && (Math.abs(prob1 - 0.5) < creativity || i === 0)) {
-                    for (const prefId of preferredIds) {
-                        // On vérifie si les bits déjà fixés correspondent au début de l'ID préféré
-                        const mask = ((1 << 12) - 1) & ~((1 << (b + 1)) - 1);
-                        if ((prefId & mask) === (predictedId & mask)) {
-                            chosenBit = (prefId >> b) & 1;
-                            break;
-                        }
+                // PRIORISATION DU BIAIS D'IDENTITÉ (Dominance sur l'hésitation)
+                if (bias && totalWeight > 0) {
+                    const bitWeight = bias[b] / totalWeight;
+                    if (Math.abs(bitWeight) > 0.1) {
+                        const preferredBit = bitWeight > 0 ? 1 : 0;
+                        
+                        // On calcule l'incertitude de la séquence (proche de 0.5 = flou)
+                        const uncertainty = 1.0 - Math.abs(prob1 - 0.5) * 2; 
+                        // Plus la séquence est incertaine, plus l'identité (le biais) domine (jusqu'à 50/50)
+                        const biasWeight = 0.2 + (uncertainty * 0.3);
+                        const seqWeight = 1.0 - biasWeight;
+
+                        chosenBit = (prob1 * seqWeight + preferredBit * biasWeight) >= 0.5 ? 1 : 0;
                     }
-                } else if (Math.abs(prob1 - 0.5) < creativity) {
+                }
+                
+                if (Math.abs(prob1 - 0.5) < creativity) {
                     if (Math.random() < creativity) chosenBit = 1 - chosenBit;
                 }
 
@@ -1344,13 +1416,27 @@ export class SemanticRelationalMemory {
             }
 
             const word = this.reverseVocab.get(predictedId);
-            // Sécurité : on évite les boucles infinies sur le même mot
-            if (!word || (result.length > 0 && word === result[result.length - 1])) break;
+            // Sécurité anti-répétition : on compare avec le dernier mot (généré ou prompt)
+            const lastRef = result.length > 0 ? result[result.length - 1] : tokens[tokens.length - 1];
+            
+            // On ne s'arrête que si le mot est invalide. Si c'est une répétition, on tente de continuer
+            // sauf si on a atteint la profondeur max.
+            if (!word) break;
+            if (word === lastRef && i < depth - 1) continue; 
             
             result.push(word);
 
-            // ARRÊT SUR PONCTUATION : Si le sens est complet, on s'arrête
-            if (['.', '!', '?'].includes(word)) break;
+            // DÉTECTION DE BOUCLE ET EXPRESSION D'IDENTITÉ
+            if (['.', '!', '?'].includes(word)) {
+                const expressed = result.join(' ');
+                const missingIdentity = identityIds.some(id => 
+                    this.reverseVocab.has(id) && 
+                    !expressed.toLowerCase().includes(this.reverseVocab.get(id).toLowerCase())
+                );
+                
+                if (!missingIdentity || i >= depth - 1) break;
+                // On continue la génération pour inclure le rôle manquant
+            }
         }
         return result.join(' ');
     }

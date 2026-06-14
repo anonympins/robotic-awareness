@@ -447,17 +447,23 @@ console.log("\n=== Test d'Invention d'Identité ('Je suis') ===");
 /**
  * On définit des identités (Personas)
  */
-attention.setIdentity("protecteur", ["gardien", "vigilant", "bouclier", "sécurité", "intégrité"]);
-attention.setIdentity("explorateur", ["curieux", "découverte", "horizon", "analyse", "inconnu"]);
+/**
+ * APPRENTISSAGE PAR CORRÉLATION (COMMON SENSE)
+ * On donne des phrases au réseau. Il va corréler les IDs des mots entre eux.
+ */
+semanticBrain.learnSense("Le protecteur est un gardien vigilant .");
+semanticBrain.learnSense("L' explorateur est curieux de l' horizon .");
+semanticBrain.learnSense("Je suis un protecteur .");
+semanticBrain.learnSense("Je suis un explorateur .");
 
-const semanticCorpusIdentities = [
-    "Je suis opérationnel pour la mission.",
-    "Je suis un gardien vigilant du maillage.",
-    "Je suis curieux de découvrir l'horizon.",
-    "Le robot est un bouclier de sécurité.",
-    "L'analyse de l'inconnu est ma priorité."
-];
-semanticCorpusIdentities.forEach(s => semanticBrain.learnSense(s));
+console.log("\n--- Test de Corrélation Bit à Bit ---");
+
+// Amorce : "Je suis un protecteur"
+// Le réseau a corrélé "protecteur" avec "gardien" et "vigilant" au niveau des bits de leurs IDs.
+const prompt1 = "Je suis un protecteur";
+const res1 = semanticBrain.predictSense(prompt1, 5, { attention });
+console.log(`Prompt: "${prompt1}" -> Réponse: "${res1}"`); 
+// Résultat attendu : "... gardien vigilant"
 
 function testPersona(role) {
     const prompt = "Je suis";
