@@ -1185,7 +1185,15 @@ export class BitwiseRelationalMemory {
 export class SemanticAttentionLayer {
     constructor() {
         this.states = new Map(); // Concept (Ancre) -> { valeur, saillance, metadata }
+        this.identities = new Map(); // Nom Identity -> Set de mots/concepts associés
         this.equivalences = new Map(); // Synonymes ou concepts liés
+    }
+
+    /**
+     * Définit un "Je suis" : un ensemble de mots qui définissent une personnalité.
+     */
+    setIdentity(name, concepts) {
+        this.identities.set(name, new Set(concepts.map(c => c.toLowerCase())));
     }
 
     /**
@@ -1253,7 +1261,7 @@ export class SemanticRelationalMemory {
      * Transforme une phrase en unités de sens avant de les mémoriser
      */
     learnSense(sentence) {
-        const tokens = sentence.toLowerCase().match(/\w+|[^\w\s]/g) || [];
+        const tokens = sentence.toLowerCase().match(/[a-z0-9àâäéèêëïîôöùûüç]+(?:['][a-z0-9àâäéèêëïîôöùûüç]*)?|[^\w\s]/g) || [];
         
         this.bitEngine.resetContext();
         
@@ -1275,7 +1283,7 @@ export class SemanticRelationalMemory {
      * @param {Object} options { depth, focusBias: Map<ID, weight> }
      */
     predictSense(seedSentence, depth = 10, options = {}) {
-        const tokens = seedSentence.toLowerCase().match(/\w+|[^\w\s]/g) || [];
+        const tokens = seedSentence.toLowerCase().match(/[a-z0-9àâäéèêëïîôöùûüç]+(?:['][a-z0-9àâäéèêëïîôöùûüç]*)?|[^\w\s]/g) || [];
         this.bitEngine.resetContext();
         
         // Préchauffage avec le sens de l'amorce
@@ -1284,14 +1292,48 @@ export class SemanticRelationalMemory {
             this._shiftId(id);
         }
 
+        const identityName = options.identity;
+        const attLayer = options.attention;
+        const preferredIds = new Set();
+
+        // On récupère les IDs des mots liés à l'identité pour orienter la génération
+        if (identityName && attLayer && attLayer.identities.has(identityName)) {
+            for (const word of attLayer.identities.get(identityName)) {
+                const id = this.vocabulary.get(word);
+                if (id !== undefined) preferredIds.add(id);
+            }
+        }
+
         let result = [];
+        const creativity = options.creativity || 0.2; // Facteur d'invention (0 à 1)
+
         for (let i = 0; i < depth; i++) {
             let predictedId = 0;
+
             // On reconstruit l'ID du prochain token bit par bit
             for (let b = 11; b >= 0; b--) {
-                const bit = this.bitEngine.predictBit() || 0;
-                predictedId |= (bit << b);
-                this.bitEngine.shift(bit);
+                const prob1 = this.bitEngine.getConfidence(); // 0.0 à 1.0
+                let chosenBit = (prob1 >= 0.5) ? 1 : 0;
+
+                // LOGIQUE D'ORIENTATION PAR IDENTITÉ :
+                // On augmente le biais si :
+                // 1. Le réseau hésite (proche de 0.5)
+                // 2. OU on est au tout début de la génération (i === 0) pour forcer le choix du chemin
+                if (preferredIds.size > 0 && (Math.abs(prob1 - 0.5) < creativity || i === 0)) {
+                    for (const prefId of preferredIds) {
+                        // On vérifie si les bits déjà fixés correspondent au début de l'ID préféré
+                        const mask = ((1 << 12) - 1) & ~((1 << (b + 1)) - 1);
+                        if ((prefId & mask) === (predictedId & mask)) {
+                            chosenBit = (prefId >> b) & 1;
+                            break;
+                        }
+                    }
+                } else if (Math.abs(prob1 - 0.5) < creativity) {
+                    if (Math.random() < creativity) chosenBit = 1 - chosenBit;
+                }
+
+                predictedId |= (chosenBit << b);
+                this.bitEngine.shift(chosenBit);
             }
 
             // Mécanisme d'attention optionnelle :
@@ -1302,8 +1344,13 @@ export class SemanticRelationalMemory {
             }
 
             const word = this.reverseVocab.get(predictedId);
-            if (!word || word === result[result.length - 1]) break;
+            // Sécurité : on évite les boucles infinies sur le même mot
+            if (!word || (result.length > 0 && word === result[result.length - 1])) break;
+            
             result.push(word);
+
+            // ARRÊT SUR PONCTUATION : Si le sens est complet, on s'arrête
+            if (['.', '!', '?'].includes(word)) break;
         }
         return result.join(' ');
     }

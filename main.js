@@ -442,6 +442,37 @@ function processInstruction(sentence) {
     }
 }
 
+console.log("\n=== Test d'Invention d'Identité ('Je suis') ===");
+
+/**
+ * On définit des identités (Personas)
+ */
+attention.setIdentity("protecteur", ["gardien", "vigilant", "bouclier", "sécurité", "intégrité"]);
+attention.setIdentity("explorateur", ["curieux", "découverte", "horizon", "analyse", "inconnu"]);
+
+const semanticCorpusIdentities = [
+    "Je suis opérationnel pour la mission.",
+    "Je suis un gardien vigilant du maillage.",
+    "Je suis curieux de découvrir l'horizon.",
+    "Le robot est un bouclier de sécurité.",
+    "L'analyse de l'inconnu est ma priorité."
+];
+semanticCorpusIdentities.forEach(s => semanticBrain.learnSense(s));
+
+function testPersona(role) {
+    const prompt = "Je suis";
+    // On augmente la créativité pour permettre au réseau de sortir des sentiers battus
+    const reponse = semanticBrain.predictSense(prompt, 10, { 
+        attention: attention, 
+        identity: role,
+        creativity: 0.4 
+    });
+    console.log(`[Identité: ${role.toUpperCase()}] "${prompt} ${reponse}"`);
+}
+
+testPersona("protecteur");
+testPersona("explorateur");
+
 processInstruction("Robot : Batterie critique.");
 processInstruction("Alerte : L'accumulateur est maintenant down.");
 
