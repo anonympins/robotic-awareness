@@ -10,12 +10,17 @@ export async function scrapeRandomWikipediaContent() {
 
     console.log(`[Scraper] Connexion à : ${startUrl}`);
 
-    const cleanHtmlSource = (html) => {
-        return html
-            .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, '') // Supprime le CSS
-            .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, '') // Supprime le JS
-            .replace(/<noscript[^>]*>[\s\S]*?<\/noscript>/gi, '');
-    };
+    // Fonctions utilitaires déplacées pour plus de clarté
+    const cleanHtmlSource = (html) => html
+        .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, ' ') 
+        .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, ' ') 
+        .replace(/<noscript[^>]*>[\s\S]*?<\/noscript>/gi, ' ')
+        // Supprime les tableaux (infobox/navbox) AVANT de supprimer les balises génériques
+        .replace(/<table[^>]*class="[^"]*(?:infobox|navbox)[^"]*"[^>]*>[\s\S]*?<\/table>/gi, ' ')
+        // Ajoute des espaces autour des éléments de structure pour éviter la fusion de mots
+        .replace(/<\/p>|<br\/?>|<\/li>|<\/h[1-6]>/gi, ' \n ')
+        // Supprime enfin toutes les balises HTML restantes
+        .replace(/<[^>]+>/g, ' ');
 
     const extractTitle = (html) => {
         const match = html.match(/<h1[^>]*id="firstHeading"[^>]*>([\s\S]*?)<\/h1>/);
@@ -49,7 +54,9 @@ export async function scrapeRandomWikipediaContent() {
                 } else if (nextUrl.startsWith('/')) {
                     nextUrl = 'https://fr.wikipedia.org' + nextUrl;
                 }
-                return fetchHtml(nextUrl).then(resolve).catch(reject);
+                // Normalisation de l'URL pour gérer les caractères spéciaux/accents dans les titres
+                const safeUrl = new URL(nextUrl).href;
+                return fetchHtml(safeUrl).then(resolve).catch(reject);
             }
 
             if (res.statusCode !== 200) {
@@ -65,40 +72,41 @@ export async function scrapeRandomWikipediaContent() {
     try {
         const rawHtml = await fetchHtml(startUrl);
         const title = extractTitle(rawHtml);
-        // Pré-nettoyage des balises de données (CSS/JS)
-        const html = cleanHtmlSource(rawHtml);
 
-        // Localisation de la balise cible
+        // On cherche la balise dans le HTML BRUT pour ne pas perdre les IDs
         const targetId = 'id="mw-content-text"';
-        const startIdx = html.indexOf(targetId);
+        const startIdx = rawHtml.indexOf(targetId);
 
         if (startIdx === -1) {
             throw new Error("La balise #mw-content-text n'a pas été trouvée dans le HTML.");
         }
 
         // On remonte à l'ouverture du <div
-        const divStartIdx = html.lastIndexOf('<div', startIdx);
+        const divStartIdx = rawHtml.lastIndexOf('<div', startIdx);
         
         // Extraction du bloc par comptage de balises pour gérer les imbrications
-        let content = "";
+        let blockHtml = "";
         let depth = 0;
         let i = divStartIdx;
 
-        while (i < html.length) {
-            if (html.substring(i, i + 4) === '<div') {
+        while (i < rawHtml.length) {
+            if (rawHtml.substring(i, i + 4) === '<div') {
                 depth++;
                 i += 4;
-            } else if (html.substring(i, i + 5) === '</div') {
+            } else if (rawHtml.substring(i, i + 5) === '</div') {
                 depth--;
                 i += 5;
                 if (depth === 0) {
-                    content = html.substring(divStartIdx, i);
+                    blockHtml = rawHtml.substring(divStartIdx, i);
                     break;
                 }
             } else {
                 i++;
             }
         }
+
+        // Nettoyage sémantique du bloc extrait uniquement
+        const content = cleanHtmlSource(blockHtml);
 
         console.log("=== Extraction Réussie ===");
         console.log(`Titre : ${title}`);
