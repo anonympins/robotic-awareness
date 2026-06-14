@@ -484,4 +484,36 @@ processInstruction("Alerte : L'accumulateur est maintenant down.");
 
 console.log("\nProchaine étape : L'Apprentissage par Renforcement des Unités de Sens.");
 
+// ============================================================
+// TEST : INGESTION DE GRAMMAIRE ET RESTITUTION CRÉATIVE
+// ============================================================
+
+console.log("\n=== Test d'Ingestion de Grammaire (Combinaisons Créatives) ===");
+
+const grammaireCorpus = [
+    "Le robot analyse le secteur .",
+    "Le robot protège le maillage .",
+    "Le robot observe l' horizon .",
+    "L' humain surveille le secteur .",
+    "L' humain répare le maillage .",
+    "L' humain explore l' horizon ."
+];
+
+console.log("Apprentissage des structures grammaticales...");
+grammaireCorpus.forEach(phrase => semanticBrain.learnSense(phrase));
+
+const testGrammaire = (amorce, niveauCreativite) => {
+    // On utilise predictSense avec un niveau de créativité ajustable
+    // La créativité (0.0 à 1.0) force le réseau à choisir des bits moins probables
+    const generation = semanticBrain.predictSense(amorce, 6, { 
+        creativity: niveauCreativite 
+    });
+    console.log(`[Créativité: ${niveauCreativite}] Amorce: "${amorce}" -> Sortie: "${generation}"`);
+};
+
+testGrammaire("Le robot", 0.001); // Fidèle : "analyse le secteur ."
+testGrammaire("Le robot", 0.6); // Créatif : peut sortir "répare le maillage ." (action d'humain)
+testGrammaire("L' humain", 0.2); // Fidèle : "surveille le secteur ."
+testGrammaire("L' humain", 0.9); // Très créatif : "observe le maillage ." (mélange de concepts)
+
 console.log(`\nTaille du Vocabulaire : ${semanticBrain.vocabulary.size} concepts uniques.`);

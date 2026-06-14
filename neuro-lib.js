@@ -1135,6 +1135,30 @@ export class BitwiseRelationalMemory {
     }
 
     /**
+     * Évalue la probabilité qu'une séquence de bits (ID) soit la suite logique du contexte.
+     * @param {number} id L'ID à tester
+     * @param {number} bitLen Nombre de bits (12 par défaut)
+     */
+    scoreId(id, bitLen = 12) {
+        let score = 1.0;
+        let tempContext = this.currentContext;
+        for (let i = bitLen - 1; i >= 0; i--) {
+            const cell = this.vault.get(tempContext);
+            if (!cell) { 
+                score *= 0.01; // Pénalité massive pour les transitions jamais vues
+            } 
+            else {
+                const bit = (id >> i) & 1;
+                const total = cell[0] + cell[1];
+                // On favorise l'exclusivité : si un bit n'a jamais été vu dans ce contexte, score -> 0
+                score *= (cell[bit] === 0) ? 0.001 : (cell[bit] / total);
+            }
+            tempContext = ((tempContext << 1n) | BigInt((id >> i) & 1)) & this.mask;
+        }
+        return score;
+    }
+
+    /**
      * Retourne la probabilité pour le codage arithmétique (échelle 0-4096)
      */
     getProbability() {
@@ -1193,57 +1217,130 @@ export class SemanticAttentionLayer {
     }
 
     /**
-     * Apprend la corrélation binaire entre plusieurs concepts (IDs)
-     * sans utiliser de chaînes de caractères.
+     * Apprend la corrélation sémantique avec notion de distance (Attention Propagation).
+     * Plus deux mots sont proches dans la phrase, plus leur lien est fort.
      */
     correlate(ids) {
         for (let i = 0; i < ids.length; i++) {
             for (let j = 0; j < ids.length; j++) {
                 if (i === j) continue;
                 const a = ids[i], b = ids[j];
+                
+                // Calcul de l'intensité de l'attention basé sur la proximité
+                // (Similaire au mécanisme de positional encoding simplifié)
+                const distance = Math.abs(i - j);
+                const attentionWeight = 1.0 / distance;
+
                 if (!this.correlationMatrix.has(a)) this.correlationMatrix.set(a, new Map());
                 const targets = this.correlationMatrix.get(a);
-                targets.set(b, (targets.get(b) || 0) + 1);
+                
+                // Propagation : On cumule l'énergie sémantique
+                const currentEnergy = targets.get(b) || 0;
+                targets.set(b, currentEnergy + attentionWeight);
             }
         }
     }
 
     /**
-     * Calcule le "poids de probabilité" pour chaque bit (0-11) 
-     * basé sur les corrélations des IDs présents dans le contexte.
+     * Propage l'énergie entre les concepts pour créer des liens indirects (Résonance).
+     * Si A est lié à B et B est lié à C, alors un lien A -> C est créé/renforcé.
+     * Permet l'émergence de relations non explicitement citées.
+     * @param {number} factor Amortissement de la propagation (0.0 à 1.0)
      */
-    getBitBias(activeIds, identityIds = []) {
-        // Utilisation de deux accumulateurs pour gérer la superposition
+    propagateResonance(factor = 0.2) {
+        const newLinks = new Map();
+
+        for (const [idA, targetsA] of this.correlationMatrix) {
+            for (const [idB, energyAB] of targetsA) {
+                const targetsB = this.correlationMatrix.get(idB);
+                if (!targetsB) continue;
+
+                for (const [idC, energyBC] of targetsB) {
+                    if (idA === idC) continue; // Pas d'auto-boucle
+
+                    const indirectEnergy = energyAB * energyBC * factor;
+                    if (!newLinks.has(idA)) newLinks.set(idA, new Map());
+                    const potentialLinks = newLinks.get(idA);
+                    potentialLinks.set(idC, (potentialLinks.get(idC) || 0) + indirectEnergy);
+                }
+            }
+        }
+
+        // Fusion des résonances dans la matrice principale
+        for (const [idA, links] of newLinks) {
+            if (!this.correlationMatrix.has(idA)) this.correlationMatrix.set(idA, new Map());
+            const targets = this.correlationMatrix.get(idA);
+            for (const [idC, energy] of links) {
+                targets.set(idC, (targets.get(idC) || 0) + energy);
+            }
+        }
+    }
+
+    /**
+     * Calcule le "poids de probabilité" pour chaque bit (0-11).
+     * @param {number[]} activeIds Fenêtre de tokens récents (Attention Locale)
+     * @param {number[]} identityIds IDs de Persona (Bias)
+     * @param {number[]} queryIds IDs de la question initiale (Attention Globale Persistante)
+     */
+    getBitBias(activeIds, identityIds = [], queryIds = []) {
         const posBias = new Float32Array(12).fill(0);
         const negBias = new Float32Array(12).fill(0);
         let totalWeight = 0;
 
-        for (const activeId of activeIds) {
-            // Auto-résonance massive pour l'identité (le "vouloir")
-            // Le contexte reste à 0.5 pour éviter l'écho, l'identité monte à 5.0
-            const isIdentity = identityIds.includes(activeId);
-            const selfWeight = isIdentity ? 5.0 : 0.5;
+        // 1. Attention Globale (La Question)
+        // Elle reste allumée avec une force constante pour guider chaque mot généré.
+        queryIds.forEach(id => {
+            const weight = 1.2;
+            this._applyBias(id, weight, posBias, negBias);
+            totalWeight += weight;
+            // La question propage son attention vers les concepts liés
+            this._applyCorrelationBias(id, 0.2, posBias, negBias, (w) => totalWeight += w);
+        });
 
-            for (let b = 0; b < 12; b++) {
-                if ((activeId >> b) & 1) posBias[b] += selfWeight; else negBias[b] += selfWeight;
-            }
-            totalWeight += selfWeight;
+        // 2. Attention d'Identité (Le Persona) - APPLICATION GLOBALE
+        // On injecte l'identité comme un biais persistant, même si le mot n'est pas encore dit.
+        identityIds.forEach(id => {
+            const weight = 15.0; // Augmenté pour dominer les probabilités grammaticales ambiguës
+            this._applyBias(id, weight, posBias, negBias);
+            totalWeight += weight;
+            
+            // Propagation plus forte vers les concepts liés (ex: explorateur -> horizon)
+            this._applyCorrelationBias(id, 0.8, posBias, negBias, (w) => totalWeight += w);
+        });
 
-            const correlations = this.correlationMatrix.get(activeId);
-            if (!correlations) continue;
-
-            for (const [correlatedId, strength] of correlations) {
-                for (let b = 0; b < 12; b++) {
-                    if ((correlatedId >> b) & 1) posBias[b] += strength;
-                    else negBias[b] += strength;
-                }
-                totalWeight += strength;
-            }
-        }
+        // 3. Attention Locale (Contexte glissant)
+        activeIds.forEach((id, index) => {
+            const weight = 3.0 * (index + 1) / (activeIds.length || 1);
+            this._applyBias(id, weight, posBias, negBias);
+            totalWeight += weight;
+            this._applyCorrelationBias(id, 0.1, posBias, negBias, (w) => totalWeight += w);
+        });
 
         const finalBias = new Float32Array(12);
         for (let b = 0; b < 12; b++) finalBias[b] = posBias[b] - negBias[b];
         return { bias: finalBias, totalWeight };
+    }
+
+    _applyBias(id, weight, posBias, negBias) {
+        for (let b = 0; b < 12; b++) {
+            // "Bit Final" Resolution: Les bits de poids faible (0-5) sont les plus 
+            // discriminants pour les IDs incrémentaux. On booste leur importance.
+            const resolutionBoost = 1.0 + ((11 - b) / 22); 
+            const w = weight * resolutionBoost;
+
+            if ((id >> b) & 1) posBias[b] += w; 
+            else negBias[b] += w * 0.05; // Contraste 20:1 pour une sélectivité chirurgicale
+        }
+    }
+
+    _applyCorrelationBias(id, multiplier, posBias, negBias, weightAdder) {
+        const correlations = this.correlationMatrix.get(id);
+        if (!correlations) return;
+        for (const [correlatedId, strength] of correlations) {
+            const effectiveWeight = strength * multiplier;
+            this._applyBias(correlatedId, effectiveWeight, posBias, negBias);
+            weightAdder(effectiveWeight);
+        }
     }
 
     /**
@@ -1316,13 +1413,42 @@ export class SemanticRelationalMemory {
 
     /**
      * Transforme une phrase en unités de sens avant de les mémoriser
+     * @param {string} sentence La phrase à apprendre
+     * @param {boolean} resetContext Si vrai, oublie le contexte précédent (défaut: true)
      */
-    learnSense(sentence) {
+    learnSense(sentence, resetContext = true) {
         const tokens = sentence.toLowerCase().match(this.tokenizer) || [];
         
-        this.bitEngine.resetContext();
+        if (resetContext) this.bitEngine.resetContext();
         const ids = [];
         
+        this._ingestTokens(tokens, ids);
+
+        // Automatisation : On corrèle tous les IDs de la phrase entre eux dans la matrice
+        if (this.attention) this.attention.correlate(ids);
+    }
+
+    /**
+     * Ingestre un texte long en le découpant par ponctuation.
+     * @param {string} text Le corpus complet
+     * @param {boolean} continuous Si vrai, lie la fin d'une phrase au début de la suivante
+     */
+    learnText(text, continuous = false) {
+        // Découpage par phrases (., !, ?)
+        const sentences = text.split(/(?<=[.!?])\s+/);
+        console.log(`[SemanticMemory] Ingestion de ${sentences.length} unités de sens...`);
+        
+        sentences.forEach((s, index) => {
+            // Si continuous est vrai, on ne reset le contexte que pour la toute première phrase
+            const shouldReset = index === 0 || !continuous;
+            this.learnSense(s, shouldReset);
+        });
+
+        // Consolidation post-ingestion : On fait émerger les liens indirects
+        if (this.attention) this.attention.propagateResonance();
+    }
+
+    _ingestTokens(tokens, ids) {
         for (const token of tokens) {
             let id = this.vocabulary.get(token);
             if (id === undefined) {
@@ -1335,9 +1461,6 @@ export class SemanticRelationalMemory {
             // On injecte l'ID du token (l'unité de sens) dans le moteur de bits
             this._updateId(id);
         }
-
-        // Automatisation : On corrèle tous les IDs de la phrase entre eux dans la matrice
-        if (this.attention) this.attention.correlate(ids);
     }
 
     /**
@@ -1349,94 +1472,115 @@ export class SemanticRelationalMemory {
         this.bitEngine.resetContext();
         
         const activeIds = [];
-        
-        // INJECTION D'IDENTITÉ : On ajoute l'ID de l'identité aux IDs actifs 
-        // Support multi-identités (ex: "protecteur explorateur")
+        const queryIds = tokens.map(t => this.vocabulary.get(t) || 0).filter(id => id > 0);
         const identityIds = [];
+
         if (options.identity) {
             const roles = options.identity.toLowerCase().split(/\s+/);
             roles.forEach(role => {
                 const id = this.vocabulary.get(role);
-                if (id !== undefined) { activeIds.push(id); identityIds.push(id); }
+                if (id !== undefined) { identityIds.push(id); }
             });
         }
 
         // Préchauffage avec le sens de l'amorce
         for (const token of tokens) {
             const id = this.vocabulary.get(token) || 0;
-            if (id > 0) activeIds.push(id);
+            if (id > 0) {
+                activeIds.push(id);
+                // On limite la fenêtre d'attention aux 4 derniers mots pour garder la structure
+                if (activeIds.length > 4) activeIds.shift();
+            }
             this._shiftId(id);
         }
 
         const attLayer = options.attention || this.attention;
-        // On récupère le biais sémantique binaire basé sur les corrélations apprises
-        const { bias, totalWeight } = attLayer ? 
-            attLayer.getBitBias(activeIds, identityIds) : { bias: null, totalWeight: 0 };
-
         let result = [];
-        const creativity = options.creativity || 0.2; // Facteur d'invention (0 à 1)
+        const wordCounts = new Map();
+        const creativity = (options.creativity !== undefined) ? options.creativity : 0.01; 
+        const topK = options.topK || 4;
 
         for (let i = 0; i < depth; i++) {
-            let predictedId = 0;
+            const candidates = [];
 
-            // On reconstruit l'ID du prochain token bit par bit
-            for (let b = 11; b >= 0; b--) {
-                const prob1 = this.bitEngine.getConfidence(); // 0.0 à 1.0
-                let chosenBit = (prob1 >= 0.5) ? 1 : 0;
-
-                // PRIORISATION DU BIAIS D'IDENTITÉ (Dominance sur l'hésitation)
-                if (bias && totalWeight > 0) {
-                    const bitWeight = bias[b] / totalWeight;
-                    if (Math.abs(bitWeight) > 0.1) {
-                        const preferredBit = bitWeight > 0 ? 1 : 0;
-                        
-                        // On calcule l'incertitude de la séquence (proche de 0.5 = flou)
-                        const uncertainty = 1.0 - Math.abs(prob1 - 0.5) * 2; 
-                        // Plus la séquence est incertaine, plus l'identité (le biais) domine (jusqu'à 50/50)
-                        const biasWeight = 0.2 + (uncertainty * 0.3);
-                        const seqWeight = 1.0 - biasWeight;
-
-                        chosenBit = (prob1 * seqWeight + preferredBit * biasWeight) >= 0.5 ? 1 : 0;
+            for (let [word, id] of this.vocabulary) {
+                if (id === 0) continue;
+                
+                // 1. Probabilité de Transition (Grammaire)
+                const transitionProb = this.bitEngine.scoreId(id);
+                if (creativity < 0.1 && transitionProb < 0.0001) continue; // Filtre strict pour le déterminisme
+                
+                // 2. Score de Contexte (Attention & Identité)
+                let contextBoost = 1.0;
+                if (attLayer && (activeIds.length > 0 || identityIds.length > 0 || queryIds.length > 0)) {
+                    const { bias, totalWeight } = attLayer.getBitBias(activeIds, identityIds, queryIds);
+                    if (totalWeight > 0) {
+                        let bitMatch = 0;
+                        for (let b = 0; b < 12; b++) {
+                            bitMatch += ((id >> b) & 1) ? bias[b] : -bias[b];
+                        }
+                        // Courbe de boost plus raide (0.2) et plage élargie (-4 à 6)
+                        contextBoost = Math.exp(Math.max(-4.0, Math.min(6.0, bitMatch / (totalWeight * 0.2))));
                     }
                 }
+
+                // On augmente drastiquement l'influence de la probabilité de transition
+                let score = Math.pow(transitionProb, 4.0) * contextBoost; 
+
+                // PÉNALITÉ DE RÉPÉTITION (Dynamique)
+                const count = wordCounts.get(word) || 0;
+                if (count > 0) score *= Math.pow(0.001, count);
                 
-                if (Math.abs(prob1 - 0.5) < creativity) {
-                    if (Math.random() < creativity) chosenBit = 1 - chosenBit;
-                }
+                if (word.length <= 3 && result.slice(-3).includes(word)) score *= 0.01;
 
-                predictedId |= (chosenBit << b);
-                this.bitEngine.shift(chosenBit);
+                candidates.push({ id, word, score });
             }
 
-            // Mécanisme d'attention optionnelle :
-            // Si un focus externe est fourni, on peut corriger/orienter la prédiction
-            if (options.focusMap && options.focusMap.has(predictedId)) {
-                // Ici on pourrait implémenter une logique de "re-routing"
-                // pour forcer la restitution vers un état plus actuel
+            if (candidates.length === 0) break;
+
+            candidates.sort((a, b) => b.score - a.score);
+            
+            // En mode déterministe (créativité basse), on force le Top 1
+            let selectionLimit = creativity < 0.05 ? 1 : topK;
+            let topKCandidates = candidates.slice(0, selectionLimit);
+
+            if (result.length < 2) {
+                topKCandidates.forEach(c => {
+                    if (['.', '!', '?'].includes(c.word)) {
+                        c.score *= 0.0001;
+                    }
+                });
             }
 
-            const word = this.reverseVocab.get(predictedId);
-            // Sécurité anti-répétition : on compare avec le dernier mot (généré ou prompt)
-            const lastRef = result.length > 0 ? result[result.length - 1] : tokens[tokens.length - 1];
+            // Normalisation des Top-K avec la température (créativité)
+            const temperature = Math.max(0.01, creativity);
+            let adjustedCandidates = topKCandidates.map(c => ({
+                ...c,
+                prob: Math.pow(c.score, 1 / temperature)
+            }));
             
-            // On ne s'arrête que si le mot est invalide. Si c'est une répétition, on tente de continuer
-            // sauf si on a atteint la profondeur max.
-            if (!word) break;
-            if (word === lastRef && i < depth - 1) continue; 
-            
+            // Recalcul de la somme des probabilités ajustées (Crucial pour la Roulette)
+            let totalScore = adjustedCandidates.reduce((acc, c) => acc + c.prob, 0);
+            if (totalScore <= 0 || isNaN(totalScore)) break;
+
+            // Sélection stochastique (Roulette)
+            let pick = Math.random() * totalScore;
+            let selected = adjustedCandidates[0];
+            for (const cand of adjustedCandidates) {
+                pick -= cand.prob;
+                if (pick <= 0) { selected = cand; break; }
+            }
+
+            const word = selected.word;
             result.push(word);
+            wordCounts.set(word, (wordCounts.get(word) || 0) + 1);
+            
+            // Propagation de l'attention : On ajoute le mot généré au contexte actif
+            activeIds.push(selected.id);
+            if (activeIds.length > 4) activeIds.shift();
 
-            // DÉTECTION DE BOUCLE ET EXPRESSION D'IDENTITÉ
-            if (['.', '!', '?'].includes(word)) {
-                const expressed = result.join(' ');
-                const missingIdentity = identityIds.some(id => 
-                    this.reverseVocab.has(id) && 
-                    !expressed.toLowerCase().includes(this.reverseVocab.get(id).toLowerCase())
-                );
-                
-                if (!missingIdentity || i >= depth - 1) break;
-                // On continue la génération pour inclure le rôle manquant
-            }
+            this._shiftId(selected.id);
+            if (['.', '!', '?'].includes(word)) break;
         }
         return result.join(' ');
     }
