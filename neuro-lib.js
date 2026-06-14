@@ -1087,27 +1087,32 @@ export class MultiHeadAttentionBinary {
 /**
  * MÉMOIRE RELATIONNELLE PERSISTANTE (Bit Mémoriel)
  * Une structure qui n'oublie jamais et traite les relations sans perte.
- * Utilise une Map pour garantir l'absence de collisions de hachage.
  */
 export class BitwiseRelationalMemory {
-    constructor(contextSize = 64, tablePower = null) { 
+    constructor(contextSize = 64, tablePower = 22) { 
         this.contextSize = contextSize;
         this.mask = (1n << BigInt(contextSize)) - 1n;
         this.currentContext = 0n;
-        // Stockage parfait : Context -> [Compteur0, Compteur1]
-        this.vault = new Map();
+
+        this.tablePower = tablePower;
+        this.tableSize = 1 << tablePower;
+        // Stabilité du GC : Un seul gros objet Uint32Array au lieu de millions de Map nodes.
+        // Chaque slot contient deux compteurs 32-bits [count0, count1].
+        this.data = new Uint32Array(this.tableSize * 2);
+    }
+
+    _getHash(ctx) {
+        // Hachage non-linéaire du contexte pour indexer la table
+        let h = ctx ^ (ctx >> 17n) ^ (ctx >> 33n);
+        return Number(h & BigInt(this.tableSize - 1));
     }
 
     /**
      * Enregistre une transition de bit sans perte d'information.
      */
-    update(bit) {
-        let cell = this.vault.get(this.currentContext);
-        if (!cell) {
-            cell = new Uint32Array(2); // [count0, count1]
-            this.vault.set(this.currentContext, cell);
-        }
-        cell[bit & 1]++;
+    update(bit, weight = 1) {
+        const h = this._getHash(this.currentContext);
+        this.data[h * 2 + (bit & 1)] += weight;
 
         // Mise à jour du "Bit Mémoriel" glissant
         this.currentContext = ((this.currentContext << 1n) | BigInt(bit & 1)) & this.mask;
@@ -1125,13 +1130,14 @@ export class BitwiseRelationalMemory {
      * Renvoie null s'il n'y a pas de majorité stricte ou aucune donnée.
      */
     predictBit() {
-        const cell = this.vault.get(this.currentContext);
-        if (!cell) return null; // Signal de contexte inconnu
+        const h = this._getHash(this.currentContext);
+        const c0 = this.data[h * 2];
+        const c1 = this.data[h * 2 + 1];
+
+        if (c0 === 0 && c1 === 0) return null; // Signal de contexte inconnu
         
         // Pour le "Perfect Score", on ne s'arrête que si le contexte est TOTALEMENT inconnu.
-        // Si on a des données mais qu'il y a égalité (collision), on force un choix déterministe
-        // au lieu de renvoyer null. Cela permet de terminer la phrase.
-        return cell[1] >= cell[0] ? 1 : 0;
+        return c1 >= c0 ? 1 : 0;
     }
 
     /**
@@ -1143,15 +1149,18 @@ export class BitwiseRelationalMemory {
         let score = 1.0;
         let tempContext = this.currentContext;
         for (let i = bitLen - 1; i >= 0; i--) {
-            const cell = this.vault.get(tempContext);
-            if (!cell) { 
+            const h = this._getHash(tempContext);
+            const c0 = this.data[h * 2];
+            const c1 = this.data[h * 2 + 1];
+            const total = c0 + c1;
+
+            if (total === 0) { 
                 score *= 0.01; // Pénalité massive pour les transitions jamais vues
-            } 
-            else {
+            } else {
                 const bit = (id >> i) & 1;
-                const total = cell[0] + cell[1];
                 // On favorise l'exclusivité : si un bit n'a jamais été vu dans ce contexte, score -> 0
-                score *= (cell[bit] === 0) ? 0.001 : (cell[bit] / total);
+                const count = (bit === 0) ? c0 : c1;
+                score *= (count === 0) ? 0.001 : (count / total);
             }
             tempContext = ((tempContext << 1n) | BigInt((id >> i) & 1)) & this.mask;
         }
@@ -1162,20 +1171,25 @@ export class BitwiseRelationalMemory {
      * Retourne la probabilité pour le codage arithmétique (échelle 0-4096)
      */
     getProbability() {
-        const cell = this.vault.get(this.currentContext);
-        if (!cell) return 2048; // Neutre
-        const total = cell[0] + cell[1];
-        return Math.floor(((cell[1] + 1) / (total + 2)) * 4096); // Laplace smoothing
+        const h = this._getHash(this.currentContext);
+        const c0 = this.data[h * 2];
+        const c1 = this.data[h * 2 + 1];
+        const total = c0 + c1;
+
+        if (total === 0) return 2048; // Neutre
+        return Math.floor(((c1 + 1) / (total + 2)) * 4096); // Laplace smoothing
     }
 
     /**
      * Retourne la probabilité exacte (sans perte) de voir un 1.
      */
     getConfidence() {
-        const cell = this.vault.get(this.currentContext);
-        if (!cell) return 0.5;
-        const total = cell[0] + cell[1];
-        return cell[1] / total;
+        const h = this._getHash(this.currentContext);
+        const c0 = this.data[h * 2];
+        const c1 = this.data[h * 2 + 1];
+        const total = c0 + c1;
+        if (total === 0) return 0.5;
+        return c1 / total;
     }
 
     /**
@@ -1192,13 +1206,31 @@ export class BitwiseRelationalMemory {
 
     reset(clearMemory = false) {
         this.currentContext = 0n;
-        if (clearMemory) this.vault.clear();
+        if (clearMemory) this.data.fill(0);
     }
 
     resetContext() { this.reset(false); }
 
     get memorySize() {
-        return this.vault.size;
+        let count = 0;
+        for (let i = 0; i < this.data.length; i += 2) {
+            if (this.data[i] > 0 || this.data[i + 1] > 0) count++;
+        }
+        return count;
+    }
+
+    /**
+     * Restaure l'état de la table de compteurs
+     */
+    importState(stateData) {
+        if (stateData) this.data.set(stateData);
+    }
+
+    /**
+     * Exporte les données pour la persistance JSON
+     */
+    exportState() {
+        return Array.from(this.data);
     }
 }
 
@@ -1220,7 +1252,7 @@ export class SemanticAttentionLayer {
      * Apprend la corrélation sémantique avec notion de distance (Attention Propagation).
      * Plus deux mots sont proches dans la phrase, plus leur lien est fort.
      */
-    correlate(ids) {
+    correlate(ids, weight = 1) {
         for (let i = 0; i < ids.length; i++) {
             for (let j = 0; j < ids.length; j++) {
                 if (i === j) continue;
@@ -1229,7 +1261,7 @@ export class SemanticAttentionLayer {
                 // Calcul de l'intensité de l'attention basé sur la proximité
                 // (Similaire au mécanisme de positional encoding simplifié)
                 const distance = Math.abs(i - j);
-                const attentionWeight = 1.0 / distance;
+                const attentionWeight = (1.0 / distance) * weight;
 
                 if (!this.correlationMatrix.has(a)) this.correlationMatrix.set(a, new Map());
                 const targets = this.correlationMatrix.get(a);
@@ -1412,43 +1444,70 @@ export class SemanticRelationalMemory {
     }
 
     /**
+     * Charge un état complet (Vocabulaire + BitEngine)
+     */
+    importState(state) {
+        if (!state.vocab || !state.bitEngine) throw new Error("Format de stockage invalide");
+        
+        this.vocabulary = new Map(state.vocab);
+        this.reverseVocab = new Map();
+        this.nextId = 1; 
+        for (let [word, id] of this.vocabulary) {
+            this.reverseVocab.set(id, word);
+            if (id >= this.nextId) this.nextId = id + 1;
+        }
+        if (state.bitEngine && state.bitEngine.data) {
+            this.bitEngine.importState(new Uint32Array(state.bitEngine.data));
+        }
+    }
+
+    /**
+     * Exporte l'intégralité du cerveau (Vocabulaire + Poids binaires)
+     */
+    exportState() {
+        return {
+            vocab: Array.from(this.vocabulary.entries()),
+            bitEngine: { data: this.bitEngine.exportState() }
+        };
+    }
+
+    /**
      * Transforme une phrase en unités de sens avant de les mémoriser
      * @param {string} sentence La phrase à apprendre
      * @param {boolean} resetContext Si vrai, oublie le contexte précédent (défaut: true)
+     * @param {number} weight Poids de l'apprentissage
      */
-    learnSense(sentence, resetContext = true) {
+    learnSense(sentence, resetContext = true, weight = 1) {
         const tokens = sentence.toLowerCase().match(this.tokenizer) || [];
         
         if (resetContext) this.bitEngine.resetContext();
         const ids = [];
         
-        this._ingestTokens(tokens, ids);
+        this._ingestTokens(tokens, ids, weight);
 
         // Automatisation : On corrèle tous les IDs de la phrase entre eux dans la matrice
-        if (this.attention) this.attention.correlate(ids);
+        if (this.attention) this.attention.correlate(ids, weight);
     }
 
     /**
      * Ingestre un texte long en le découpant par ponctuation.
      * @param {string} text Le corpus complet
      * @param {boolean} continuous Si vrai, lie la fin d'une phrase au début de la suivante
+     * @param {number} weight Poids de l'apprentissage
      */
-    learnText(text, continuous = false) {
+    learnText(text, continuous = false, weight = 1) {
         // Découpage par phrases (., !, ?)
-        const sentences = text.split(/(?<=[.!?])\s+/);
-        console.log(`[SemanticMemory] Ingestion de ${sentences.length} unités de sens...`);
+        const sentences = text.split(/(?<=[.!?])\s+|\n+/);
         
         sentences.forEach((s, index) => {
-            // Si continuous est vrai, on ne reset le contexte que pour la toute première phrase
+            const cleanS = s.trim();
+            if (!cleanS) return;
             const shouldReset = index === 0 || !continuous;
-            this.learnSense(s, shouldReset);
+            this.learnSense(cleanS, shouldReset, weight);
         });
-
-        // Consolidation post-ingestion : On fait émerger les liens indirects
-        if (this.attention) this.attention.propagateResonance();
     }
 
-    _ingestTokens(tokens, ids) {
+    _ingestTokens(tokens, ids, weight = 1) {
         for (const token of tokens) {
             let id = this.vocabulary.get(token);
             if (id === undefined) {
@@ -1459,7 +1518,7 @@ export class SemanticRelationalMemory {
             
             ids.push(id);
             // On injecte l'ID du token (l'unité de sens) dans le moteur de bits
-            this._updateId(id);
+            this._updateId(id, weight);
         }
     }
 
@@ -1585,10 +1644,10 @@ export class SemanticRelationalMemory {
         return result.join(' ');
     }
 
-    _updateId(id) {
+    _updateId(id, weight = 1) {
         // On décompose l'ID (le sens) en 12 bits pour le moteur
         for (let i = 11; i >= 0; i--) {
-            this.bitEngine.update((id >> i) & 1);
+            this.bitEngine.update((id >> i) & 1, weight);
         }
     }
 
