@@ -10,11 +10,14 @@ export async function scrapeRandomWikipediaContent() {
 
     console.log(`[Scraper] Connexion à : ${startUrl}`);
 
-    const cleanHtmlSource = (html) => {
+    const stripHtmlToText = (html) => {
         return html
-            .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, '') // Supprime le CSS
+            .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, '')   // Supprime le CSS
             .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, '') // Supprime le JS
-            .replace(/<noscript[^>]*>[\s\S]*?<\/noscript>/gi, '');
+            .replace(/<noscript[^>]*>[\s\S]*?<\/noscript>/gi, '')
+            .replace(/<[^>]+>/g, ' ')                        // Remplace TOUS les tags par des espaces (évite de coller les mots)
+            .replace(/&[a-z0-9#]+;/gi, ' ')                  // Supprime les entités HTML (&nbsp;, etc)
+            .replace(/\s+/g, ' ');                           // Normalise les espaces
     };
 
     const extractTitle = (html) => {
@@ -65,40 +68,20 @@ export async function scrapeRandomWikipediaContent() {
     try {
         const rawHtml = await fetchHtml(startUrl);
         const title = extractTitle(rawHtml);
-        // Pré-nettoyage des balises de données (CSS/JS)
-        const html = cleanHtmlSource(rawHtml);
 
-        // Localisation de la balise cible
-        const targetId = 'id="mw-content-text"';
-        const startIdx = html.indexOf(targetId);
+        // Localisation simplifiée du bloc de contenu
+        const marker = 'id="mw-content-text"';
+        const startIdx = rawHtml.indexOf(marker);
+        if (startIdx === -1) throw new Error("Zone de contenu non trouvée.");
 
-        if (startIdx === -1) {
-            throw new Error("La balise #mw-content-text n'a pas été trouvée dans le HTML.");
-        }
-
-        // On remonte à l'ouverture du <div
-        const divStartIdx = html.lastIndexOf('<div', startIdx);
+        let fragment = rawHtml.substring(startIdx);
         
-        // Extraction du bloc par comptage de balises pour gérer les imbrications
-        let content = "";
-        let depth = 0;
-        let i = divStartIdx;
+        // On coupe avant les catégories et le footer pour éviter le bruit
+        const endMarker = fragment.indexOf('id="catlinks"');
+        if (endMarker !== -1) fragment = fragment.substring(0, endMarker);
 
-        while (i < html.length) {
-            if (html.substring(i, i + 4) === '<div') {
-                depth++;
-                i += 4;
-            } else if (html.substring(i, i + 5) === '</div') {
-                depth--;
-                i += 5;
-                if (depth === 0) {
-                    content = html.substring(divStartIdx, i);
-                    break;
-                }
-            } else {
-                i++;
-            }
-        }
+        // Extraction du texte brut
+        const content = stripHtmlToText(fragment);
 
         console.log("=== Extraction Réussie ===");
         console.log(`Titre : ${title}`);
