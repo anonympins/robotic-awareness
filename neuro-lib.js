@@ -44,7 +44,7 @@ class BitwiseNode {
 }
 
 export class BitwiseRelationalMemory {
-    constructor(contextSize = 64, maxNodes = 1000000) {
+    constructor(contextSize = 64, maxNodes = 5000000) { // Augmentation à 5M pour plus de nuances
         this.contextSize = contextSize;
         this.maxNodes = maxNodes; // Sécurité anti-OOM
         this.root = new BitwiseNode();
@@ -53,12 +53,6 @@ export class BitwiseRelationalMemory {
     }
 
     update(bit) {
-        // OPTIMISATION : Auto-Pruning au lieu du Hard Reset
-        // Si on dépasse la limite, on déclenche un cycle de "nettoyage sémantique"
-        if (this.memorySize > this.maxNodes) {
-            this.autoPrune();
-        }
-
         let current = this.root;
         for (let i = 0; i < this.history.length; i++) {
             const hBit = this.history[i];
@@ -77,43 +71,6 @@ export class BitwiseRelationalMemory {
         if (this.history.length > this.contextSize) {
             this.history.shift();
         }
-    }
-
-    /**
-     * Parcours récursif pour appliquer un facteur de vieillissement (decay)
-     * et supprimer les relations qui ne sont plus statistiquement significatives.
-     */
-    autoPrune() {
-        const start = Date.now();
-        let nodesRemoved = 0;
-
-        const pruneRecursive = (node) => {
-            // 1. Vieillissement des poids (on réduit de moitié)
-            node.c0 = node.c0 >> 1;
-            node.c1 = node.c1 >> 1;
-
-            // 2. Nettoyage des branches
-            if (node.n0) {
-                pruneRecursive(node.n0);
-                // Si le nœud n'a plus de poids et plus d'enfants, on le coupe
-                if (node.n0.c0 === 0 && node.n0.c1 === 0 && !node.n0.n0 && !node.n0.n1) {
-                    node.n0 = null;
-                    nodesRemoved++;
-                }
-            }
-            if (node.n1) {
-                pruneRecursive(node.n1);
-                if (node.n1.c0 === 0 && node.n1.c1 === 0 && !node.n1.n0 && !node.n1.n1) {
-                    node.n1 = null;
-                    nodesRemoved++;
-                }
-            }
-        };
-
-        pruneRecursive(this.root);
-        this.memorySize -= nodesRemoved;
-        
-        console.log(`[PRUNING] Nettoyage : -${nodesRemoved} nœuds en ${Date.now() - start}ms. Nouvelle taille : ${this.memorySize}`);
     }
 
     predictBit() {
@@ -139,7 +96,7 @@ export class SemanticRelationalMemory {
         this.windowSize = windowSize;
         this.vocabulary = new Map();
         this.reverseVocab = [];
-        this.bitEngine = new BitwiseRelationalMemory(windowSize * 8, 2000000); // 2M de nœuds max
+        this.bitEngine = new BitwiseRelationalMemory(windowSize * 8, 5000000); // Cohérence avec le bitEngine
         this.attention = null;
     }
 

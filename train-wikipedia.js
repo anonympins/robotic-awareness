@@ -1,17 +1,21 @@
 import { SemanticRelationalMemory, SemanticAttentionLayer } from "./neuro-lib.js";
 import { scrapeRandomWikipediaContent } from "./wikipedia-scraper.js";
+import { RobertGrammarManager } from "./train-grammar.js";
 import fs from 'node:fs/promises';
 import path from 'node:path';
 
 const BACKUP_PATH = path.join(process.cwd(), 'semantic_brain_storage.json');
-const SLEEP_BETWEEN_PAGES = 8000; // 8 secondes pour respecter Wikipédia
+const SLEEP_INTERVAL = 5000; 
 
 async function runWikipediaTraining() {
-    console.log("\n[SYSTEM] === Démarrage du Service d'Apprentissage Continu ===");
+    console.log("\n[SYSTEM] === Démarrage de l'Ingestion Parallèle (Wiki + Robert) ===");
     
     const attention = new SemanticAttentionLayer();
-    const brain = new SemanticRelationalMemory(8); // Réduction de 16 à 8 pour stabiliser la RAM
+    const brain = new SemanticRelationalMemory(12); // 12 pour capturer la structure grammaticale
     brain.attachAttention(attention);
+
+    const grammarManager = new RobertGrammarManager();
+    await grammarManager.init();
 
     // Tentative de chargement du backup existant
     try {
@@ -30,31 +34,48 @@ async function runWikipediaTraining() {
             pagesProcessed++;
             console.log(`\n--- Cycle #${pagesProcessed} | Time: ${new Date().toLocaleTimeString()} ---`);
             
-            console.log("[1/4] Scraping Wikipédia...");
-            const { title, content: htmlContent } = await scrapeRandomWikipediaContent();
+            // --- REQUETES PARALLELES (I/O) ---
+            process.stdout.write("[NETWORK] Récupération simultanée... ");
+            const [wikiRes, robertRes] = await Promise.all([
+                scrapeRandomWikipediaContent().catch(() => null),
+                grammarManager.getNextBatch().catch(() => null)
+            ]);
+            console.log("OK.");
 
-            // OPTIMISATION FLUX : Une seule passe regex pour nettoyer les résidus HTML, titres et références
-            // On délègue la tokenisation fine à la librairie neuro-lib
-            const cleanContent = htmlContent
-                .replace(/<[^>]*>?|==.*?==|\[\d+\]/g, ' ')
-                .replace(/\s+/g, ' ')
-                .trim();
+            // --- INGESTION WIKIPEDIA ---
+            if (wikiRes) {
+                const cleanWiki = wikiRes.content
+                    .replace(/<[^>]*>?|==.*?==|\[\d+\]/g, ' ')
+                    .replace(/\s+/g, ' ')
+                    .trim();
+                
+                process.stdout.write(`   [INGESTION] Wiki: "${wikiRes.title}"... `);
+                const start = Date.now();
+                brain.learnText(cleanWiki);
+                console.log(`${Date.now() - start}ms`);
+            }
 
-            console.log(`[2/4] Ingestion : "${title}" (${cleanContent.length} chars)`);
-            
-            const start = Date.now();
-            brain.learnText(cleanContent); 
-            const duration = Date.now() - start;
+            // --- INGESTION ROBERT (GRAMMAIRE) ---
+            if (robertRes) {
+                process.stdout.write(`   [INGESTION] Robert: "${robertRes.path}"... `);
+                const start = Date.now();
+                brain.learnText(robertRes.content);
+                console.log(`${Date.now() - start}ms`);
+            } else {
+                console.log("   [INFO] Robert : File d'attente vide ou fin du guide atteinte.");
+            }
 
             // OPTIMISATION MATH : Sauvegarde asynchrone et moins fréquente pour ne pas bloquer l'ingestion
             if (pagesProcessed % 5 === 0) {
-                console.log("[3/4] Persistence sur disque...");
+                process.stdout.write("[STORAGE] Persistence sur disque... ");
                 const brainState = brain.exportState();
                 await fs.writeFile(BACKUP_PATH, JSON.stringify(brainState));
+                await grammarManager.saveState();
+                console.log("OK.");
             }
 
             // Statistiques de santé du réseau
-            console.log(`[4/4] Bilan : ${duration}ms | Vocab: ${brain.vocabulary.size} | Mémoire: ${brain.bitEngine.memorySize} relations.`);
+            console.log(`[BILAN] Vocab: ${brain.vocabulary.size} | Mémoire: ${brain.bitEngine.memorySize} relations.`);
 
             // Petit test de santé aléatoire sur le savoir acquis
             if (pagesProcessed % 5 === 0) {
@@ -72,7 +93,7 @@ async function runWikipediaTraining() {
             continue;
         }
 
-        await new Promise(r => setTimeout(r, SLEEP_BETWEEN_PAGES));
+        await new Promise(r => setTimeout(r, SLEEP_INTERVAL));
     }
 }
 
