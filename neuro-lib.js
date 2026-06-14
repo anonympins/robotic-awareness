@@ -1563,6 +1563,14 @@ export class SemanticRelationalMemory {
             const technicalWords = tokens.filter(t => /[0-9]/.test(t) && /[a-z]/i.test(t)).length;
             if (technicalWords / tokens.length > 0.2) return;
 
+            // Heuristique 3 : Détection de "miettes" (trop de mots très courts < 3 chars, typique des URLs/breadcrumbs)
+            const shortWords = tokens.filter(t => t.length < 3 && /[a-z0-9]/.test(t)).length;
+            if (shortWords / tokens.length > 0.4) return;
+
+            // Heuristique 4 : Détection d'IDs numériques (Gros nombres isolés ou dates techniques)
+            const numericIds = tokens.filter(t => /^\d{3,}$/.test(t)).length;
+            if (numericIds / tokens.length > 0.15) return; 
+
             const shouldReset = index === 0 || !continuous;
             this.learnSense(cleanS, shouldReset, weight);
         });
@@ -1747,12 +1755,12 @@ export class SemanticRelationalMemory {
 
                 // 4. Filtre de bruit sémantique (Heuristique)
                 // On pénalise les balises HTML communes et les identifiants techniques (mixte lettres/chiffres)
-                if (['div', 'span', 'class', 'id', 'href', 'width', 'height', 'style', 'mw', 'parser', 'output'].includes(word)) score *= 0.0001;
+                if (['div', 'span', 'class', 'id', 'href', 'width', 'height', 'style', 'mw', 'parser', 'output', 'ch', 'sc', 'sc2', 'sc3', 'en', 'http', 'www', 'oldid', 'news', 'title', 'index', 'php'].includes(word)) score *= 0.000001;
                 if (word.length > 20) score *= 0.1; // Mots anormalement longs
                 
-                // Si le mot contient des chiffres ET des lettres, ou trop de chiffres (bruit technique)
-                if (/[a-z]/.test(word) && /[0-9]/.test(word)) score *= 0.0001;
-                if (/^\d+$/.test(word) && word.length > 3) score *= 0.01;
+                // --- FILTRE ANTI-NOMBRE STRICT ---
+                // On pénalise drastiquement tout ce qui ressemble à un nombre ou un ID technique
+                if (/[0-9]/.test(word)) score *= 0.0000001; 
 
                 // PÉNALITÉ DE RÉPÉTITION (Dynamique)
                 const count = wordCounts.get(word) || 0;
