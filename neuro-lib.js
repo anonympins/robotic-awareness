@@ -31,60 +31,76 @@ export class SemanticAttentionLayer {
     }
 }
 
-/**
- * OPTIMISATION 3 : Mémoire Bitwise (Direct References)
- * Version allégée pour limiter la pression sur le Garbage Collector.
- */
-class BitwiseNode {
-    constructor() {
-        // Utilisation de propriétés directes au lieu de tableaux pour réduire l'allocation d'objets
-        this.c0 = 0; this.c1 = 0; 
-        this.n0 = null; this.n1 = null;
-    }
-}
-
 export class BitwiseRelationalMemory {
-    constructor(contextSize = 64, maxNodes = 5000000) { // Augmentation à 5M pour plus de nuances
+    constructor(contextSize = 64, maxNodes = 5000000) {
         this.contextSize = contextSize;
-        this.maxNodes = maxNodes; // Sécurité anti-OOM
-        this.root = new BitwiseNode();
-        this.history = []; // Sliding window of bits
-        this.memorySize = 0;
+        this.maxNodes = maxNodes;
+        // Chaque nœud possède 4 slots : [count0, count1, ptr0, ptr1]
+        this.nodes = new Uint32Array(maxNodes * 4);
+        this.nodesUsed = 1; // Le nœud racine est à l'index 0
+        this.history = [];
+    }
+
+    get memorySize() {
+        return this.nodesUsed;
     }
 
     update(bit) {
-        let current = this.root;
+        let currentIdx = 0;
         for (let i = 0; i < this.history.length; i++) {
             const hBit = this.history[i];
-            if (hBit === 0) {
-                if (!current.n0) { current.n0 = new BitwiseNode(); this.memorySize++; }
-                current = current.n0;
-            } else {
-                if (!current.n1) { current.n1 = new BitwiseNode(); this.memorySize++; }
-                current = current.n1;
+            const ptrOffset = hBit === 0 ? 2 : 3;
+            let nextIdx = this.nodes[currentIdx * 4 + ptrOffset];
+
+            if (nextIdx === 0) {
+                if (this.nodesUsed >= this.maxNodes) return;
+                nextIdx = this.nodesUsed++;
+                this.nodes[currentIdx * 4 + ptrOffset] = nextIdx;
             }
+            currentIdx = nextIdx;
         }
 
-        if (bit === 0) current.c0++; else current.c1++;
+        // Mise à jour du compteur au nœud terminal du contexte
+        if (bit === 0) this.nodes[currentIdx * 4 + 0]++;
+        else this.nodes[currentIdx * 4 + 1]++;
         
         this.history.push(bit);
-        if (this.history.length > this.contextSize) {
-            this.history.shift();
-        }
+        if (this.history.length > this.contextSize) this.history.shift();
     }
 
     predictBit() {
-        let current = this.root;
+        let currentIdx = 0;
         for (let i = 0; i < this.history.length; i++) {
             const hBit = this.history[i];
-            const next = hBit === 0 ? current.n0 : current.n1;
-            if (!next) return Math.random() > 0.5 ? 1 : 0;
-            current = next;
+            const ptrOffset = hBit === 0 ? 2 : 3;
+            const nextIdx = this.nodes[currentIdx * 4 + ptrOffset];
+            if (nextIdx === 0) return Math.random() > 0.5 ? 1 : 0;
+            currentIdx = nextIdx;
         }
-        return current.c1 >= current.c0 ? 1 : 0;
+        
+        const c0 = this.nodes[currentIdx * 4 + 0];
+        const c1 = this.nodes[currentIdx * 4 + 1];
+        if (c0 === 0 && c1 === 0) return Math.random() > 0.5 ? 1 : 0;
+        return c1 >= c0 ? 1 : 0;
     }
 
     resetContext() { this.history = []; }
+
+    exportState() {
+        // On ne transfère que la partie utilisée du TypedArray pour l'export JSON
+        return {
+            nodesUsed: this.nodesUsed,
+            data: Array.from(this.nodes.slice(0, this.nodesUsed * 4))
+        };
+    }
+
+    importState(state) {
+        this.nodesUsed = state.nodesUsed;
+        const incoming = state.data;
+        for (let i = 0; i < incoming.length; i++) {
+            this.nodes[i] = incoming[i];
+        }
+    }
 }
 
 /**
@@ -147,11 +163,15 @@ export class SemanticRelationalMemory {
     }
 
     exportState() {
-        return { vocab: Array.from(this.vocabulary.entries()) };
+        return { 
+            vocab: Array.from(this.vocabulary.entries()),
+            bitEngine: this.bitEngine.exportState()
+        };
     }
 
     importState(state) {
         this.vocabulary = new Map(state.vocab);
         state.vocab.forEach(([word, id]) => this.reverseVocab[id] = word);
+        if (state.bitEngine) this.bitEngine.importState(state.bitEngine);
     }
 }
