@@ -1114,6 +1114,16 @@ export class BitwiseRelationalMemory {
         const h = this._getHash(this.currentContext);
         this.data[h * 2 + (bit & 1)] += weight;
 
+        // --- ANTI-ÉCRASEMENT : Normalisation locale ---
+        // Si le total des observations pour ce bit atteint un plafond (ex: 255)
+        // on divise par 2. Cela préserve le RATIO (la structure) mais empêche
+        // la dilution statistique par de nouvelles données massives.
+        const total = this.data[h * 2] + this.data[h * 2 + 1];
+        if (total > 255) {
+            this.data[h * 2] >>= 1;
+            this.data[h * 2 + 1] >>= 1;
+        }
+
         // Mise à jour du "Bit Mémoriel" glissant
         this.currentContext = ((this.currentContext << 1n) | BigInt(bit & 1)) & this.mask;
     }
@@ -1252,14 +1262,17 @@ export class SemanticAttentionLayer {
      * Apprend la corrélation sémantique avec notion de distance (Attention Propagation).
      * Plus deux mots sont proches dans la phrase, plus leur lien est fort.
      */
-    correlate(ids, weight = 1) {
+    correlate(ids, weight = 1, maxWindow = 15) {
+        // Sécurité : Si la phrase est anormalement longue, on évite le O(N^2) total
         for (let i = 0; i < ids.length; i++) {
-            for (let j = 0; j < ids.length; j++) {
+            // Fenêtre glissante limitée : la corrélation sémantique au-delà de 15 mots est souvent du bruit
+            const start = Math.max(0, i - maxWindow);
+            const end = Math.min(ids.length, i + maxWindow);
+            
+            for (let j = start; j < end; j++) {
                 if (i === j) continue;
                 const a = ids[i], b = ids[j];
                 
-                // Calcul de l'intensité de l'attention basé sur la proximité
-                // (Similaire au mécanisme de positional encoding simplifié)
                 const distance = Math.abs(i - j);
                 const attentionWeight = (1.0 / distance) * weight;
 
@@ -1278,19 +1291,31 @@ export class SemanticAttentionLayer {
      * Si A est lié à B et B est lié à C, alors un lien A -> C est créé/renforcé.
      * Permet l'émergence de relations non explicitement citées.
      * @param {number} factor Amortissement de la propagation (0.0 à 1.0)
+     * @param {number} minThreshold Seuil minimum pour créer un lien
      */
-    propagateResonance(factor = 0.2) {
+    propagateResonance(factor = 0.1, minThreshold = 0.2) {
         const newLinks = new Map();
 
+        // On ne travaille que sur les liens déjà existants
         for (const [idA, targetsA] of this.correlationMatrix) {
+            // OPTIMISATION : On ignore les "Hubs" (mots de liaison comme "le", "de", "et") 
+            // qui saturent le graphe sans apporter de sens unique.
+            if (targetsA.size > 80) continue; 
+
             for (const [idB, energyAB] of targetsA) {
+                if (energyAB < minThreshold) continue;
+
                 const targetsB = this.correlationMatrix.get(idB);
-                if (!targetsB) continue;
+                if (!targetsB || targetsB.size > 80) continue;
 
                 for (const [idC, energyBC] of targetsB) {
-                    if (idA === idC) continue; // Pas d'auto-boucle
+                    if (idA === idC || energyBC < minThreshold) continue;
 
                     const indirectEnergy = energyAB * energyBC * factor;
+                    
+                    // On ne retient que l'énergie significative
+                    if (indirectEnergy < minThreshold) continue;
+
                     if (!newLinks.has(idA)) newLinks.set(idA, new Map());
                     const potentialLinks = newLinks.get(idA);
                     potentialLinks.set(idC, (potentialLinks.get(idC) || 0) + indirectEnergy);
@@ -1305,6 +1330,21 @@ export class SemanticAttentionLayer {
             for (const [idC, energy] of links) {
                 targets.set(idC, (targets.get(idC) || 0) + energy);
             }
+        }
+        
+        // Nettoyage périodique pour éviter la saturation mémoire
+        this.pruneMatrix(minThreshold);
+    }
+
+    /**
+     * Supprime les liens faibles pour garder le graphe léger et réactif
+     */
+    pruneMatrix(minThreshold = 0.1) {
+        for (const [idA, targets] of this.correlationMatrix) {
+            for (const [idB, energy] of targets) {
+                if (energy < minThreshold) targets.delete(idB);
+            }
+            if (targets.size === 0) this.correlationMatrix.delete(idA);
         }
     }
 
@@ -1435,6 +1475,8 @@ export class SemanticRelationalMemory {
         this.reverseVocab = new Map(); // ID binaire -> Mot
         this.nextId = 1;
         this.attention = null;
+        // Nouvelle couche : Schémas de transition (Grammaire) - Stocke des trigrammes (A, B) -> C
+        this.grammarMap = new Map(); // ID -> Map(SuivantID -> Poids)
         // Regex centralisée supportant les accents et l'élision
         this.tokenizer = /[a-z0-9àâäéèêëïîôöùûüç]+(?:['][a-z0-9àâäéèêëïîôöùûüç]*)?|[^\w\s]/g;
     }
@@ -1448,7 +1490,7 @@ export class SemanticRelationalMemory {
      */
     importState(state) {
         if (!state.vocab || !state.bitEngine) throw new Error("Format de stockage invalide");
-        
+        this.grammarMap = new Map(); // Reset ou charger si présent
         this.vocabulary = new Map(state.vocab);
         this.reverseVocab = new Map();
         this.nextId = 1; 
@@ -1456,6 +1498,13 @@ export class SemanticRelationalMemory {
             this.reverseVocab.set(id, word);
             if (id >= this.nextId) this.nextId = id + 1;
         }
+
+        if (state.grammar) {
+            for (const [id, targets] of state.grammar) {
+                this.grammarMap.set(id, new Map(targets));
+            }
+        }
+
         if (state.bitEngine && state.bitEngine.data) {
             this.bitEngine.importState(new Uint32Array(state.bitEngine.data));
         }
@@ -1467,7 +1516,8 @@ export class SemanticRelationalMemory {
     exportState() {
         return {
             vocab: Array.from(this.vocabulary.entries()),
-            bitEngine: { data: this.bitEngine.exportState() }
+            bitEngine: { data: this.bitEngine.exportState() },
+            grammar: Array.from(this.grammarMap.entries()).map(([id, targets]) => [id, Array.from(targets.entries())])
         };
     }
 
@@ -1491,9 +1541,7 @@ export class SemanticRelationalMemory {
 
     /**
      * Ingestre un texte long en le découpant par ponctuation.
-     * @param {string} text Le corpus complet
-     * @param {boolean} continuous Si vrai, lie la fin d'une phrase au début de la suivante
-     * @param {number} weight Poids de l'apprentissage
+     * NETTOYAGE DE L'ENTRAÎNEMENT : Filtre les listes de noms et métadonnées.
      */
     learnText(text, continuous = false, weight = 1) {
         // Découpage par phrases (., !, ?)
@@ -1501,13 +1549,28 @@ export class SemanticRelationalMemory {
         
         sentences.forEach((s, index) => {
             const cleanS = s.trim();
-            if (!cleanS) return;
+            if (!cleanS || cleanS.length < 5) return;
+
+            // --- FILTRAGE DE BRUIT ---
+            const tokens = cleanS.match(this.tokenizer) || [];
+            if (tokens.length < 3) return; 
+
+            // Heuristique 1 : Détection de listes (Trop de virgules par rapport au nombre de mots)
+            const commaCount = (cleanS.match(/,/g) || []).length;
+            if (commaCount / tokens.length > 0.35) return; 
+
+            // Heuristique 2 : Détection de métadonnées/bruit technique (mots mixant chiffres et lettres)
+            const technicalWords = tokens.filter(t => /[0-9]/.test(t) && /[a-z]/i.test(t)).length;
+            if (technicalWords / tokens.length > 0.2) return;
+
             const shouldReset = index === 0 || !continuous;
             this.learnSense(cleanS, shouldReset, weight);
         });
     }
 
     _ingestTokens(tokens, ids, weight = 1) {
+        let prevPrevId = null; // Pour les trigrammes
+        let prevId = null;     // Pour les trigrammes
         for (const token of tokens) {
             let id = this.vocabulary.get(token);
             if (id === undefined) {
@@ -1517,9 +1580,48 @@ export class SemanticRelationalMemory {
             }
             
             ids.push(id);
+
+            // 1. Enregistrement Bigramme (A -> B)
+            if (prevId !== null) {
+                if (!this.grammarMap.has(prevId)) this.grammarMap.set(prevId, new Map());
+                const bigramTransitions = this.grammarMap.get(prevId);
+                bigramTransitions.set(id, (bigramTransitions.get(id) || 0) + weight);
+
+                // Normalisation Bigramme
+                if (bigramTransitions.size > 50) { 
+                    this._normalizeGrammarMap(bigramTransitions);
+                }
+
+                // 2. Enregistrement Trigramme (A + B -> C)
+                if (prevPrevId !== null) {
+                    const contextKey = `${prevPrevId}-${prevId}`;
+                    if (!this.grammarMap.has(contextKey)) this.grammarMap.set(contextKey, new Map());
+                    const trigramTransitions = this.grammarMap.get(contextKey);
+                    trigramTransitions.set(id, (trigramTransitions.get(id) || 0) + weight);
+
+                    // Normalisation Trigramme
+                    if (trigramTransitions.size > 20) {
+                        this._normalizeGrammarMap(trigramTransitions);
+                    }
+                }
+            }
+
             // On injecte l'ID du token (l'unité de sens) dans le moteur de bits
+            prevPrevId = prevId; // Décale les IDs pour la prochaine itération
             this._updateId(id, weight);
+            prevId = id;         // Le mot actuel devient le mot précédent
         }
+    }
+
+    /**
+     * Empêche une structure de devenir statistiquement insignifiante
+     * en plafonnant la somme des poids d'un contexte.
+     */
+    _normalizeGrammarMap(map) {
+        let total = 0;
+        for (let v of map.values()) total += v;
+        if (total < 100) return;
+        for (let [k, v] of map) map.set(k, Math.max(1, Math.floor(v * 0.5)));
     }
 
     /**
@@ -1547,8 +1649,8 @@ export class SemanticRelationalMemory {
             const id = this.vocabulary.get(token) || 0;
             if (id > 0) {
                 activeIds.push(id);
-                // On limite la fenêtre d'attention aux 4 derniers mots pour garder la structure
-                if (activeIds.length > 4) activeIds.shift();
+                // On limite la fenêtre d'attention aux 2 derniers mots pour le contexte trigramme
+                if (activeIds.length > 2) activeIds.shift();
             }
             this._shiftId(id);
         }
@@ -1557,21 +1659,78 @@ export class SemanticRelationalMemory {
         let result = [];
         const wordCounts = new Map();
         const creativity = (options.creativity !== undefined) ? options.creativity : 0.01; 
-        const topK = options.topK || 4;
+        const topK = options.topK || 5;
+
+        let lastId = activeIds[activeIds.length - 1] || null;
 
         for (let i = 0; i < depth; i++) {
             const candidates = [];
 
+            // Étape 1 : Analyse globale du contexte pour le Back-off
+            let trigramContext = null;
+            if (activeIds.length >= 2) {
+                const trigramKey = `${activeIds[activeIds.length - 2]}-${activeIds[activeIds.length - 1]}`;
+                trigramContext = this.grammarMap.get(trigramKey);
+            }
+            const bigramKey = activeIds[activeIds.length - 1];
+            const bigramContext = this.grammarMap.get(bigramKey);
+
+            const hasTrigramOptions = trigramContext && trigramContext.size > 0;
+            const hasBigramOptions = bigramContext && bigramContext.size > 0;
+            
+            // Itère sur tous les mots du vocabulaire pour trouver les candidats
             for (let [word, id] of this.vocabulary) {
+                // Ignore l'ID 0 (souvent <PAD> ou <UNK>)
                 if (id === 0) continue;
                 
-                // 1. Probabilité de Transition (Grammaire)
-                const transitionProb = this.bitEngine.scoreId(id);
-                if (creativity < 0.1 && transitionProb < 0.0001) continue; // Filtre strict pour le déterminisme
+                // 1. Probabilité de Transition Bitwise (Mémoire Verbatim)
+                // CORRECTIF : Normalisation Géométrique.
+                // scoreId est un produit de 12 probabilités (une par bit).
+                // Pour rester sur une échelle 0.0 - 1.0 comparable à la grammaire, 
+                // on extrait la racine 12ème. Sans cela, 0.9^12 = 0.28 (trop faible).
+                const rawProb = this.bitEngine.scoreId(id);
+                const transitionProb = Math.pow(rawProb, 1/12);
+
+                // 2. Score de Schéma (BACK-OFF HIÉRARCHIQUE : Tri > Bi > Raw)
+                let grammarWeight = 0;
+                let totalStructuralWeight = 1;
+                let trigramHit = false;
+                let bigramHit = false;
+
+                // Tentative Trigramme (Priorité absolue)
+                if (hasTrigramOptions && trigramContext.has(id)) {
+                    grammarWeight = trigramContext.get(id) * 50.0; // Boost Trigramme massif
+                    totalStructuralWeight = Array.from(trigramContext.values()).reduce((a,b)=>a+b, 0);
+                    trigramHit = true;
+                }
+
+                // Fallback Bigramme (Si pas de hit Trigramme)
+                if (!trigramHit && hasBigramOptions && bigramContext.has(id)) {
+                    grammarWeight = bigramContext.get(id) * 5.0;
+                    totalStructuralWeight = Array.from(bigramContext.values()).reduce((a,b)=>a+b, 0);
+                    bigramHit = true;
+                }
+
+                let grammarScore = grammarWeight / (totalStructuralWeight || 1);
+
+                // --- LOGIQUE MSB (Most Significant Bit) : FILTRE DE COHÉRENCE ---
+                let structuralPenalty = 1.0;
+                // Si une structure est connue (Trigramme ou Bigramme), tout candidat hors-structure est éliminé
+                if (!trigramHit && hasTrigramOptions) structuralPenalty *= 0.000001; 
+                if (!trigramHit && !bigramHit && hasBigramOptions) structuralPenalty *= 0.00001;
                 
-                // 2. Score de Contexte (Attention & Identité)
+                // Si aucun lien structurel du tout et faible probabilité bit à bit
+                if (!trigramHit && !bigramHit && transitionProb < 0.6) structuralPenalty *= 0.0000001;
+
+                // 2.5 Logique de Restitution Verbatim (Ancrage)
+                const isVerbatim = transitionProb > 0.92;
+                const verbatimBoost = isVerbatim ? 100.0 : 1.0; // Boost Verbatim augmenté
+                
+                // 3. Score de Contexte (Attention & Identité)
                 let contextBoost = 1.0;
-                if (attLayer && (activeIds.length > 0 || identityIds.length > 0 || queryIds.length > 0)) {
+                // L'attention est moins prioritaire en mode Verbatim pour éviter la déviation
+                const effectiveAttention = (isVerbatim && creativity < 0.05) ? 0.2 : 1.0;
+                if (attLayer && effectiveAttention > 0 && (activeIds.length > 0 || identityIds.length > 0 || queryIds.length > 0)) {
                     const { bias, totalWeight } = attLayer.getBitBias(activeIds, identityIds, queryIds);
                     if (totalWeight > 0) {
                         let bitMatch = 0;
@@ -1579,18 +1738,29 @@ export class SemanticRelationalMemory {
                             bitMatch += ((id >> b) & 1) ? bias[b] : -bias[b];
                         }
                         // Courbe de boost plus raide (0.2) et plage élargie (-4 à 6)
-                        contextBoost = Math.exp(Math.max(-4.0, Math.min(6.0, bitMatch / (totalWeight * 0.2))));
+                        contextBoost = Math.exp(Math.max(-4.0, Math.min(6.0, (bitMatch / (totalWeight * 0.2)) * effectiveAttention)));
                     }
                 }
 
-                // On augmente drastiquement l'influence de la probabilité de transition
-                let score = Math.pow(transitionProb, 4.0) * contextBoost; 
+                // Fusion des scores : Grammaire (Schéma) + Bitwise (Précision) + Attention
+                let score = (grammarScore + transitionProb * 4.0) * contextBoost * verbatimBoost * structuralPenalty;
+
+                // 4. Filtre de bruit sémantique (Heuristique)
+                // On pénalise les balises HTML communes et les identifiants techniques (mixte lettres/chiffres)
+                if (['div', 'span', 'class', 'id', 'href', 'width', 'height', 'style', 'mw', 'parser', 'output'].includes(word)) score *= 0.0001;
+                if (word.length > 20) score *= 0.1; // Mots anormalement longs
+                
+                // Si le mot contient des chiffres ET des lettres, ou trop de chiffres (bruit technique)
+                if (/[a-z]/.test(word) && /[0-9]/.test(word)) score *= 0.0001;
+                if (/^\d+$/.test(word) && word.length > 3) score *= 0.01;
 
                 // PÉNALITÉ DE RÉPÉTITION (Dynamique)
                 const count = wordCounts.get(word) || 0;
                 if (count > 0) score *= Math.pow(0.001, count);
                 
+                // Anti-bégaiement immédiat
                 if (word.length <= 3 && result.slice(-3).includes(word)) score *= 0.01;
+                if (result.length > 0 && result[result.length - 1] === word) score *= 0.0001;
 
                 candidates.push({ id, word, score });
             }
@@ -1632,11 +1802,12 @@ export class SemanticRelationalMemory {
 
             const word = selected.word;
             result.push(word);
+            lastId = selected.id;
             wordCounts.set(word, (wordCounts.get(word) || 0) + 1);
             
             // Propagation de l'attention : On ajoute le mot généré au contexte actif
             activeIds.push(selected.id);
-            if (activeIds.length > 4) activeIds.shift();
+            if (activeIds.length > 2) activeIds.shift(); // Maintient la fenêtre de 2 IDs pour le trigramme
 
             this._shiftId(selected.id);
             if (['.', '!', '?'].includes(word)) break;
