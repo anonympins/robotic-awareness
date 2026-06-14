@@ -458,13 +458,6 @@ semanticBrain.learnSense("Je suis un explorateur .");
 
 console.log("\n--- Test de Corrélation Bit à Bit ---");
 
-// Amorce : "Je suis un protecteur"
-// Le réseau a corrélé "protecteur" avec "gardien" et "vigilant" au niveau des bits de leurs IDs.
-const prompt1 = "Je suis un protecteur";
-const res1 = semanticBrain.predictSense(prompt1, 5, { attention });
-console.log(`Prompt: "${prompt1}" -> Réponse: "${res1}"`); 
-// Résultat attendu : "... gardien vigilant"
-
 function testPersona(role) {
     const prompt = "Je suis";
     // On augmente la créativité pour permettre au réseau de sortir des sentiers battus
