@@ -2,7 +2,7 @@
 // ============================================================
 // EXEMPLE D'UTILISATION : CHIFFREMENT NEURONAL AUTHENTIFIÉ
 // ============================================================
-import {BitwiseNeuralCipher, BitwiseWordLearner, BitwiseLosslessCompressor} from "./neuro-lib.js";
+import {BitwiseNeuralCipher, BitwiseWordLearner, BitwiseLosslessCompressor, BitwiseRelationalMemory} from "./neuro-lib.js";
 
 function _runCipherBenchmark() {
     console.log("\n=== BENCHMARK: BitwiseNeuralCipher Performance ===");
@@ -199,7 +199,7 @@ console.log(`Efficacité moyenne : ${((totalCompressed / totalOriginal) * 100).t
 console.log("\n=== Test de Restitution (Mémoire Bit à Bit) ===");
 
 // Augmentation du contexte à 48 bits (6 octets) pour éviter les collisions entre phrases
-const sharedCompressor = new BitwiseLosslessCompressor(48);
+const sharedCompressor = new BitwiseLosslessCompressor(48, true);
 
 const baseTextes = [
     "Le robot analyse son environnement.",
@@ -235,11 +235,11 @@ function runMassiveRestitutionBenchmark(iterations = 200) {
     console.log(`\n=== BENCHMARK: Restitution Massive (${iterations} occurrences) ===`);
     
     /**
-     * Passage à 512 bits (64 octets).
-     * Cela couvre l'intégralité de la phrase (ID + Données),
-     * éliminant toute collision contextuelle.
+     * On utilise BitwiseRelationalMemory (true) pour le benchmark massif.
+     * On augmente le contexte à 256 bits (32 octets) pour que l'ID unique
+     * reste dans la "mémoire de travail" pendant la génération du tail.
      */
-    const benchmarkCompressor = new BitwiseLosslessCompressor(512);
+    const benchmarkCompressor = new BitwiseLosslessCompressor(256, true); 
     const decoder = new TextDecoder();
     const encoder = new TextEncoder();
 
@@ -269,6 +269,7 @@ function runMassiveRestitutionBenchmark(iterations = 200) {
 
     // 2. Phase de restitution (Validation Verbatim)
     let successCount = 0;
+    let failCount = 0;
     const startEval = process.hrtime.bigint();
 
     testData.forEach(original => {
@@ -280,7 +281,20 @@ function runMassiveRestitutionBenchmark(iterations = 200) {
         const generatedRaw = benchmarkCompressor.complete(seed, expectedTail.length, false);
         const generatedTail = decoder.decode(generatedRaw);
 
-        if (generatedTail === expectedTail) successCount++;
+        if (generatedTail === expectedTail) {
+            successCount++;
+        } else {
+            if (failCount < 10) {
+                console.log(`\n[ÉCHEC #${failCount + 1}]`);
+                console.log(`  Original   : "${original}"`);
+                console.log(`  Attendu    : "${expectedTail}"`);
+                console.log(`  Obtenu     : "${generatedTail}"`);
+                if (generatedTail.length < expectedTail.length) {
+                    console.log(`  Diagnostic : Arrêt prématuré (${generatedTail.length}/${expectedTail.length} chars)`);
+                }
+            }
+            failCount++;
+        }
     });
 
     const endEval = process.hrtime.bigint();
@@ -288,8 +302,55 @@ function runMassiveRestitutionBenchmark(iterations = 200) {
     console.log(`Temps Entraînement : ${Number(endTrain - startTrain) / 1_000_000} ms`);
     console.log(`Temps Restitution   : ${Number(endEval - startEval) / 1_000_000} ms`);
     console.log(`Taux de Succès      : ${((successCount / iterations) * 100).toFixed(2)}% (${successCount}/${iterations})`);
-    console.log(`Taille du "Cerveau" : ${benchmarkCompressor.predictor.counts.size} contextes uniques enregistrés`);
+    console.log(`Mémoire Utilisée    : ${benchmarkCompressor.predictor.memorySize} relations (Zéro Oubli)`);
 }
 
 // Exécution du benchmark avec 500 occurrences pour tester les limites
 runMassiveRestitutionBenchmark(500);
+
+// ============================================================
+// TEST : MÉMOIRE RELATIONNELLE SANS OUBLI CATASTROPHIQUE
+// ============================================================
+
+console.log("\n=== Test BitwiseRelationalMemory (Zero Forgetting) ===");
+
+const ltm = new BitwiseRelationalMemory(128); // Contexte de 24 bits
+const encoder = new TextEncoder();
+
+const complexPatterns = [
+    "PATTERN-A: Le robot doit survivre.",
+    "PATTERN-B: La loi zero est prioritaire.",
+    "PATTERN-C: Analyse des flux binaires en cours."
+];
+
+// 1. Entraînement massif (plusieurs fois le même pafttern pour ancrer)
+console.log("Mémorisation des relations...");
+complexPatterns.forEach(p => ltm.train(encoder.encode(p)));
+
+// 2. Vérification de la non-volatilité
+console.log(`Taille de la mémoire : ${ltm.memorySize} relations uniques.`);
+
+const testRestitution = (seed) => {
+    ltm.resetContext();
+    // On injecte le seed
+    const seedBytes = encoder.encode(seed);
+    for (let byte of seedBytes) {
+        for (let i = 7; i >= 0; i--) ltm.update((byte >> i) & 1);
+    }
+
+    // On génère la suite
+    let output = "";
+    for (let i = 0; i < 30; i++) {
+        let charCode = 0;
+        for (let b = 7; b >= 0; b--) {
+            const bit = ltm.predictBit();
+            charCode |= (bit << b);
+            ltm.update(bit);
+        }
+        output += String.fromCharCode(charCode);
+    }
+    return output;
+};
+
+console.log(`Seed: "PATTERN-B" -> Suite: "${testRestitution("PATTERN-B")}"`);
+console.log(`Seed: "PATTERN-A" -> Suite: "${testRestitution("PATTERN-A")}"`);
