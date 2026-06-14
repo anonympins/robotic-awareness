@@ -2,7 +2,7 @@
 // ============================================================
 // EXEMPLE D'UTILISATION : CHIFFREMENT NEURONAL AUTHENTIFIÉ
 // ============================================================
-import {BitwiseNeuralCipher, BitwiseWordLearner, BitwiseLosslessCompressor, BitwiseRelationalMemory} from "./neuro-lib.js";
+import {BitwiseNeuralCipher, BitwiseWordLearner, BitwiseLosslessCompressor, BitwiseRelationalMemory, SemanticRelationalMemory} from "./neuro-lib.js";
 
 function _runCipherBenchmark() {
     console.log("\n=== BENCHMARK: BitwiseNeuralCipher Performance ===");
@@ -354,3 +354,85 @@ const testRestitution = (seed) => {
 
 console.log(`Seed: "PATTERN-B" -> Suite: "${testRestitution("PATTERN-B")}"`);
 console.log(`Seed: "PATTERN-A" -> Suite: "${testRestitution("PATTERN-A")}"`);
+
+// ============================================================
+// TEST : MÉMOIRE RELATIONNELLE SÉMANTIQUE (HIERARCHIQUE)
+// ============================================================
+
+console.log("\n=== Test SemanticRelationalMemory (Concepts & Unités de Sens) ===");
+
+/**
+ * Ici, le contexte de 16 ne représente plus 16 bits, mais 16 TOKENS (mots).
+ * Cela permet une compréhension hiérarchique sur de très longues distances.
+ */
+const semanticBrain = new SemanticRelationalMemory(16);
+
+const semanticCorpus = [
+    "Robot : Analyse du terrain terminée. Risque de collision faible.",
+    "Robot : Batterie critique. Retour à la base de recharge immédiat.",
+    "Robot : Analyse du terrain en cours. Détection d'un obstacle inconnu.",
+    "Humain : Quel est ton statut actuel ?",
+    "Robot : Mon statut est opérationnel. Analyse du terrain terminée."
+];
+
+console.log("Apprentissage des unités de sens...");
+semanticCorpus.forEach(sentence => semanticBrain.learnSense(sentence));
+
+const semanticTests = [
+    { amorce: "Robot : Analyse du", profondeur: 5, attendu: "terrain terminée . risque de" },
+    { amorce: "Robot : Batterie", profondeur: 4, attendu: "critique . retour à" },
+    { amorce: "Humain : Quel est", profondeur: 4, attendu: "ton statut actuel ?" }
+];
+
+console.log("\n--- Résultats de la Restitution Sémantique ---");
+
+semanticTests.forEach(({amorce, profondeur, attendu}) => {
+    // On prédit des tokens entiers (mots) au lieu de bits
+    const generation = semanticBrain.predictSense(amorce, profondeur);
+    
+    console.log(`\nAmorce Conceptuelle : "${amorce}"`);
+    console.log(`Concept Prédit      : "${generation}"`);
+    
+    // Vérification de la cohérence hiérarchique
+    const isCoherent = attendu.split(' ').every(word => 
+        generation.toLowerCase().includes(word.toLowerCase())
+    );
+
+    console.log(`Validation Sémantique : ${isCoherent ? "✅ CONCEPT VALIDE" : "⚠️ DÉRIVE COGNITIVE"}`);
+});
+
+// ============================================================
+// ET APRÈS ? : LE PONT ENTRE SENS ET ACTION
+// ============================================================
+
+console.log("\n=== Vers la Conscience Robotique (Action-Mapping) ===");
+
+/**
+ * On associe un concept sémantique à une cible pour les actuateurs.
+ * Si le robot "comprend" le mot 'Batterie', il active le Seeker vers la base.
+ */
+const actionBridge = new Map([
+    ["batterie", { target: [0, -1, 0], group: "base" }],
+    ["collision", { target: [1, 1, 1], group: "bras" }],
+    ["statut", { target: [0, 0, 0], group: "camera" }]
+]);
+
+const testSentence = "Robot : Batterie critique.";
+const sensedTokens = testSentence.toLowerCase().match(/\w+/g);
+
+console.log(`Analyse de la phrase : "${testSentence}"`);
+
+sensedTokens.forEach(token => {
+    if (actionBridge.has(token)) {
+        const action = actionBridge.get(token);
+        console.log(`[Pont Sémantique] Mot clé détecté : "${token}"`);
+        console.log(`[Action] Mise à jour de la cible pour le groupe "${action.group}" vers [${action.target}]`);
+        
+        // Ici, on injecterait la cible dans le SeekerNeuron de l'actuateur
+        // actuator.seeker.update(Quaternion.fromVec3(action.target), 0.1, 0.05);
+    }
+});
+
+console.log("\nProchaine étape : L'Apprentissage par Renforcement des Unités de Sens.");
+
+console.log(`\nTaille du Vocabulaire : ${semanticBrain.vocabulary.size} concepts uniques.`);

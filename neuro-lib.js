@@ -1179,6 +1179,84 @@ export class BitwiseRelationalMemory {
 }
 
 /**
+ * MÉMOIRE RELATIONNELLE SÉMANTIQUE
+ * Aligne la structure bit à bit sur des unités de sens (Tokens).
+ */
+export class SemanticRelationalMemory {
+    constructor(contextSize = 16) {
+        // On utilise la mémoire bitwise comme moteur de transition
+        this.bitEngine = new BitwiseRelationalMemory(contextSize * 12); 
+        this.vocabulary = new Map(); // Mot -> ID binaire
+        this.reverseVocab = new Map(); // ID binaire -> Mot
+        this.nextId = 1;
+    }
+
+    /**
+     * Transforme une phrase en unités de sens avant de les mémoriser
+     */
+    learnSense(sentence) {
+        const tokens = sentence.toLowerCase().match(/\w+|[^\w\s]/g) || [];
+        
+        this.bitEngine.resetContext();
+        
+        for (const token of tokens) {
+            let id = this.vocabulary.get(token);
+            if (id === undefined) {
+                id = this.nextId++;
+                this.vocabulary.set(token, id);
+                this.reverseVocab.set(id, token);
+            }
+            
+            // On injecte l'ID du token (l'unité de sens) dans le moteur de bits
+            this._updateId(id);
+        }
+    }
+
+    /**
+     * Prédit la suite non pas par lettre, mais par concept
+     */
+    predictSense(seedSentence, depth = 10) {
+        const tokens = seedSentence.toLowerCase().match(/\w+|[^\w\s]/g) || [];
+        this.bitEngine.resetContext();
+        
+        // Préchauffage avec le sens de l'amorce
+        for (const token of tokens) {
+            const id = this.vocabulary.get(token) || 0;
+            this._shiftId(id);
+        }
+
+        let result = [];
+        for (let i = 0; i < depth; i++) {
+            let predictedId = 0;
+            // On reconstruit l'ID du prochain token bit par bit
+            for (let b = 11; b >= 0; b--) {
+                const bit = this.bitEngine.predictBit() || 0;
+                predictedId |= (bit << b);
+                this.bitEngine.shift(bit);
+            }
+
+            const word = this.reverseVocab.get(predictedId);
+            if (!word || word === result[result.length - 1]) break;
+            result.push(word);
+        }
+        return result.join(' ');
+    }
+
+    _updateId(id) {
+        // On décompose l'ID (le sens) en 12 bits pour le moteur
+        for (let i = 11; i >= 0; i--) {
+            this.bitEngine.update((id >> i) & 1);
+        }
+    }
+
+    _shiftId(id) {
+        for (let i = 11; i >= 0; i--) {
+            this.bitEngine.shift((id >> i) & 1);
+        }
+    }
+}
+
+/**
  * PRÉDICTEUR NEURONAL DÉTERMINISTE (Le "Cerveau" du Compresseur)
  * Version Ultra-Compacte : Remplace la Map par une table de probabilités 8-bits hachée.
  * Réduit l'empreinte mémoire de ~98% par rapport à une Map sérialisée en JSON.
