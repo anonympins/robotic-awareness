@@ -10,7 +10,7 @@ async function runWikipediaTraining() {
     console.log("\n[SYSTEM] === Démarrage du Service d'Apprentissage Continu ===");
     
     const attention = new SemanticAttentionLayer();
-    const brain = new SemanticRelationalMemory(8); // Réduction de 16 à 8 pour stabiliser la RAM
+    const brain = new SemanticRelationalMemory(16); // Contexte de 16 mots
     brain.attachAttention(attention);
 
     // Tentative de chargement du backup existant
