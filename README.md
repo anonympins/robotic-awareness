@@ -39,14 +39,87 @@ The library implements a state-of-the-art **Neural Arithmetic Compressor**. It u
 *   **Verbatim Restitution**: Capable of 100% perfect reproduction of training data, used for storing robotic "directives" or critical code sequences.
 *   **Massive Restitution**: Optimized for large scale memory storage where the "brain" can memorize hundreds of unique sequences without catastrophic forgetting.
 
+```javascript
+import { BitwiseLosslessCompressor } from './neuro-lib.js';
+
+// 1. Utilisation pour la compression de données techniques
+const compressor = new BitwiseLosslessCompressor(12); // Fenêtre de 12 bits
+const rawData = new TextEncoder().encode("Protocol: Secure-Auth-v2.1; Status: Active;");
+
+const compressed = compressor.compress(rawData);
+console.log(`Taille compressée : ${compressed.length} octets`);
+
+// Décompression (nécessite la taille originale)
+const decompressed = compressor.decompress(compressed, rawData.length);
+console.log(`Restituton : ${new TextDecoder().decode(decompressed)}`);
+
+// 2. Utilisation pour la mémorisation et complétion (Mode Verbatim)
+// On utilise contextSize=48 et useRelational=true pour une mémorisation parfaite
+const memory = new BitwiseLosslessCompressor(48, true);
+const directive = "Alerte : Température moteur supérieure à 85°C. Arrêt immédiat.";
+
+memory.train(new TextEncoder().encode(directive));
+
+// Complétion à partir d'une amorce
+const seed = "Alerte : Température";
+const completionBytes = memory.complete(seed, 40);
+const fullText = seed + new TextDecoder().decode(completionBytes);
+console.log(`Mémoire profonde : "${fullText}"`);
+```
+
 ### 5. Memory Systems
 *   **`BitwiseRelationalMemory` (Zero Forgetting)**: A high-precision "Vault" that stores bit-level transitions. It guarantees zero collisions and allows for perfect recall of patterns given a small "seed" or context.
+
+```javascript
+import { BitwiseRelationalMemory } from './neuro-lib.js';
+
+const ltm = new BitwiseRelationalMemory(128); // Contexte de 128 bits
+ltm.update(1);
+ltm.update(0);
+ltm.update(1);
+
+const nextBit = ltm.predictBit(); // Prédit le bit le plus probable selon l'historique
+console.log(`Prédiction : ${nextBit}`);
+```
+
 *   **`SemanticRelationalMemory` (Conceptual Hierarchy)**: Operates at the token level (words/concepts) rather than bits. It maps semantic units to binary IDs, allowing the robot to predict "meaning" over long temporal distances (e.g., predicting a battery alert after a terrain analysis).
+
+```javascript
+import { SemanticRelationalMemory } from './neuro-lib.js';
+
+const semanticBrain = new SemanticRelationalMemory(16); // Fenêtre de 16 tokens
+
+// Apprentissage par flux
+semanticBrain.learnText("Le robot analyse le terrain. Batterie critique.");
+
+// Prédiction de concepts (complétion)
+const prediction = semanticBrain.predictSense("Le robot", 5); 
+console.log(`Suite logique : ${prediction}`); // "analyse le terrain . batterie"
+```
 
 ### 6. The Semantic-Action Bridge
 This is the link between "understanding" and "moving".
 *   **Action Mapping**: Semantic tokens are mapped to specific robotic targets (e.g., the concept "Battery" triggers a navigation target toward the charging base).
 *   **Cognitive Bridge**: Uses the output of the Semantic Memory to update `SeekerNeurons` in real-time, allowing the robot to react to verbal or logical directives.
+
+#### `SemanticAttentionLayer`
+Gère les équivalences de sens et la pondération des états d'attention.
+
+```javascript
+import { SemanticAttentionLayer } from './neuro-lib.js';
+
+const attention = new SemanticAttentionLayer();
+
+// Définition d'équivalences sémantiques
+attention.setEquivalence("accumulateur", "batterie");
+
+// Mise à jour d'un état avec pré-calcul de poids
+attention.updateState("batterie", "critique", 1.0);
+
+// Résolution (l'ancre "accumulateur" renvoie vers "batterie")
+const state = attention.getResolvedState("accumulateur");
+console.log(state.value); // "critique"
+```
 
 ### 7. Geometric Learning
 *   **`SeekerNeuron`**: A "Geometric Neuron" that uses Quaternions to learn spatial orientations. Instead of learning numbers, it learns directions in 3D space.
