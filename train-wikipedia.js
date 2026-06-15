@@ -1,11 +1,17 @@
 import { SemanticRelationalMemory, SemanticAttentionLayer } from "./neuro-lib.js";
 import { scrapeRandomWikipediaContent } from "./wikipedia-scraper.js";
+import fs from 'node:fs';
 
-async function runWikipediaTraining() {
+export async function runWikipediaTraining() {
     console.log("=== Initialisation du Cerveau Sémantique ===");
     const attention = new SemanticAttentionLayer();
     const brain = new SemanticRelationalMemory(16); // Contexte de 16 mots
     brain.attachAttention(attention);
+    
+    const STORAGE_PATH = "./semantic_brain_storage.json";
+    if (fs.existsSync(STORAGE_PATH)) {
+        brain.importState(JSON.parse(fs.readFileSync(STORAGE_PATH, 'utf8')));
+    }
 
     try {
         console.log("\n[1/3] Récupération d'une page aléatoire...");
@@ -27,6 +33,9 @@ async function runWikipediaTraining() {
         // learnText découpe par phrases et gère l'ingestion bit à bit
         brain.learnText(cleanContent, true); 
         const duration = Date.now() - start;
+        
+        // Sauvegarde de l'état
+        fs.writeFileSync(STORAGE_PATH, JSON.stringify(brain.exportState()));
 
         console.log(`Apprentissage terminé en ${duration}ms.`);
         console.log(`Vocabulaire acquis : ${brain.vocabulary.size} mots.`);
@@ -34,7 +43,7 @@ async function runWikipediaTraining() {
         console.log("\n[3/3] Test de prévision déterministe...");
         
         // Utilisation du tokenizer interne pour garantir la correspondance des IDs
-        const allTokens = cleanContent.toLowerCase().match(brain.tokenizer) || [];
+        const allTokens = cleanContent.match(brain.tokenizer) || [];
         
         // On prend les 4 premiers tokens significatifs comme amorce
         const amorceTokens = allTokens.slice(0, 4);
@@ -51,7 +60,7 @@ async function runWikipediaTraining() {
 
         console.log(`${amorce} ${prediction}`);
 
-        if (cleanContent.toLowerCase().includes(prediction.toLowerCase())) {
+        if (cleanContent.includes(prediction)) {
             console.log("\nStatut : ✅ Restitution fidèle au bit près.");
         } else {
             console.log("\nStatut : ⚠️ Le modèle a divergé (créativité ou collision d'IDs).");
@@ -61,5 +70,3 @@ async function runWikipediaTraining() {
         console.error("❌ Échec de l'entraînement :", err);
     }
 }
-
-runWikipediaTraining();
