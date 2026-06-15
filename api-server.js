@@ -5,7 +5,7 @@ import fs from 'node:fs';
 import { SemanticRelationalMemory, SemanticAttentionLayer } from "./neuro-lib.js";
 
 const app = express();
-const port = process.env.PORT || 3000;
+const port = process.env.PORT || 7701;
 const STORAGE_PATH = "./semantic_brain_storage.json";
 const CORPUS_FILE = "./training_corpus.txt";
 
