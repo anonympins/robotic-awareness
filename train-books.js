@@ -61,8 +61,8 @@ async function fetchFromRapidAPI(path) {
 
 export async function runBookTraining() {
     const stats = getDailyStats();
-    if (stats.count + 2 > MAX_REQ_PER_DAY) {
-        console.log(`\x1b[33m[Books] Quota journalier atteint (${stats.count}/${MAX_REQ_PER_DAY}). Repos.\x1b[0m`);
+    if (stats.count >= MAX_REQ_PER_DAY) {
+        console.log(`\x1b[33m[Books] Quota journalier déjà atteint (${stats.count}/${MAX_REQ_PER_DAY}). Repos.\x1b[0m`);
         return;
     }
 
@@ -78,47 +78,67 @@ export async function runBookTraining() {
     const keywords = ["Shakespeare", "Plato", "Dante", "Tolstoy", "Twain", "Homer", "History", "Philosophy"];
     let query = keywords[Math.floor(Math.random() * keywords.length)];
 
+    let currentPage = 1;
+    let totalPages = 1; // Sera mis à jour après le premier appel de recherche
+    const pageSize = 50; // Nombre de livres par page, à ajuster selon l'API
+    let booksProcessedCount = 0;
+
     try {
         console.log(`\x1b[34m[Books]\x1b[0m Recherche de : ${query}...`);
 
-        // 1. Recherche par mot-clé pour varier l'apprentissage
-        const search = await fetchFromRapidAPI(`/books?search=${encodeURIComponent(query)}`);
-        const books = search?.results || [];
-        if (books.length === 0) throw new Error("Impossible de récupérer la liste des livres");
+        do {
+            const currentStats = getDailyStats(); // Récupère les stats à jour
+            // Vérifie si on a assez de quota pour au moins une requête (page de recherche)
+            if (currentStats.count + 1 > MAX_REQ_PER_DAY) {
+                console.log(`\x1b[33m[Books] Quota journalier presque atteint (${currentStats.count}/${MAX_REQ_PER_DAY}). Arrêt de la pagination.\x1b[0m`);
+                break; // Arrête la pagination si le quota est presque atteint
+            }
 
-        const book = books[Math.floor(Math.random() * books.length)];
-        console.log(`\x1b[34m[Books]\x1b[0m Lecture de : "${book.title}"`);
+            console.log(`\x1b[34m[Books]\x1b[0m Chargement de la page ${currentPage}/${totalPages} pour "${query}"...`);
+            // 1. Recherche par mot-clé avec pagination
+            const searchResponse = await fetchFromRapidAPI(`/books?search=${encodeURIComponent(query)}&page=${currentPage}&limit=${pageSize}`);
+            const booksOnPage = searchResponse?.results || [];
+            totalPages = searchResponse?.totalPages || 1; // Met à jour le nombre total de pages
 
-        // 2. Récupération du texte nettoyé directement via l'API
-        const textData = await fetchFromRapidAPI(`/books/${book.id}/text?cleaning_mode=simple`);
-        const text = textData.text || textData.content || "";
+            if (booksOnPage.length === 0) {
+                console.log(`\x1b[34m[Books]\x1b[0m Aucune livre trouvé sur la page ${currentPage} pour "${query}".`);
+                break; // Plus de livres sur cette page, ou fin des résultats
+            }
 
-        if (!text) throw new Error("Contenu textuel indisponible");
-        
-        // 3. Découpage optimisé pour l'apprentissage relationnel
-        const limit = 100000; 
-        const cleanContent = text.substring(0, limit)
-            .replace(/\r\n|\r|\n/g, ' ') // Supprime les sauts de ligne physiques
-            .replace(/\s+/g, ' ');       // Normalise les espaces
+            for (const book of booksOnPage) {
+                const currentStatsForBook = getDailyStats(); // Récupère les stats à jour avant chaque livre
+                // Vérifie si on a assez de quota pour la requête de contenu du livre
+                if (currentStatsForBook.count + 1 > MAX_REQ_PER_DAY) {
+                    console.log(`\x1b[33m[Books] Quota journalier presque atteint (${currentStatsForBook.count}/${MAX_REQ_PER_DAY}). Arrêt du traitement des livres.\x1b[0m`);
+                    break; // Arrête le traitement des livres sur cette page
+                }
 
-        // Capture les phrases se terminant par . ! ou ? suivis d'un espace ou fin de texte
-        const sentences = (cleanContent.match(/[^.!?]+[.!?]+(?=\s|$)/g) || [])
-            .map(s => s.trim())
-            .filter(s => s.length > 25 && s.length < 400) // Taille idéale pour capturer un "sens" complet sans saturer
-            .filter(s => !s.toLowerCase().includes("gutenberg") && !s.includes("http")); // Nettoyage du bruit légal/URL
+                console.log(`\x1b[34m[Books]\x1b[0m Lecture de : "${book.title}" (ID: ${book.id})...`);
+                // 2. Récupération du texte nettoyé directement via l'API
+                const textData = await fetchFromRapidAPI(`/books/${book.id}/text?cleaning_mode=simple`);
+                const text = textData.text || textData.content || "";
 
-        console.log(`\x1b[34m[Books]\x1b[0m Apprentissage de ${sentences.length} phrases.`);
+                if (!text) {
+                    console.warn(`\x1b[33m[Books] Contenu textuel indisponible pour "${book.title}".\x1b[0m`);
+                    continue; // Passe au livre suivant
+                }
+                
+                // 3. Utilisation de learnText de neuro-lib.js pour un apprentissage optimisé
+                // Le paramètre 'continuous: true' permet de garder le contexte entre les phrases du même livre
+                brain.learnText(text, true);
+                booksProcessedCount++;
+                console.log(`\x1b[32m[Books] Apprentissage de "${book.title}" terminé. Livres traités: ${booksProcessedCount}.\x1b[0m`);
+            }
 
-        // 4. Sauvegarde dans le corpus global (format texte brut)
-        fs.appendFileSync(CORPUS_FILE, sentences.join('\n') + '\n', 'utf8');
+            currentPage++;
+            // Si la boucle interne a été interrompue à cause du quota, on sort aussi de la boucle de pagination
+            if (getDailyStats().count + 1 > MAX_REQ_PER_DAY) break;
 
-        let count = 0;
-        for (const sentence of sentences) {
-            brain.learnSense(sentence);
-            count++;
-        }
+        } while (currentPage <= totalPages);
+
+        console.log(`\x1b[32m[Books] Apprentissage terminé sur ${booksProcessedCount} livres (ou quota atteint).\x1b[0m`);
         fs.writeFileSync(STORAGE_PATH, JSON.stringify(brain.exportState()));
-        console.log("\x1b[32m[Books] Succès : Mémoire littéraire mise à jour.\x1b[0m");
+        console.log("\x1b[32m[Books] État de la mémoire littéraire sauvegardé.\x1b[0m");
     } catch (err) {
         console.error("\x1b[31m[Books] Erreur cycle :\x1b[0m", err.message);
     }

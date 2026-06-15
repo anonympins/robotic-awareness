@@ -1806,6 +1806,8 @@ export class SemanticRelationalMemory {
                 }
 
                 let grammarScore = grammarWeight / (totalStructuralWeight || 1);
+                // Seuil de "Verbatim" dynamique basé sur la créativité
+                const verbatimThreshold = 0.92 - (creativity * 0.1); // Plus de créativité = seuil plus bas
                 const isVerbatim = transitionProb > verbatimThreshold;
 
                 // --- LOGIQUE MSB (Most Significant Bit) : FILTRE DE COHÉRENCE ---
@@ -1820,8 +1822,6 @@ export class SemanticRelationalMemory {
                 if (!trigramHit && !bigramHit && !isVerbatim) structuralPenalty *= 0.0000001;
 
                 const verbatimBoost = isVerbatim ? 100.0 : 1.0; // Boost Verbatim augmenté
-                // Seuil de "Verbatim" dynamique basé sur la créativité
-                const verbatimThreshold = 0.92 - (creativity * 0.1); // Plus de créativité = seuil plus bas
                 // --- BIAIS DE FLUX GRAMMATICAL (NOUVEAU) ---
                 let flowBias = 1.0;
                 // 1. Si on a un hit grammatical sur un connecteur, on le booste (fluidité)
