@@ -1233,7 +1233,16 @@ export class BitwiseRelationalMemory {
      * Restaure l'état de la table de compteurs
      */
     importState(stateData) {
-        if (stateData) this.data.set(stateData);
+        if (stateData) {
+            // Sécurité : Si les dimensions de la mémoire importée ne correspondent pas
+            // (ex: tablePower différent dans le fichier de stockage), on réalloue dynamiquement
+            if (stateData.length !== this.data.length) {
+                this.tableSize = stateData.length / 2;
+                this.tablePower = Math.round(Math.log2(this.tableSize));
+                this.data = new Uint32Array(stateData.length);
+            }
+            this.data.set(stateData);
+        }
     }
 
     /**
