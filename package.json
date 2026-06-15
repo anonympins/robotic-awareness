@@ -1,5 +1,28 @@
 {
-  "type": "module",
   "name": "robotic-awareness",
-  "version": "1.0.0"
+  "version": "1.1.0",
+  "description": "Système de mémoire relationnelle sémantique et d'apprentissage robotique bit à bit (G-NEURO).",
+  "type": "module",
+  "main": "neuro-lib.js",
+  "scripts": {
+    "start": "node api-server.js",
+    "train": "node continuous-trainer.js",
+    "dev": "node --watch api-server.js",
+    "stats": "cat training_stats.json"
+  },
+  "keywords": [
+    "neural-network",
+    "bitwise",
+    "robotics",
+    "semantic-memory",
+    "nlp"
+  ],
+  "author": "G-Neuro Team",
+  "license": "MIT",
+  "dependencies": {
+    "express": "^4.18.2"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
 }
