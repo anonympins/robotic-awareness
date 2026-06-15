@@ -1,0 +1,1 @@
+npm i && npm data-primals-engine && npm run start
