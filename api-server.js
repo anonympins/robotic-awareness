@@ -58,6 +58,49 @@ app.post('/ingest', async (req, res) => {
     }
 });
 
+/**
+ * Endpoint pour interroger le cerveau (similaire à query-brain.js).
+ * Attend un prompt et renvoie la prédiction sémantique.
+ */
+app.post('/query', async (req, res) => {
+    const { prompt, depth = 20, creativity = 0.05, topK = 3 } = req.body;
+
+    if (!prompt || typeof prompt !== 'string' || prompt.trim().length === 0) {
+        return res.status(400).json({ error: "Prompt invalide." });
+    }
+
+    try {
+        const brain = new SemanticRelationalMemory(16);
+        const attention = new SemanticAttentionLayer();
+        brain.attachAttention(attention);
+
+        // Chargement de l'état
+        if (!fs.existsSync(STORAGE_PATH)) {
+            return res.status(404).json({ error: "Modèle introuvable. Ingestez des données d'abord." });
+        }
+
+        brain.importState(JSON.parse(fs.readFileSync(STORAGE_PATH, 'utf8')));
+
+        console.log(`\x1b[36m[API QUERY]\x1b[0m Amorce: "${prompt}" (depth: ${depth}, creativity: ${creativity})`);
+
+        const prediction = brain.predictSense(prompt, depth, {
+            creativity: creativity,
+            topK: topK,
+            attention: attention
+        });
+
+        res.json({
+            success: true,
+            prompt: prompt,
+            prediction: prediction,
+            full_result: `${prompt} ${prediction}`
+        });
+    } catch (err) {
+        console.error("\x1b[31m[API ERROR]\x1b[0m", err.message);
+        res.status(500).json({ error: "Erreur lors de la génération de la réponse." });
+    }
+});
+
 app.listen(port, () => {
     console.log(`\n\x1b[35m=== G-NEURO API SERVER ===\x1b[0m`);
     console.log(`Statut : Opérationnel sur http://localhost:${port}`);
