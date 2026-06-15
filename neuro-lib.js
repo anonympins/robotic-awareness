@@ -616,6 +616,53 @@ export class StochasticPerceptron {
     }
 }
 
+/**
+ * CELLULE RÉCURRENTE BINAIRE (Bit-RNN)
+ * Version adaptative : Apprend les transitions d'états binaires pour le texte.
+ */
+export class BitwiseRNNCell {
+    constructor(size) {
+        this.size = size;
+        this.state = new Uint8Array(size).fill(0);
+        // Chaque bit d'état est géré par un neurone capable d'apprendre
+        // l'influence combinée de l'input et de l'état précédent.
+        this.neurons = Array.from({ length: size }, () => new AdaptiveMajorityNeuron(size * 2));
+    }
+
+    /**
+     * Un cycle d'horloge du RNN
+     * @param {Uint8Array} inputs 
+     */
+    step(inputs) {
+        const combinedInput = new Uint8Array(this.size * 2);
+        combinedInput.set(inputs, 0);
+        combinedInput.set(this.state, this.size);
+
+        const nextState = new Uint8Array(this.size);
+        for (let i = 0; i < this.size; i++) {
+            nextState[i] = this.neurons[i].predict(combinedInput);
+        }
+
+        this.state = nextState;
+        return this.state;
+    }
+
+    train(inputs, targets) {
+        const combinedInput = new Uint8Array(this.size * 2);
+        combinedInput.set(inputs, 0);
+        combinedInput.set(this.state, this.size);
+
+        for (let i = 0; i < this.size; i++) {
+            this.neurons[i].train(combinedInput, targets[i]);
+        }
+        this.step(inputs); // Avance l'état après l'entraînement
+    }
+
+    reset() {
+        this.state.fill(0);
+    }
+}
+
 // ---------- Réseau Majoritaire Récurrent (StatefulMajorityNetwork) ----------
 // Un réseau qui maintient un état interne (sa propre sortie précédente)
 // et l'utilise comme entrée pour la prédiction suivante.
@@ -1710,6 +1757,11 @@ export class SemanticRelationalMemory {
         const identityIds = [];
         const isQuestion = seedSentence.includes('?');
 
+        // DÉTERMINATION DE L'OBJECTIF : 
+        // On alloue un quota de phrases basé sur la richesse conceptuelle (un concept par proposition).
+        const significantConcepts = queryIds.filter(id => !this.isStructural(id)).length;
+        const targetSentences = Math.max(1, Math.min(8, significantConcepts));
+
         if (options.identity) {
             const roles = options.identity.split(/\s+/);
             roles.forEach(role => {
@@ -1751,6 +1803,8 @@ export class SemanticRelationalMemory {
         let lastWasConnector = this.isStructural(lastId);
         let lastWasPunctuation = ['.', ',', ';', '!', '?'].includes(lastWord);
         
+        let sentencesGenerated = 0;
+
         // --- OPTIMISATION : Analyse du contexte hors-boucle ---
         let trigramContext = null;
         if (activeIds.length >= 2) {
@@ -1760,7 +1814,11 @@ export class SemanticRelationalMemory {
         const bigramKey = activeIds[activeIds.length - 1];
         let bigramContext = this.grammarMap.get(bigramKey);
 
-        for (let i = 0; i < depth; i++) {
+        // 'depth' devient maintenant une limite de sécurité (budget maximum).
+        // On s'assure qu'elle est suffisante pour le quota de phrases calculé.
+        const maxSafetyLimit = Math.max(depth, targetSentences * 25);
+
+        for (let i = 0; i < maxSafetyLimit; i++) {
             const candidates = [];
 
             const hasTrigramOptions = trigramContext && trigramContext.size > 0;
@@ -1773,6 +1831,21 @@ export class SemanticRelationalMemory {
 
                 const isConnector = this.isStructural(id);
                 
+                // 0. RÉSONANCE SÉMANTIQUE (Le "Sens")
+                // On regarde si ce mot (id) a un lien fort avec les concepts de la question (queryIds)
+                let semanticResonance = 0;
+                if (attLayer && queryIds.length > 0) {
+                    queryIds.forEach(qId => {
+                        const relations = attLayer.correlationMatrix.get(qId);
+                        if (relations && relations.has(id)) {
+                            // On cumule l'énergie sémantique entre le concept posé et le candidat
+                            semanticResonance += relations.get(id);
+                        }
+                    });
+                    // Normalisation de la résonance
+                    semanticResonance = semanticResonance / queryIds.length;
+                }
+
                 // 1. Probabilité de Transition Bitwise (Mémoire Verbatim)
                 // CORRECTIF : Normalisation Géométrique.
                 // scoreId est un produit de 12 probabilités (une par bit).
@@ -1810,16 +1883,15 @@ export class SemanticRelationalMemory {
                 const verbatimThreshold = 0.92 - (creativity * 0.1); // Plus de créativité = seuil plus bas
                 const isVerbatim = transitionProb > verbatimThreshold;
 
-                // --- LOGIQUE MSB (Most Significant Bit) : FILTRE DE COHÉRENCE ---
+                // --- LOGIQUE DE COHÉRENCE FLEXIBLE ---
+                // Au lieu de tuer le mot s'il n'est pas statistique, on vérifie s'il a du sens
                 let structuralPenalty = 1.0;
-                // Si une structure est connue (Trigramme ou Bigramme), tout candidat hors-structure est éliminé
-                if (!trigramHit && hasTrigramOptions) structuralPenalty *= 0.000001; 
-                if (!trigramHit && !bigramHit && hasBigramOptions) structuralPenalty *= 0.00001;
+                const hasGrammarHit = trigramHit || bigramHit;
 
-                // 2.5 Logique de Restitution Verbatim (Ancrage)
-
-                // Si aucun lien structurel et pas de verbatim, on pénalise lourdement pour éviter l'hallucination
-                if (!trigramHit && !bigramHit && !isVerbatim) structuralPenalty *= 0.0000001;
+                if (!hasGrammarHit && !isVerbatim) {
+                    // Si le mot n'est ni statistique ni verbatim, il ne survit que s'il a une forte résonance sémantique
+                    structuralPenalty = Math.max(0.000001, semanticResonance * 2.0);
+                }
 
                 const verbatimBoost = isVerbatim ? 100.0 : 1.0; // Boost Verbatim augmenté
                 // --- BIAIS DE FLUX GRAMMATICAL (NOUVEAU) ---
@@ -1853,8 +1925,12 @@ export class SemanticRelationalMemory {
                     }
                 }
 
-                // Fusion des scores : Grammaire (Schéma) + Bitwise (Précision) + Attention
-                let score = (grammarScore + transitionProb * transitionWeight) * contextBoost * verbatimBoost * structuralPenalty * flowBias;
+                // FUSION FINALE : On ajoute la résonance sémantique au score global
+                // La résonance agit comme un aimant qui attire les mots liés au sujet
+                const meaningPower = semanticResonance * 50.0; 
+                
+                let score = (grammarScore + transitionProb * transitionWeight + meaningPower) * 
+                            contextBoost * verbatimBoost * structuralPenalty * flowBias;
 
                 // --- LOGIQUE DE FIN (SENSATION DE FIN DE PROPOS) ---
                 // Si c'est un hit structurel, c'est presque certainement la fin de phrase voulue
@@ -1933,6 +2009,15 @@ export class SemanticRelationalMemory {
             // Signal d'arrêt : si le mot sélectionné est le jeton de fin, on stoppe
             if (word === "<eos>") break;
             result.push(word);
+
+            // ARRÊT INTELLIGENT :
+            // On s'arrête dès qu'on a produit assez de phrases pour couvrir l'objectif.
+            const isTerminal = ['.', '!', '?'].includes(word);
+            if (isTerminal) {
+                sentencesGenerated++;
+                if (sentencesGenerated >= targetSentences) break;
+            }
+
             lastId = selected.id;
             wordCounts.set(word, (wordCounts.get(word) || 0) + 1);
 
@@ -1955,7 +2040,8 @@ export class SemanticRelationalMemory {
             const nextBigramKey = activeIds[activeIds.length - 1];
             bigramContext = this.grammarMap.get(nextBigramKey);
         }
-        return result.join(' ');
+        // Nettoyage des espaces avant la ponctuation pour un rendu propre
+        return result.join(' ').replace(/\s([,.;!])/g, '$1');
     }
 
     _updateId(id, weight = 1) {

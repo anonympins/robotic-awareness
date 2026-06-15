@@ -36,7 +36,7 @@ async function main() {
         output: process.stdout
     });
 
-    let depth = 20;
+    let depth = 150;
     let creativity = 0.05;
 
     console.log("\n\x1b[32mPrêt pour l'interrogation. Tapez votre amorce.\x1b[0m");
@@ -65,7 +65,7 @@ async function main() {
         process.stdout.write("\x1b[33mIA      > \x1b[0m" + prompt + " ");
         
         try {
-            const response = brain.predictSense(prompt, depth, {
+            let response = brain.predictSense(prompt, depth, {
                 creativity: creativity,
                 topK: 3,
                 attention: attention
