@@ -2139,11 +2139,15 @@ export class SemanticRelationalMemory {
                 if (id === 0) continue;
 
                 const isConnector = this.isStructural(id);
-                
+
                 // 0. RÉSONANCE SÉMANTIQUE (Le "Sens")
-                // On regarde si ce mot (id) a un lien fort avec les concepts de la question (queryIds)
                 let semanticResonance = 0;
-                if (attLayer && queryIds.length > 0) {
+                if (attLayer) {
+                    // Focus Global (Le prompt)
+                    const hasQuery = queryIds.length > 0;
+                    // Focus Fenêtre (Les mots qu'on vient de dire)
+                    const hasWindow = activeIds.length > 0;
+
                     queryIds.forEach(qId => {
                         const relations = attLayer.correlationMatrix.get(qId);
                         if (relations && relations.has(id)) {
@@ -2151,8 +2155,19 @@ export class SemanticRelationalMemory {
                             semanticResonance += relations.get(id);
                         }
                     });
-                    // Normalisation de la résonance
-                    semanticResonance = semanticResonance / queryIds.length;
+
+                    // NOUVEAU : Résonance de la fenêtre contextuelle (Auto-cohérence)
+                    // Cela force le modèle à rester dans le même "article" Wikipedia
+                    activeIds.forEach(aId => {
+                        const relations = attLayer.correlationMatrix.get(aId);
+                        if (relations && relations.has(id)) {
+                            // On donne un poids fort à la continuité immédiate
+                            semanticResonance += relations.get(id) * 2.5;
+                        }
+                    });
+
+                    // Normalisation pondérée
+                    semanticResonance = semanticResonance / (queryIds.length + activeIds.length || 1);
                 }
 
                 // 1. Probabilité de Transition Bitwise (Mémoire Verbatim)
@@ -5631,10 +5646,27 @@ export class GNeuroMoE {
     }
 
     route(text) {
-        const t = text.toLowerCase();
-        if (t.includes("histoire") || t.includes("siècle") || t.includes("roi") || t.includes("guerre")) return "history";
-        if (t.includes("science") || t.includes("physique") || t.includes("math")) return "science";
-        if (t.includes("robot") || t.includes("code") || t.includes("tech") || t.includes("web")) return "tech";
+        const tokens = text.toLowerCase().match(/[a-z0-9àâäéèêëïîôöùûüç]+/g) || [];
+        if (tokens.length === 0) return "general";
+
+        // Scoring par densité de vocabulaire connu par domaine
+        const scores = { history: 0, science: 0, tech: 0, general: 0 };
+        
+        // Mots-clés de secours pour l'amorçage
+        const anchors = {
+            history: ["histoire", "siècle", "roi", "guerre", "politique", "empire"],
+            science: ["science", "physique", "math", "biologie", "espace", "planète"],
+            tech: ["robot", "code", "tech", "web", "ordinateur", "numérique"]
+        };
+
+        tokens.forEach(t => {
+            for (let [domain, keywords] of Object.entries(anchors)) {
+                if (keywords.includes(t)) scores[domain] += 5;
+            }
+        });
+
+        const best = Object.entries(scores).sort((a, b) => b[1] - a[1])[0];
+        if (best[1] > 0) return best[0];
         return "general";
     }
 }
