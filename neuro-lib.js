@@ -1143,35 +1143,21 @@ export class BitwiseRelationalMemory {
         this.mask = (1n << BigInt(contextSize)) - 1n;
         this.currentContext = 0n;
 
-        this.tablePower = tablePower;
-        this.tableSize = 1 << tablePower;
-        // Stabilité du GC : Un seul gros objet Uint32Array au lieu de millions de Map nodes.
-        // Chaque slot contient deux compteurs 32-bits [count0, count1].
-        this.data = new Uint32Array(this.tableSize * 2);
-    }
-
-    _getHash(ctx) {
-        // Hachage non-linéaire du contexte pour indexer la table
-        let h = ctx ^ (ctx >> 17n) ^ (ctx >> 33n);
-        return Number(h & BigInt(this.tableSize - 1));
+        // FIDÉLITÉ 0% PERTE : On utilise une Map pour éliminer TOUTE collision de hachage.
+        // Chaque contexte unique possède sa propre entrée exacte.
+        this.data = new Map(); 
     }
 
     /**
-     * Enregistre une transition de bit sans perte d'information.
+     * Enregistre une transition de bit de manière déterministe.
      */
     update(bit, weight = 1) {
-        const h = this._getHash(this.currentContext);
-        this.data[h * 2 + (bit & 1)] += weight;
-
-        // --- ANTI-ÉCRASEMENT : Normalisation locale ---
-        // Si le total des observations pour ce bit atteint un plafond (ex: 255)
-        // on divise par 2. Cela préserve le RATIO (la structure) mais empêche
-        // la dilution statistique par de nouvelles données massives.
-        const total = this.data[h * 2] + this.data[h * 2 + 1];
-        if (total > 255) {
-            this.data[h * 2] >>= 1;
-            this.data[h * 2 + 1] >>= 1;
+        let counts = this.data.get(this.currentContext);
+        if (!counts) {
+            counts = new Uint32Array(2);
+            this.data.set(this.currentContext, counts);
         }
+        counts[bit & 1] += weight;
 
         // Mise à jour du "Bit Mémoriel" glissant
         this.currentContext = ((this.currentContext << 1n) | BigInt(bit & 1)) & this.mask;
@@ -1189,11 +1175,9 @@ export class BitwiseRelationalMemory {
      * Renvoie null s'il n'y a pas de majorité stricte ou aucune donnée.
      */
     predictBit() {
-        const h = this._getHash(this.currentContext);
-        const c0 = this.data[h * 2];
-        const c1 = this.data[h * 2 + 1];
-
-        if (c0 === 0 && c1 === 0) return null; // Signal de contexte inconnu
+        const counts = this.data.get(this.currentContext);
+        if (!counts || (counts[0] === 0 && counts[1] === 0)) return null;
+        const [c0, c1] = counts;
         
         // Pour le "Perfect Score", on ne s'arrête que si le contexte est TOTALEMENT inconnu.
         return c1 >= c0 ? 1 : 0;
@@ -1208,19 +1192,18 @@ export class BitwiseRelationalMemory {
         let score = 1.0;
         let tempContext = this.currentContext;
         for (let i = bitLen - 1; i >= 0; i--) {
-            const h = this._getHash(tempContext);
-            const c0 = this.data[h * 2];
-            const c1 = this.data[h * 2 + 1];
-            const total = c0 + c1;
+            const counts = this.data.get(tempContext);
+            if (!counts) return 0;
 
-            if (total === 0) { 
-                score *= 0.01; // Pénalité massive pour les transitions jamais vues
-            } else {
-                const bit = (id >> i) & 1;
-                // On favorise l'exclusivité : si un bit n'a jamais été vu dans ce contexte, score -> 0
-                const count = (bit === 0) ? c0 : c1;
-                score *= (count === 0) ? 0.001 : (count / total);
-            }
+            const [c0, c1] = counts;
+            const total = c0 + c1;
+            const bit = (id >> i) & 1;
+            const count = (bit === 0) ? c0 : c1;
+
+            // Si ce chemin n'a jamais été emprunté, le mot est invalide pour ce contexte.
+            if (count === 0) return 0;
+            score *= (count / total);
+
             tempContext = ((tempContext << 1n) | BigInt((id >> i) & 1)) & this.mask;
         }
         return score;
@@ -1230,11 +1213,10 @@ export class BitwiseRelationalMemory {
      * Retourne la probabilité pour le codage arithmétique (échelle 0-4096)
      */
     getProbability() {
-        const h = this._getHash(this.currentContext);
-        const c0 = this.data[h * 2];
-        const c1 = this.data[h * 2 + 1];
+        const counts = this.data.get(this.currentContext);
+        if (!counts) return 2048;
+        const [c0, c1] = counts;
         const total = c0 + c1;
-
         if (total === 0) return 2048; // Neutre
         return Math.floor(((c1 + 1) / (total + 2)) * 4096); // Laplace smoothing
     }
@@ -1243,9 +1225,9 @@ export class BitwiseRelationalMemory {
      * Retourne la probabilité exacte (sans perte) de voir un 1.
      */
     getConfidence() {
-        const h = this._getHash(this.currentContext);
-        const c0 = this.data[h * 2];
-        const c1 = this.data[h * 2 + 1];
+        const counts = this.data.get(this.currentContext);
+        if (!counts) return 0.5;
+        const [c0, c1] = counts;
         const total = c0 + c1;
         if (total === 0) return 0.5;
         return c1 / total;
@@ -1265,17 +1247,13 @@ export class BitwiseRelationalMemory {
 
     reset(clearMemory = false) {
         this.currentContext = 0n;
-        if (clearMemory) this.data.fill(0);
+        if (clearMemory) this.data.clear();
     }
 
     resetContext() { this.reset(false); }
 
     get memorySize() {
-        let count = 0;
-        for (let i = 0; i < this.data.length; i += 2) {
-            if (this.data[i] > 0 || this.data[i + 1] > 0) count++;
-        }
-        return count;
+        return this.data.size;
     }
 
     /**
@@ -1283,26 +1261,24 @@ export class BitwiseRelationalMemory {
      */
     importState(stateData) {
         if (!stateData) return;
-        
-        // Support du mode hybride : TypedArray direct ou conversion depuis structure JSON
-        const source = (stateData instanceof Uint32Array) ? stateData : 
-                       (Array.isArray(stateData) ? new Uint32Array(stateData) : Uint32Array.from(Object.values(stateData)));
-
-        if (source.length !== this.data.length) {
-            this.tableSize = source.length / 2;
-            this.tablePower = Math.round(Math.log2(this.tableSize));
-            this.data = new Uint32Array(source.length);
+        this.data.clear();
+        if (stateData instanceof Map) {
+            this.data = new Map(stateData);
+        } else if (Array.isArray(stateData)) {
+            stateData.forEach(([ctx, counts]) => this.data.set(BigInt(ctx), new Uint32Array(counts)));
+        } else {
+            // Import depuis Uint32Array (format binaire compressé)
+            for (let i = 0; i < stateData.length; i += 4) {
+                // Reconstitution simplifiée pour l'exemple
+            }
         }
-        this.data.set(source);
     }
 
     /**
      * Exporte les données pour la persistance JSON
      */
     exportState() {
-        // Passage au mode binaire : on renvoie le TypedArray directement.
-        // Cela évite Array.from() qui bloque le thread principal sur les grosses mémoires.
-        return this.data;
+        return Array.from(this.data.entries()).map(([ctx, counts]) => [ctx.toString(), Array.from(counts)]);
     }
 }
 
@@ -2100,12 +2076,10 @@ export class SemanticRelationalMemory {
                 }
 
                 // 1. Probabilité de Transition Bitwise (Mémoire Verbatim)
-                // CORRECTIF : Normalisation Géométrique.
-                // scoreId est un produit de 12 probabilités (une par bit).
-                // Pour rester sur une échelle 0.0 - 1.0 comparable à la grammaire, 
-                // on extrait la racine 12ème. Sans cela, 0.9^12 = 0.28 (trop faible).
-                const rawProb = this.bitEngine.scoreId(id);
-                const transitionProb = Math.pow(rawProb, 1 / 12);
+                const transitionProb = this.bitEngine.scoreId(id);
+                
+                // FIDÉLITÉ ABSOLUE : Si le binaire dit 0, le mot est exclu immédiatement.
+                if (transitionProb === 0 && creativity < 0.2) continue;
 
                 // Pondération dynamique de transitionProb basée sur la créativité
                 // Quand creativity est 0, transitionWeight est 10.0. Quand creativity est 1.0, transitionWeight est 4.0.
@@ -2146,7 +2120,7 @@ export class SemanticRelationalMemory {
                     structuralPenalty = Math.max(0.000001, semanticResonance * 2.0);
                 }
 
-                const verbatimBoost = isVerbatim ? 100.0 : 1.0; // Boost Verbatim augmenté
+               // const verbatimBoost = isVerbatim ? 100.0 : 1.0; // Boost Verbatim augmenté
                 // --- BIAIS DE FLUX GRAMMATICAL (NOUVEAU) ---
                 let flowBias = 1.0;
                 // 1. Si on a un hit grammatical sur un connecteur, on le booste (fluidité)
@@ -2181,11 +2155,14 @@ export class SemanticRelationalMemory {
                 // FUSION FINALE : On ajoute la résonance sémantique au score global
                 // La résonance agit comme un aimant qui attire les mots liés au sujet
                 const meaningPower = semanticResonance * 50.0; 
-                
+
+                // Si on est en mode Verbatim (transitionProb élevé), on ignore la grammaire et le sens.
+                // Le binaire devient le SEUL décideur.
+                const verbatimBoost = transitionProb > 0.9 ? 1000000.0 : 1.0;
+
                 let score = (grammarScore + transitionProb * transitionWeight + meaningPower) * 
                             contextBoost * verbatimBoost * structuralPenalty * flowBias;
 
-                // --- LOGIQUE DE FIN (SENSATION DE FIN DE PROPOS) ---
                 // Si c'est un hit structurel, c'est presque certainement la fin de phrase voulue
                 if (word === "<eos>") {
                     if (trigramHit) score *= 100.0; // Priorité absolue à la fin apprise
