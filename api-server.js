@@ -2,36 +2,33 @@
 
 import express from 'express';
 import fs from 'node:fs';
-import { SemanticRelationalMemory, SemanticAttentionLayer } from "./neuro-lib.js";
+import { GNeuroMoE, SemanticAttentionLayer } from "./neuro-lib.js";
 
 const app = express();
 const port = process.env.PORT || 7701;
-const STORAGE_PATH = "./semantic_brain_storage.gnr";
-const CORPUS_FILE = "./training_corpus.txt";
+const EXPERTS_DIR = "./experts_chunks/";
 
-// Instance globale du cerveau pour éviter les accès disques répétitifs
-let brain = new SemanticRelationalMemory(16);
-let attention = new SemanticAttentionLayer();
-brain.attachAttention(attention);
+if (!fs.existsSync(EXPERTS_DIR)) fs.mkdirSync(EXPERTS_DIR);
+
+// Orchestrateur Mixture of Experts
+const moe = new GNeuroMoE(16);
+const attention = new SemanticAttentionLayer();
 
 /**
- * Charge ou rafraîchit l'état du cerveau depuis le stockage
+ * Récupère un expert et charge son état binaire si nécessaire
  */
-function refreshBrainState() {
-    try {
-        if (fs.existsSync(STORAGE_PATH)) {
-            const buffer = fs.readFileSync(STORAGE_PATH);
-            brain.importState(buffer);
-            return true;
-        }
-    } catch (err) {
-        console.error("\x1b[31m[SYSTEM ERROR]\x1b[0m Erreur de lecture du modèle:", err.message);
-    }
-    return false;
-}
+function getExpertForContent(text) {
+    const domain = moe.route(text);
+    const brain = moe.getExpert(domain);
+    const path = `${EXPERTS_DIR}expert_${domain}.gnr`;
 
-// Chargement initial
-refreshBrainState();
+    if (!brain.hasBeenLoaded && fs.existsSync(path)) {
+        console.log(`[MoE] Chargement binaire de l'expert : ${domain}`);
+        brain.importState(fs.readFileSync(path));
+        brain.hasBeenLoaded = true;
+    }
+    return { brain, domain, path };
+}
 
 // Augmentation de la limite pour permettre l'envoi de textes longs (ex: articles complets)
 app.use(express.json({ limit: '10mb' }));
@@ -48,25 +45,23 @@ app.post('/ingest', async (req, res) => {
     }
 
     try {
-        // On s'assure d'avoir la dernière version avant d'apprendre
-        refreshBrainState();
-
+        const { brain, domain, path } = getExpertForContent(text);
+        brain.attachAttention(attention);
+        
         const initialSize = brain.vocabulary.size;
 
-        // Apprentissage : learnText découpe par ponctuation et nettoie les métadonnées
-        brain.learnText(text.trim(), false, weight);
+        // Apprentissage segmenté
+        brain.learnText(text.trim(), true, weight);
 
         // Persistance immédiate après ingestion
-        fs.writeFileSync(STORAGE_PATH, brain.exportBinary());
+        fs.writeFileSync(path, brain.exportBinary());
         
-        // Archivage dans le fichier corpus global pour traçabilité
-        fs.appendFileSync(CORPUS_FILE, `\n--- API INGESTION [${new Date().toLocaleString()}] ---\n${text.trim()}\n`, 'utf8');
-
         const newWords = brain.vocabulary.size - initialSize;
-        console.log(`\x1b[32m[API]\x1b[0m Ingestion terminée : +${newWords} nouveaux tokens ajoutés.`);
+        console.log(`\x1b[32m[API]\x1b[0m Ingestion [${domain}] : +${newWords} tokens.`);
 
         res.json({
             success: true,
+            domain: domain,
             added_tokens: newWords,
             total_vocabulary: brain.vocabulary.size
         });
@@ -91,11 +86,10 @@ app.post('/query', async (req, res) => {
     }
 
     try {
-        // Rafraîchir si le trainer a tourné entre temps
-        if (!refreshBrainState() && brain.vocabulary.size === 0) {
-            return res.status(404).json({ error: "Modèle introuvable. Ingestez des données d'abord." });
-        }
+        const { brain, domain } = getExpertForContent(prompt);
+        brain.attachAttention(attention);
 
+        console.log(`\x1b[36m[API QUERY]\x1b[0m Expert: ${domain.toUpperCase()}`);
         console.log(`\x1b[36m[API QUERY]\x1b[0m Amorce: "${prompt}" (probabilisme: topK=${topK}, créativité=${creativity})`);
 
         // On demande une profondeur généreuse pour permettre de finir la phrase
@@ -107,6 +101,7 @@ app.post('/query', async (req, res) => {
 
         res.json({
             success: true,
+            domain: domain,
             prompt: prompt,
             prediction: prediction,
             full_result: `${prompt} ${prediction}`

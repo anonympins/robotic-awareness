@@ -1,36 +1,19 @@
 #!/usr/bin/env node
 
-import { SemanticRelationalMemory, SemanticAttentionLayer } from "./neuro-lib.js";
+import { GNeuroMoE, SemanticAttentionLayer } from "./neuro-lib.js";
 import fs from "node:fs";
 import readline from "node:readline/promises";
 
-const STORAGE_PATH = "./semantic_brain_storage.json";
+const EXPERTS_DIR = "./experts_chunks/";
 
 async function main() {
     console.log("\x1b[35m%s\x1b[0m", "=== G-NEURO SEMANTIC QUERY INTERFACE ===");
+    console.log("Mode : Mixture of Experts (Auto-Routing)\n");
 
-    if (!fs.existsSync(STORAGE_PATH)) {
-        console.error(`\x1b[31mErreur: Le fichier ${STORAGE_PATH} est introuvable.\x1b[0m`);
-        process.exit(1);
-    }
-
-    // 1. Initialisation du cerveau
-    const brain = new SemanticRelationalMemory(8);
+    // 1. Initialisation de l'orchestrateur
+    const moe = new GNeuroMoE(16);
     const attention = new SemanticAttentionLayer();
-    brain.attachAttention(attention);
-
-    // 2. Chargement des données
-    try {
-        console.log(`[Système] Chargement du modèle depuis ${STORAGE_PATH}...`);
-        const rawData = JSON.parse(fs.readFileSync(STORAGE_PATH, 'utf8'));
-        brain.importState(rawData);
-        console.log(`[Système] Vocabulaire chargé : ${brain.vocabulary.size} mots.`);
-        console.log(`[Système] Relations actives : ${brain.bitEngine.memorySize}`);
-    } catch (err) {
-        console.error("\x1b[31mErreur lors de l'importation :\x1b[0m", err.message);
-        process.exit(1);
-    }
-
+    
     const rl = readline.createInterface({
         input: process.stdin,
         output: process.stdout
@@ -61,11 +44,22 @@ async function main() {
 
         if (!prompt.trim()) continue;
 
-        // 3. Prédiction
-        process.stdout.write("\x1b[33mIA      > \x1b[0m" + prompt + " ");
+        // 2. Routage et chargement dynamique
+        const domain = moe.route(prompt);
+        const brain = moe.getExpert(domain);
+        const path = `${EXPERTS_DIR}expert_${domain}.gnr`;
+
+        if (!brain.hasBeenLoaded && fs.existsSync(path)) {
+            process.stdout.write(`\x1b[2m[Système: Chargement expert ${domain}...]\x1b[0m\r`);
+            brain.importState(fs.readFileSync(path));
+            brain.hasBeenLoaded = true;
+        }
+
+        brain.attachAttention(attention);
+        process.stdout.write(`\x1b[33mIA [${domain}] > \x1b[0m` + prompt + " ");
         
         try {
-            let response = brain.predictSense(prompt, depth, {
+            const response = brain.predictSense(prompt, depth, {
                 creativity: creativity,
                 topK: 3,
                 attention: attention

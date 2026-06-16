@@ -1506,30 +1506,36 @@ export class SemanticAttentionLayer {
  * Aligne la structure bit à bit sur des unités de sens (Tokens).
  */
 export class SemanticRelationalMemory {
-    constructor(contextSize = 16) {
+    constructor(contextSize = 16, sharedState = null) {
         // On utilise la mémoire bitwise comme moteur de transition
         this.bitEngine = new BitwiseRelationalMemory(contextSize * 12); 
-        this.vocabulary = new Map(); // Mot -> ID binaire
-        this.reverseVocab = new Map(); // ID binaire -> Mot
 
-        // Initialisation des jetons système pour la gestion des séquences
-        this.vocabulary.set("<pad>", 0);
-        this.vocabulary.set("<unk>", 1);
-        this.vocabulary.set("<eos>", 2);
-        this.reverseVocab.set(0, "<pad>");
-        this.reverseVocab.set(1, "<unk>");
-        this.reverseVocab.set(2, "<eos>");
+        if (sharedState) {
+            this.sharedState = sharedState;
+            this.vocabulary = sharedState.vocabulary;
+            this.reverseVocab = sharedState.reverseVocab;
+            this.wordCounts = sharedState.wordCounts;
+        } else {
+            this.sharedState = null;
+            this.vocabulary = new Map(); // Mot -> ID binaire
+            this.reverseVocab = new Map(); // ID binaire -> Mot
+            this.wordCounts = new Map(); // ID -> Fréquence globale
 
-        this.nextId = 3;
+            // Initialisation des jetons système pour la gestion des séquences
+            this.vocabulary.set("<pad>", 0);
+            this.vocabulary.set("<unk>", 1);
+            this.vocabulary.set("<eos>", 2);
+            this.reverseVocab.set(0, "<pad>");
+            this.reverseVocab.set(1, "<unk>");
+            this.reverseVocab.set(2, "<eos>");
+            this.nextId = 3;
+        }
+
         this.attention = null;
         // Nouvelle couche : Schémas de transition (Grammaire) - Stocke des trigrammes (A, B) -> C
         this.grammarMap = new Map(); // ID -> Map(SuivantID -> Poids)
         // Regex centralisée supportant les accents et l'élision
         this.tokenizer = /[a-z0-9àâäéèêëïîôöùûüç]+(?:['][a-z0-9àâäéèêëïîôöùûüç]*)?|[^\w\s]/gi;
-
-        // --- ANALYSE DE STRUCTURE PAR RÉPÉTITION ---
-        this.wordCounts = new Map(); // ID -> Fréquence globale
-        this.totalTokensProcessed = 0;
     }
 
     attachAttention(layer) {
@@ -1549,7 +1555,11 @@ export class SemanticRelationalMemory {
             this.reverseVocab = new Map();
             for (let [word, id] of this.vocabulary) {
                 this.reverseVocab.set(id, word);
-                if (id >= this.nextId) this.nextId = id + 1;
+                if (this.sharedState) {
+                    if (id >= this.sharedState.nextId) this.sharedState.nextId = id + 1;
+                } else {
+                    if (id >= this.nextId) this.nextId = id + 1;
+                }
             }
             if (state.wordCounts) this.wordCounts = new Map(state.wordCounts);
             if (state.grammar) {
@@ -1562,20 +1572,26 @@ export class SemanticRelationalMemory {
     /**
      * Exporte le modèle au format binaire compressé
      */
-    exportBinary() {
+    exportBinary(includeVocab = true) {
         const buffers = [];
         
         // 1. Vocabulaire
-        const vocabHead = Buffer.alloc(4);
-        vocabHead.writeUInt32LE(this.vocabulary.size, 0);
-        buffers.push(vocabHead);
-        for (let [word, id] of this.vocabulary) {
-            const sBuf = Buffer.from(word, 'utf8');
-            const b = Buffer.alloc(2 + sBuf.length + 4);
-            b.writeUInt16LE(sBuf.length, 0);
-            sBuf.copy(b, 2);
-            b.writeUInt32LE(id, 2 + sBuf.length);
-            buffers.push(b);
+        if (includeVocab) {
+            const vocabHead = Buffer.alloc(4);
+            vocabHead.writeUInt32LE(this.vocabulary.size, 0);
+            buffers.push(vocabHead);
+            for (let [word, id] of this.vocabulary) {
+                const sBuf = Buffer.from(word, 'utf8');
+                const b = Buffer.alloc(2 + sBuf.length + 4);
+                b.writeUInt16LE(sBuf.length, 0);
+                sBuf.copy(b, 2);
+                b.writeUInt32LE(id, 2 + sBuf.length);
+                buffers.push(b);
+            }
+        } else {
+            const emptyVocab = Buffer.alloc(4);
+            emptyVocab.writeUInt32LE(0, 0);
+            buffers.push(emptyVocab);
         }
 
         // 2. WordCounts
@@ -1612,7 +1628,21 @@ export class SemanticRelationalMemory {
         }
 
         // 4. BitEngine (Raw data)
-        const engineBuf = Buffer.from(this.bitEngine.data.buffer, this.bitEngine.data.byteOffset, this.bitEngine.data.byteLength);
+        const engineEntries = Array.from(this.bitEngine.data.entries());
+        const contextBytes = Math.ceil(this.bitEngine.contextSize / 8);
+        const entrySize = contextBytes + 8; // context + 2xUint32
+        const engineBuf = Buffer.alloc(engineEntries.length * entrySize);
+
+        for (let j = 0; j < engineEntries.length; j++) {
+            const [ctx, counts] = engineEntries[j];
+            let tempCtx = ctx;
+            for (let b = 0; b < contextBytes; b++) {
+                engineBuf.writeUInt8(Number(tempCtx & 0xFFn), (j * entrySize) + b);
+                tempCtx >>= 8n;
+            }
+            engineBuf.writeUInt32LE(counts[0], (j * entrySize) + contextBytes);
+            engineBuf.writeUInt32LE(counts[1], (j * entrySize) + contextBytes + 4);
+        }
         const engineHead = Buffer.alloc(4);
         engineHead.writeUInt32LE(engineBuf.length, 0);
         buffers.push(engineHead, engineBuf);
@@ -1649,7 +1679,11 @@ export class SemanticRelationalMemory {
             const id = raw.readUInt32LE(offset); offset += 4;
             this.vocabulary.set(word, id);
             this.reverseVocab.set(id, word);
-            if (id >= this.nextId) this.nextId = id + 1;
+            if (this.sharedState) {
+                if (id >= this.sharedState.nextId) this.sharedState.nextId = id + 1;
+            } else {
+                if (id >= this.nextId) this.nextId = id + 1;
+            }
         }
 
         // 2. WordCounts
@@ -1684,8 +1718,19 @@ export class SemanticRelationalMemory {
 
         // 4. BitEngine
         const engineLen = raw.readUInt32LE(offset); offset += 4;
-        const engineData = new Uint32Array(raw.buffer, raw.byteOffset + offset, engineLen / 4);
-        this.bitEngine.importState(engineData);
+        const contextBytes = Math.ceil(this.bitEngine.contextSize / 8);
+        const entrySize = contextBytes + 8;
+        this.bitEngine.data.clear();
+        for (let j = 0; j < engineLen; j += entrySize) {
+            let ctx = 0n;
+            for (let b = 0; b < contextBytes; b++) {
+                ctx |= BigInt(raw.readUInt8(offset + j + b)) << BigInt(b * 8);
+            }
+            const c0 = raw.readUInt32LE(offset + j + contextBytes);
+            const c1 = raw.readUInt32LE(offset + j + contextBytes + 4);
+            this.bitEngine.data.set(ctx, new Uint32Array([c0, c1]));
+        }
+        offset += engineLen;
     }
 
     /**
@@ -1761,7 +1806,21 @@ export class SemanticRelationalMemory {
         }
 
         // 5. BitEngine
-        const engineBuf = Buffer.from(this.bitEngine.data.buffer, this.bitEngine.data.byteOffset, this.bitEngine.data.byteLength);
+        const engineEntries = Array.from(this.bitEngine.data.entries());
+        const contextBytes = Math.ceil(this.bitEngine.contextSize / 8);
+        const entrySize = contextBytes + 8;
+        const engineBuf = Buffer.alloc(engineEntries.length * entrySize);
+
+        for (let j = 0; j < engineEntries.length; j++) {
+            const [ctx, counts] = engineEntries[j];
+            let tempCtx = ctx;
+            for (let b = 0; b < contextBytes; b++) {
+                engineBuf.writeUInt8(Number(tempCtx & 0xFFn), (j * entrySize) + b);
+                tempCtx >>= 8n;
+            }
+            engineBuf.writeUInt32LE(counts[0], (j * entrySize) + contextBytes);
+            engineBuf.writeUInt32LE(counts[1], (j * entrySize) + contextBytes + 4);
+        }
         const engineSize = Buffer.alloc(4);
         engineSize.writeUInt32LE(engineBuf.length, 0);
         buffers.push(engineSize, engineBuf);
@@ -1821,13 +1880,28 @@ export class SemanticRelationalMemory {
 
         // 5. BitEngine
         const engineLen = buffer.readUInt32LE(offset); offset += 4;
-        const engineData = new Uint32Array(buffer.buffer, buffer.byteOffset + offset, engineLen / 4);
-        this.bitEngine.importState(engineData);
+        const contextBytes = Math.ceil(this.bitEngine.contextSize / 8);
+        const entrySize = contextBytes + 8;
+        this.bitEngine.data.clear();
+        for (let j = 0; j < engineLen; j += entrySize) {
+            let ctx = 0n;
+            for (let b = 0; b < contextBytes; b++) {
+                ctx |= BigInt(buffer.readUInt8(offset + j + b)) << BigInt(b * 8);
+            }
+            const c0 = buffer.readUInt32LE(offset + j + contextBytes);
+            const c1 = buffer.readUInt32LE(offset + j + contextBytes + 4);
+            this.bitEngine.data.set(ctx, new Uint32Array([c0, c1]));
+        }
+        offset += engineLen;
 
         this.reverseVocab = new Map();
         for (let [word, id] of this.vocabulary) {
             this.reverseVocab.set(id, word);
-            if (id >= this.nextId) this.nextId = id + 1;
+            if (this.sharedState) {
+                if (id >= this.sharedState.nextId) this.sharedState.nextId = id + 1;
+            } else {
+                if (id >= this.nextId) this.nextId = id + 1;
+            }
         }
     }
 
@@ -1899,7 +1973,11 @@ export class SemanticRelationalMemory {
         for (const token of tokens) {
             let id = this.vocabulary.get(token);
             if (id === undefined) {
-                id = this.nextId++;
+                if (this.sharedState) {
+                    id = this.sharedState.nextId++;
+                } else {
+                    id = this.nextId++;
+                }
                 this.vocabulary.set(token, id);
                 this.reverseVocab.set(id, token);
             }
@@ -1909,7 +1987,8 @@ export class SemanticRelationalMemory {
             // Mise à jour de la statistique de répétition (Deduction des connecteurs)
             const currentCount = this.wordCounts.get(id) || 0;
             this.wordCounts.set(id, currentCount + weight);
-            this.totalTokensProcessed += weight;
+            if (this.sharedState) this.sharedState.totalTokensProcessed += weight;
+            else this.totalTokensProcessed = (this.totalTokensProcessed || 0) + weight;
 
             // 1. Enregistrement Bigramme (A -> B)
             if (prevId !== null) {
@@ -1953,13 +2032,14 @@ export class SemanticRelationalMemory {
 
         // Un mot est considéré comme structurel s'il représente plus de 0.5% du corpus
         // ou s'il fait partie du socle de base si le corpus est trop petit.
-        if (this.totalTokensProcessed < 500) {
+        const total = this.sharedState ? this.sharedState.totalTokensProcessed : (this.totalTokensProcessed || 0);
+        if (total < 500) {
             const word = this.reverseVocab.get(id);
             return word && ['et', 'ou', 'le', 'la', 'un', 'une', 'de', 'à', 'est', 'a'].includes(word.toLowerCase());
         }
 
         const count = this.wordCounts.get(id) || 0;
-        return (count / this.totalTokensProcessed) > 0.005;
+        return (count / total) > 0.005;
     }
 
     /**
@@ -5514,6 +5594,48 @@ export class BitwiseWordLearner {
         // Nettoyage des espaces pour les apostrophes (l'unité au lieu de l ' unité)
         return result.join(' ')
             .replace(/\s([,.;!])/g, '$1');
+    }
+}
+
+/**
+ * G-NEURO MOE : Orchestrateur de Mixture d'Experts (Chunks)
+ */
+export class GNeuroMoE {
+    constructor(contextSize = 16) {
+        this.contextSize = contextSize;
+        this.sharedState = {
+            vocabulary: new Map(),
+            reverseVocab: new Map(),
+            wordCounts: new Map(),
+            nextId: 3,
+            totalTokensProcessed: 0
+        };
+
+        // Jetons système partagés
+        this.sharedState.vocabulary.set("<pad>", 0);
+        this.sharedState.vocabulary.set("<unk>", 1);
+        this.sharedState.vocabulary.set("<eos>", 2);
+        this.sharedState.reverseVocab.set(0, "<pad>");
+        this.sharedState.reverseVocab.set(1, "<unk>");
+        this.sharedState.reverseVocab.set(2, "<eos>");
+
+        this.experts = new Map();
+    }
+
+    getExpert(domain) {
+        if (!this.experts.has(domain)) {
+            const brain = new SemanticRelationalMemory(this.contextSize, this.sharedState);
+            this.experts.set(domain, brain);
+        }
+        return this.experts.get(domain);
+    }
+
+    route(text) {
+        const t = text.toLowerCase();
+        if (t.includes("histoire") || t.includes("siècle") || t.includes("roi") || t.includes("guerre")) return "history";
+        if (t.includes("science") || t.includes("physique") || t.includes("math")) return "science";
+        if (t.includes("robot") || t.includes("code") || t.includes("tech") || t.includes("web")) return "tech";
+        return "general";
     }
 }
 

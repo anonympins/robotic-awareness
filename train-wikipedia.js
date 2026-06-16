@@ -1,18 +1,8 @@
-import { SemanticRelationalMemory, SemanticAttentionLayer } from "./neuro-lib.js";
+import { SemanticAttentionLayer } from "./neuro-lib.js";
 import { scrapeRandomWikipediaContent } from "./wikipedia-scraper.js";
 import fs from 'node:fs';
 
-export async function runWikipediaTraining() {
-    console.log("=== Initialisation du Cerveau Sémantique ===");
-    const attention = new SemanticAttentionLayer();
-    const brain = new SemanticRelationalMemory(16); // Contexte de 16 mots
-    brain.attachAttention(attention);
-    
-    const STORAGE_PATH = "./semantic_brain_storage.gnr";
-    if (fs.existsSync(STORAGE_PATH)) {
-        brain.importState(fs.readFileSync(STORAGE_PATH));
-    }
-
+export async function runWikipediaTraining(moe) {
     try {
         console.log("\n[1/3] Récupération d'une page aléatoire...");
         const { title, content: htmlContent } = await scrapeRandomWikipediaContent();
@@ -27,14 +17,31 @@ export async function runWikipediaTraining() {
             .replace(/\s+/g, ' ')    // Normaliser les espaces et sauts de ligne
             .trim();
 
-        console.log(`[2/3] Apprentissage de ${cleanContent.length} caractères...`);
+        // --- ROUTAGE MOE ---
+        const domain = moe.route(title + " " + cleanContent.slice(0, 500));
+        console.log(`[MoE] Domaine détecté : \x1b[33m${domain.toUpperCase()}\x1b[0m (Titre: ${title})`);
+        
+        const brain = moe.getExpert(domain);
+        const STORAGE_PATH = `./experts_chunks/expert_${domain}.gnr`;
+
+        // Chargement différé de l'expert depuis le disque si nécessaire
+        if (!brain.hasBeenLoaded && fs.existsSync(STORAGE_PATH)) {
+            console.log(`[MoE] Chargement du chunk : ${domain}`);
+            brain.importState(fs.readFileSync(STORAGE_PATH));
+            brain.hasBeenLoaded = true;
+        }
+
+        const attention = new SemanticAttentionLayer();
+        brain.attachAttention(attention);
+
+        console.log(`[2/3] Apprentissage (${domain}) de ${cleanContent.length} caractères...`);
         
         const start = Date.now();
         // learnText découpe par phrases et gère l'ingestion bit à bit
         brain.learnText(cleanContent, true); 
         const duration = Date.now() - start;
         
-        // Sauvegarde de l'état
+        if (!fs.existsSync("./experts_chunks/")) fs.mkdirSync("./experts_chunks/");
         fs.writeFileSync(STORAGE_PATH, brain.exportBinary());
 
         console.log(`Apprentissage terminé en ${duration}ms.`);
