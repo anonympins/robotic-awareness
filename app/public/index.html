@@ -16,6 +16,12 @@
             object-fit: cover; /* Important pour la vidéo */
         }
 
+        .tabs { display: flex; gap: 10px; margin-bottom: 20px; }
+        .tab-btn { padding: 10px 20px; cursor: pointer; background: #444; color: white; border: none; border-radius: 5px; }
+        .tab-btn.active { background: #007bff; }
+        .panel { display: none; }
+        .panel.active { display: block; }
+
         .container {
             display: flex;
             flex-wrap: wrap;
@@ -87,6 +93,13 @@
             background: #ff4444 !0important;
             animation: pulse 1s infinite;
         }
+        #archetype-canvas {
+            background: #000;
+            border: 1px solid #444;
+            border-radius: 8px;
+            display: block;
+            margin: 0 auto;
+        }
         @keyframes pulse {
             0% { opacity: 1; }
             50% { opacity: 0.5; }
@@ -95,7 +108,13 @@
     </style>
 </head>
 <body>
-<h1>Traitement Otsu en Temps Réel</h1>
+<h1>G-NEURO : Vision & Conscience 3D</h1>
+
+<div class="tabs">
+    <button class="tab-btn active" onclick="showPanel('gestures')">Gestes 2D</button>
+    <button class="tab-btn" onclick="showPanel('3d-training')">Entraînement 3D</button>
+</div>
+
 <div class="container">
     <div class="box">
         <p>Flux Original (Caméra)</p>
@@ -106,7 +125,9 @@
         <p>Flux Traité (Node.js)</p>
         <canvas id="outputCanvas" width="320" height="240"></canvas>
     </div>
-    <div class="box" style="min-width: 200px;">
+
+    <!-- PANNEAU GESTES -->
+    <div id="panel-gestures" class="box panel active" style="min-width: 250px;">
         <p>Actions G-NEURO</p>
         <div id="actionContainer"></div>
         <div style="margin-top: 15px; border-top: 1px solid #555; padding-top: 10px;">
@@ -116,10 +137,64 @@
             <button id="btnStop" style="padding: 5px 10px; cursor: pointer; background: #dc3545; color: white; border: none; border-radius: 3px; display: none;">Arrêter</button>
         </div>
     </div>
+
+    <!-- PANNEAU 3D -->
+    <div id="panel-3d-training" class="box panel" style="min-width: 250px;">
+        <p>Apprentissage Projectif</p>
+        <div class="debug-info" id="3d-status" style="height: 60px; margin-bottom: 10px;">Prêt pour calibration...</div>
+        <div style="display: flex; flex-direction: column; gap: 8px;">
+            <label style="background: #444; padding: 5px; border-radius: 4px; cursor: pointer; display: flex; align-items: center; gap: 10px;">
+                <input type="checkbox" id="check3DStream" onchange="toggle3DStream(this.checked)"> 
+                <span>📡 Stream Reconstruction 3D</span>
+            </label>
+
+            <label>Profondeur Cible (Z) : <span id="val-z">1.0</span>m</label>
+            <input type="range" id="input-z" min="0.5" max="5.0" step="0.1" value="1.0" oninput="document.getElementById('val-z').textContent=this.value">
+            
+            <button onclick="capture3DPose()" style="padding: 10px; background: #007bff; color: white; border: none; border-radius: 5px; cursor: pointer;">
+                📸 CAPTURER CETTE POSE (Train)
+            </button>
+            
+            <div id="reconstruction-results" style="margin-top: 5px; border-top: 1px solid #555; padding-top: 10px; display: none;">
+                <p style="font-size: 12px; color: #aaa;">Position 3D Estimée :</p>
+                <div id="estimated-pos" style="font-family: monospace; color: #0f0;">X: 0.0, Y: 0.0, Z: 0.0</div>
+                <p style="font-size: 12px; color: #aaa; margin-top: 5px;">Normale (Orientation) :</p>
+                <div id="estimated-normal" style="font-family: monospace; color: #00bcff;">X: 0.0, Y: 0.0, Z: 0.0</div>
+                <div id="reliability-bar" style="height: 4px; background: #555; margin-top: 8px; border-radius: 2px;">
+                    <div id="reliability-fill" style="height: 100%; width: 0%; background: #0f0; transition: width 0.2s;"></div>
+                </div>
+            </div>
+
+            <div style="margin-top: 10px; background: #111; padding: 10px; border-radius: 5px;">
+                <p style="font-size: 12px; margin-bottom: 5px;">Tester un modèle (.OBJ, .FBX) :</p>
+                <input type="file" id="obj-file" accept=".obj,.fbx" style="font-size: 10px; margin-bottom: 5px;">
+                <button onclick="runMeshBenchmark()" id="btn-bench" style="width: 100%; padding: 5px; background: #6f42c1; color: white; border: none; cursor: pointer; display: none;">
+                    ⚡ BENCHMARK (5000 cycles)
+                </button>
+                
+                <button onclick="generateArchetypes()" id="btn-archetypes" style="width: 100%; padding: 8px; background: #28a745; color: white; border: none; border-radius: 5px; cursor: pointer; margin-top: 10px;">
+                    🧬 GÉNÉRER LES ARCHÉTYPES
+                </button>
+            </div>
+            
+            <div id="archetype-results" style="display: none; margin-top: 15px;">
+                <p style="font-size: 12px; color: #888; margin-bottom: 5px;">Visualisation spatiale des archétypes appris :</p>
+                <canvas id="archetype-canvas" width="240" height="240"></canvas>
+            </div>
+        </div>
+    </div>
 </div>
+
 <div class="debug-info" id="debugInfo"></div>
 
 <script>
+    function showPanel(id) {
+        document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
+        document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+        document.getElementById('panel-' + id).classList.add('active');
+        event.target.classList.add('active');
+    }
+
     const video = document.getElementById('webcam');
     const canvas = document.getElementById('outputCanvas');
     const ctx = canvas.getContext('2d');
@@ -161,6 +236,112 @@
             ws.send(JSON.stringify({ type: 'DELETE_SAMPLE', gesture: name, index: gestureSamples[name].length - 1 }));
         }
     };
+
+    window.capture3DPose = () => {
+        const z = parseFloat(document.getElementById('input-z').value);
+        ws.send(JSON.stringify({ 
+            type: 'TRAIN_3D_POSE', 
+            target: { x: 0, y: 0, z: z } // On entraîne principalement la profondeur pour commencer
+        }));
+        const status = document.getElementById('3d-status');
+        status.innerHTML = `<div style="color: #0f0;">Outilleur : Pose apprise à Z=${z}m</div>`;
+    };
+
+    window.toggle3DStream = (active) => {
+        document.getElementById('reconstruction-results').style.display = active ? 'block' : 'none';
+        ws.send(JSON.stringify({ type: 'TOGGLE_3D_STREAM', active: active }));
+    };
+
+    document.getElementById('obj-file').onchange = function(e) {
+        const file = e.target.files[0];
+        const reader = new FileReader();
+        reader.onload = function(event) {
+            const fileData = new Uint8Array(event.target.result);
+            
+            // Format binaire : [Header "MESH" (4 octets)] + [Nom du fichier (longueur + data)] + [Contenu]
+            const nameBytes = new TextEncoder().encode(file.name);
+            const buffer = new Uint8Array(4 + 1 + nameBytes.length + fileData.length);
+            buffer.set([77, 69, 83, 72], 0); // "MESH"
+            buffer.set([nameBytes.length], 4);
+            buffer.set(nameBytes, 5);
+            buffer.set(fileData, 5 + nameBytes.length);
+
+            ws.send(buffer);
+            document.getElementById('btn-bench').style.display = 'block';
+        };
+        reader.readAsArrayBuffer(file);
+    };
+
+    window.runMeshBenchmark = () => {
+        const btn = document.getElementById('btn-bench');
+        btn.disabled = true;
+        btn.textContent = "Calcul en cours...";
+        ws.send(JSON.stringify({ type: 'BENCHMARK_3D' }));
+    };
+
+    window.generateArchetypes = () => {
+        ws.send(JSON.stringify({ type: 'GENERATE_ARCHETYPES' }));
+    };
+
+    function renderArchetypes(data) {
+        const container = document.getElementById('archetype-results');
+        container.style.display = 'block';
+        const canvas = document.getElementById('archetype-canvas');
+        const ctx = canvas.getContext('2d');
+        
+        // Nettoyage du canvas
+        ctx.fillStyle = '#000';
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        
+        const focal = 180;
+        const centerX = canvas.width / 2;
+        const centerY = canvas.height / 2;
+
+        // Tri par profondeur pour un rendu correct (Painter's algorithm)
+        const sorted = [...data].sort((a, b) => parseFloat(b.pos.z) - parseFloat(a.pos.z));
+
+        sorted.forEach(item => {
+            const x = parseFloat(item.pos.x);
+            const y = parseFloat(item.pos.y);
+            const z = parseFloat(item.pos.z);
+            const nx = parseFloat(item.normal.x);
+            const ny = parseFloat(item.normal.y);
+            const nz = parseFloat(item.normal.z);
+
+            // Projection perspective de la position
+            const f = focal / (z || 0.1);
+            const sx = x * f + centerX;
+            const sy = -y * f + centerY;
+
+            // Projection de l'extrémité de la normale
+            const nSize = 0.25; // Longueur du vecteur normal pour le visuel
+            const nf = focal / (z + nz * nSize || 0.1);
+            const nsx = (x + nx * nSize) * nf + centerX;
+            const nsy = -(y + ny * nSize) * nf + centerY;
+
+            const alpha = Math.min(1, 1.5 / z); // Estompage avec la profondeur
+            
+            // Dessin du point (Position)
+            ctx.fillStyle = `rgba(0, 255, 0, ${alpha})`;
+            ctx.beginPath();
+            ctx.arc(sx, sy, 3/z, 0, Math.PI * 2);
+            ctx.fill();
+
+            // Dessin de la normale (Vecteur d'orientation)
+            ctx.strokeStyle = `rgba(0, 188, 255, ${alpha})`;
+            ctx.lineWidth = 1.5/z;
+            ctx.beginPath();
+            ctx.moveTo(sx, sy);
+            ctx.lineTo(nsx, nsy);
+            ctx.stroke();
+            
+            // Tête de normale
+            ctx.fillStyle = `rgba(255, 255, 255, ${alpha})`;
+            ctx.beginPath();
+            ctx.arc(nsx, nsy, 1/z, 0, Math.PI * 2);
+            ctx.fill();
+        });
+    }
 
     buildActionUI();
 
@@ -306,6 +487,21 @@
                     btnStart.style.display = 'inline-block';
                     btnStop.style.display = 'none';
                     updateDebug(`🧠 Geste enregistré avec succès !`);
+                }
+                if (msg.type === '3D_ESTIMATE') {
+                    document.getElementById('estimated-pos').textContent = 
+                        `X: ${msg.pos.x}, Y: ${msg.pos.y}, Z: ${msg.pos.z}`;
+                    if (msg.normal) {
+                        document.getElementById('estimated-normal').textContent = 
+                            `X: ${msg.normal.x}, Y: ${msg.normal.y}, Z: ${msg.normal.z}`;
+                    }
+                    const rel = parseFloat(msg.reliability) * 100;
+                    document.getElementById('reliability-fill').style.width = rel + '%';
+                    document.getElementById('reliability-fill').style.background = 
+                        rel > 70 ? '#0f0' : (rel > 40 ? '#ff0' : '#f00');
+                }
+                if (msg.type === 'ARCHETYPES_LIST') {
+                    renderArchetypes(msg.data);
                 }
                 return;
             }
