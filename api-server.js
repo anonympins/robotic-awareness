@@ -6,7 +6,7 @@ import { SemanticRelationalMemory, SemanticAttentionLayer } from "./neuro-lib.js
 
 const app = express();
 const port = process.env.PORT || 7701;
-const STORAGE_PATH = "./semantic_brain_storage.json";
+const STORAGE_PATH = "./semantic_brain_storage.gnr";
 const CORPUS_FILE = "./training_corpus.txt";
 
 // Instance globale du cerveau pour éviter les accès disques répétitifs
@@ -20,8 +20,8 @@ brain.attachAttention(attention);
 function refreshBrainState() {
     try {
         if (fs.existsSync(STORAGE_PATH)) {
-            const data = JSON.parse(fs.readFileSync(STORAGE_PATH, 'utf8'));
-            brain.importState(data);
+            const buffer = fs.readFileSync(STORAGE_PATH);
+            brain.importState(buffer);
             return true;
         }
     } catch (err) {
@@ -57,7 +57,7 @@ app.post('/ingest', async (req, res) => {
         brain.learnText(text.trim(), false, weight);
 
         // Persistance immédiate après ingestion
-        fs.writeFileSync(STORAGE_PATH, JSON.stringify(brain.exportState()));
+        fs.writeFileSync(STORAGE_PATH, brain.exportBinary());
         
         // Archivage dans le fichier corpus global pour traçabilité
         fs.appendFileSync(CORPUS_FILE, `\n--- API INGESTION [${new Date().toLocaleString()}] ---\n${text.trim()}\n`, 'utf8');

@@ -3,6 +3,8 @@
 // "Lenient & Powerful" - Version Quaternions + Tête Chercheuse + FK
 // ============================================================
 
+import zlib from 'node:zlib';
+
 // ---------- Noyau Mathématique : Quaternions ----------
 export class Quaternion {
     constructor(w = 1, x = 0, y = 0, z = 0) {
@@ -1280,23 +1282,27 @@ export class BitwiseRelationalMemory {
      * Restaure l'état de la table de compteurs
      */
     importState(stateData) {
-        if (stateData) {
-            // Sécurité : Si les dimensions de la mémoire importée ne correspondent pas
-            // (ex: tablePower différent dans le fichier de stockage), on réalloue dynamiquement
-            if (stateData.length !== this.data.length) {
-                this.tableSize = stateData.length / 2;
-                this.tablePower = Math.round(Math.log2(this.tableSize));
-                this.data = new Uint32Array(stateData.length);
-            }
-            this.data.set(stateData);
+        if (!stateData) return;
+        
+        // Support du mode hybride : TypedArray direct ou conversion depuis structure JSON
+        const source = (stateData instanceof Uint32Array) ? stateData : 
+                       (Array.isArray(stateData) ? new Uint32Array(stateData) : Uint32Array.from(Object.values(stateData)));
+
+        if (source.length !== this.data.length) {
+            this.tableSize = source.length / 2;
+            this.tablePower = Math.round(Math.log2(this.tableSize));
+            this.data = new Uint32Array(source.length);
         }
+        this.data.set(source);
     }
 
     /**
      * Exporte les données pour la persistance JSON
      */
     exportState() {
-        return Array.from(this.data);
+        // Passage au mode binaire : on renvoie le TypedArray directement.
+        // Cela évite Array.from() qui bloque le thread principal sur les grosses mémoires.
+        return this.data;
     }
 }
 
@@ -1558,48 +1564,295 @@ export class SemanticRelationalMemory {
      * Charge un état complet (Vocabulaire + BitEngine)
      */
     importState(state) {
-        if (!state.vocab || !state.bitEngine) throw new Error("Format de stockage invalide");
-        this.grammarMap = new Map(); // Reset ou charger si présent
-        this.vocabulary = new Map(state.vocab);
-        this.reverseVocab = new Map();
-        this.nextId = 3; 
-        for (let [word, id] of this.vocabulary) {
-            this.reverseVocab.set(id, word);
-            if (id >= this.nextId) this.nextId = id + 1;
+        if (state instanceof Buffer || state instanceof Uint8Array) {
+            return this.importBinary(Buffer.from(state));
         }
-        
-        if (state.wordCounts) {
-            this.wordCounts = new Map(state.wordCounts);
-            this.totalTokensProcessed = Array.from(this.wordCounts.values()).reduce((a, b) => a + b, 0);
-        }
-
-        // Sécurité : s'assurer que les jetons système sont présents dans l'import
-        if (!this.vocabulary.has("<eos>")) {
-            this.vocabulary.set("<eos>", 2);
-            this.reverseVocab.set(2, "<eos>");
-        }
-
-        if (state.grammar) {
-            for (const [id, targets] of state.grammar) {
-                this.grammarMap.set(id, new Map(targets));
+        // Fallback pour compatibilité JSON
+        if (state.vocab) {
+            this.vocabulary = new Map(state.vocab);
+            this.reverseVocab = new Map();
+            for (let [word, id] of this.vocabulary) {
+                this.reverseVocab.set(id, word);
+                if (id >= this.nextId) this.nextId = id + 1;
             }
-        }
-
-        if (state.bitEngine && state.bitEngine.data) {
-            this.bitEngine.importState(new Uint32Array(state.bitEngine.data));
+            if (state.wordCounts) this.wordCounts = new Map(state.wordCounts);
+            if (state.grammar) {
+                this.grammarMap = new Map(state.grammar.map(([id, t]) => [id, new Map(t)]));
+            }
+            if (state.bitEngine?.data) this.bitEngine.importState(state.bitEngine.data);
         }
     }
 
     /**
-     * Exporte l'intégralité du cerveau (Vocabulaire + Poids binaires)
+     * Exporte le modèle au format binaire compressé
+     */
+    exportBinary() {
+        const buffers = [];
+        
+        // 1. Vocabulaire
+        const vocabHead = Buffer.alloc(4);
+        vocabHead.writeUInt32LE(this.vocabulary.size, 0);
+        buffers.push(vocabHead);
+        for (let [word, id] of this.vocabulary) {
+            const sBuf = Buffer.from(word, 'utf8');
+            const b = Buffer.alloc(2 + sBuf.length + 4);
+            b.writeUInt16LE(sBuf.length, 0);
+            sBuf.copy(b, 2);
+            b.writeUInt32LE(id, 2 + sBuf.length);
+            buffers.push(b);
+        }
+
+        // 2. WordCounts
+        const countHead = Buffer.alloc(4);
+        countHead.writeUInt32LE(this.wordCounts.size, 0);
+        buffers.push(countHead);
+        for (let [id, count] of this.wordCounts) {
+            const b = Buffer.alloc(8);
+            b.writeUInt32LE(id, 0);
+            b.writeUInt32LE(count, 4);
+            buffers.push(b);
+        }
+
+        // 3. Grammaire
+        const grammarHead = Buffer.alloc(4);
+        grammarHead.writeUInt32LE(this.grammarMap.size, 0);
+        buffers.push(grammarHead);
+        for (let [key, targets] of this.grammarMap) {
+            const isString = typeof key === 'string';
+            const kBuf = isString ? Buffer.from(key, 'utf8') : Buffer.alloc(0);
+            const b = Buffer.alloc(1 + 4 + 2 + kBuf.length + 4);
+            b.writeUInt8(isString ? 1 : 0, 0);
+            if (!isString) b.writeUInt32LE(Number(key), 1);
+            b.writeUInt16LE(kBuf.length, 5);
+            kBuf.copy(b, 7);
+            b.writeUInt32LE(targets.size, 7 + kBuf.length);
+            buffers.push(b);
+            for (let [tId, w] of targets) {
+                const tb = Buffer.alloc(8);
+                tb.writeUInt32LE(tId, 0);
+                tb.writeUInt32LE(w, 4);
+                buffers.push(tb);
+            }
+        }
+
+        // 4. BitEngine (Raw data)
+        const engineBuf = Buffer.from(this.bitEngine.data.buffer, this.bitEngine.data.byteOffset, this.bitEngine.data.byteLength);
+        const engineHead = Buffer.alloc(4);
+        engineHead.writeUInt32LE(engineBuf.length, 0);
+        buffers.push(engineHead, engineBuf);
+
+        const fullPayload = Buffer.concat(buffers);
+        
+        // Compression Zlib
+        const compressed = zlib.deflateSync(fullPayload, { level: 6 });
+        
+        // Header final [Signature 4b] [Taille Décompressée 4b] [Payload...]
+        const finalHeader = Buffer.alloc(8);
+        finalHeader.write("GNRZ", 0); 
+        finalHeader.writeUInt32LE(fullPayload.length, 4);
+        
+        return Buffer.concat([finalHeader, compressed]);
+    }
+
+    importBinary(buffer) {
+        const sig = buffer.toString('utf8', 0, 4);
+        if (sig !== "GNRZ") throw new Error("Format binaire G-NEURO invalide (attendu GNRZ)");
+        
+        const decompressedSize = buffer.readUInt32LE(4);
+        const raw = zlib.inflateSync(buffer.subarray(8));
+        
+        let offset = 0;
+
+        // 1. Vocab
+        const vocabSize = raw.readUInt32LE(offset); offset += 4;
+        this.vocabulary = new Map();
+        this.reverseVocab = new Map();
+        for (let i = 0; i < vocabSize; i++) {
+            const sLen = raw.readUInt16LE(offset); offset += 2;
+            const word = raw.toString('utf8', offset, offset + sLen); offset += sLen;
+            const id = raw.readUInt32LE(offset); offset += 4;
+            this.vocabulary.set(word, id);
+            this.reverseVocab.set(id, word);
+            if (id >= this.nextId) this.nextId = id + 1;
+        }
+
+        // 2. WordCounts
+        const countSize = raw.readUInt32LE(offset); offset += 4;
+        this.wordCounts = new Map();
+        this.totalTokensProcessed = 0;
+        for (let i = 0; i < countSize; i++) {
+            const id = raw.readUInt32LE(offset); offset += 4;
+            const count = raw.readUInt32LE(offset); offset += 4;
+            this.wordCounts.set(id, count);
+            this.totalTokensProcessed += count;
+        }
+
+        // 3. Grammaire
+        const grammarSize = raw.readUInt32LE(offset); offset += 4;
+        this.grammarMap = new Map();
+        for (let i = 0; i < grammarSize; i++) {
+            const isString = raw.readUInt8(offset) === 1;
+            let key = isString ? "" : raw.readUInt32LE(offset + 1);
+            const sLen = raw.readUInt16LE(offset + 5);
+            if (isString) key = raw.toString('utf8', offset + 7, offset + 7 + sLen);
+            offset += 7 + sLen;
+            const tCount = raw.readUInt32LE(offset); offset += 4;
+            const targets = new Map();
+            for (let j = 0; j < tCount; j++) {
+                const tId = raw.readUInt32LE(offset); offset += 4;
+                const w = raw.readUInt32LE(offset); offset += 4;
+                targets.set(tId, w);
+            }
+            this.grammarMap.set(key, targets);
+        }
+
+        // 4. BitEngine
+        const engineLen = raw.readUInt32LE(offset); offset += 4;
+        const engineData = new Uint32Array(raw.buffer, raw.byteOffset + offset, engineLen / 4);
+        this.bitEngine.importState(engineData);
+    }
+
+    /**
+     * Exporte l'intégralité du cerveau
      */
     exportState() {
         return {
             vocab: Array.from(this.vocabulary.entries()),
-            bitEngine: { data: this.bitEngine.exportState() },
+            bitEngine: { data: this.bitEngine.data }, // Référence directe au TypedArray
             grammar: Array.from(this.grammarMap.entries()).map(([id, targets]) => [id, Array.from(targets.entries())]),
             wordCounts: Array.from(this.wordCounts.entries())
         };
+    }
+
+    /**
+     * Exporte le modèle au format binaire consolidé (Random Access Mode)
+     * Format V2 : 100% binaire sans JSON intermédiaire
+     */
+    exportBinary() {
+        const buffers = [];
+        
+        // 1. Header
+        const head = Buffer.alloc(4);
+        head.write("GNR2", 0); 
+        buffers.push(head);
+
+        // 2. Vocabulaire
+        const vocabBuf = Buffer.alloc(4);
+        vocabBuf.writeUInt32LE(this.vocabulary.size, 0);
+        buffers.push(vocabBuf);
+        for (let [word, id] of this.vocabulary) {
+            const sBuf = Buffer.from(word, 'utf8');
+            const b = Buffer.alloc(2 + sBuf.length + 4);
+            b.writeUInt16LE(sBuf.length, 0);
+            sBuf.copy(b, 2);
+            b.writeUInt32LE(id, 2 + sBuf.length);
+            buffers.push(b);
+        }
+
+        // 3. WordCounts
+        const countHead = Buffer.alloc(4);
+        countHead.writeUInt32LE(this.wordCounts.size, 0);
+        buffers.push(countHead);
+        for (let [id, count] of this.wordCounts) {
+            const b = Buffer.alloc(8);
+            b.writeUInt32LE(id, 0);
+            b.writeUInt32LE(count, 4);
+            buffers.push(b);
+        }
+
+        // 4. Grammaire (Plus complexe car clés mixtes : nombre ou "ID-ID")
+        const grammarHead = Buffer.alloc(4);
+        grammarHead.writeUInt32LE(this.grammarMap.size, 0);
+        buffers.push(grammarHead);
+        for (let [key, targets] of this.grammarMap) {
+            const isStringKey = typeof key === 'string';
+            const kBuf = isStringKey ? Buffer.from(key, 'utf8') : Buffer.alloc(0);
+            
+            const b = Buffer.alloc(1 + 2 + kBuf.length + 4 + 4);
+            b.writeUInt8(isStringKey ? 1 : 0, 0); // Type
+            if (!isStringKey) b.writeUInt32LE(Number(key), 1); // Key ID
+            b.writeUInt16LE(kBuf.length, 5); // String Key Len
+            kBuf.copy(b, 7);
+            b.writeUInt32LE(targets.size, 7 + kBuf.length);
+            buffers.push(b);
+
+            for (let [tId, weight] of targets) {
+                const tb = Buffer.alloc(8);
+                tb.writeUInt32LE(tId, 0);
+                tb.writeUInt32LE(weight, 4);
+                buffers.push(tb);
+            }
+        }
+
+        // 5. BitEngine
+        const engineBuf = Buffer.from(this.bitEngine.data.buffer, this.bitEngine.data.byteOffset, this.bitEngine.data.byteLength);
+        const engineSize = Buffer.alloc(4);
+        engineSize.writeUInt32LE(engineBuf.length, 0);
+        buffers.push(engineSize, engineBuf);
+
+        return Buffer.concat(buffers);
+    }
+
+    /**
+     * Importe le modèle depuis un buffer binaire Random Access
+     */
+    importBinary(buffer) {
+        let offset = 0;
+        const sig = buffer.toString('utf8', 0, 4);
+        if (sig !== "GNR2") throw new Error("Format binaire incompatible ou corrompu");
+        offset += 4;
+
+        // 2. Vocab
+        const vocabSize = buffer.readUInt32LE(offset); offset += 4;
+        this.vocabulary = new Map();
+        for (let i = 0; i < vocabSize; i++) {
+            const sLen = buffer.readUInt16LE(offset); offset += 2;
+            const word = buffer.toString('utf8', offset, offset + sLen); offset += sLen;
+            const id = buffer.readUInt32LE(offset); offset += 4;
+            this.vocabulary.set(word, id);
+        }
+
+        // 3. WordCounts
+        const countSize = buffer.readUInt32LE(offset); offset += 4;
+        this.wordCounts = new Map();
+        this.totalTokensProcessed = 0;
+        for (let i = 0; i < countSize; i++) {
+            const id = buffer.readUInt32LE(offset); offset += 4;
+            const count = buffer.readUInt32LE(offset); offset += 4;
+            this.wordCounts.set(id, count);
+            this.totalTokensProcessed += count;
+        }
+
+        // 4. Grammaire
+        const grammarSize = buffer.readUInt32LE(offset); offset += 4;
+        this.grammarMap = new Map();
+        for (let i = 0; i < grammarSize; i++) {
+            const isString = buffer.readUInt8(offset) === 1;
+            let key = isString ? "" : buffer.readUInt32LE(offset + 1);
+            const sLen = buffer.readUInt16LE(offset + 5); 
+            if (isString) key = buffer.toString('utf8', offset + 7, offset + 7 + sLen);
+            offset += 7 + sLen;
+            
+            const tCount = buffer.readUInt32LE(offset); offset += 4;
+            const targets = new Map();
+            for (let j = 0; j < tCount; j++) {
+                const tId = buffer.readUInt32LE(offset); offset += 4;
+                const weight = buffer.readUInt32LE(offset); offset += 4;
+                targets.set(tId, weight);
+            }
+            this.grammarMap.set(key, targets);
+        }
+
+        // 5. BitEngine
+        const engineLen = buffer.readUInt32LE(offset); offset += 4;
+        const engineData = new Uint32Array(buffer.buffer, buffer.byteOffset + offset, engineLen / 4);
+        this.bitEngine.importState(engineData);
+
+        this.reverseVocab = new Map();
+        for (let [word, id] of this.vocabulary) {
+            this.reverseVocab.set(id, word);
+            if (id >= this.nextId) this.nextId = id + 1;
+        }
     }
 
     /**

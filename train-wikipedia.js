@@ -8,9 +8,9 @@ export async function runWikipediaTraining() {
     const brain = new SemanticRelationalMemory(16); // Contexte de 16 mots
     brain.attachAttention(attention);
     
-    const STORAGE_PATH = "./semantic_brain_storage.json";
+    const STORAGE_PATH = "./semantic_brain_storage.gnr";
     if (fs.existsSync(STORAGE_PATH)) {
-        brain.importState(JSON.parse(fs.readFileSync(STORAGE_PATH, 'utf8')));
+        brain.importState(fs.readFileSync(STORAGE_PATH));
     }
 
     try {
@@ -35,7 +35,7 @@ export async function runWikipediaTraining() {
         const duration = Date.now() - start;
         
         // Sauvegarde de l'état
-        fs.writeFileSync(STORAGE_PATH, JSON.stringify(brain.exportState()));
+        fs.writeFileSync(STORAGE_PATH, brain.exportBinary());
 
         console.log(`Apprentissage terminé en ${duration}ms.`);
         console.log(`Vocabulaire acquis : ${brain.vocabulary.size} mots.`);
