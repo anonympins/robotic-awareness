@@ -49,8 +49,8 @@ export async function runWikipediaTraining(moe) {
         console.log(`[2/3] Apprentissage (${domain}) de ${cleanContent.length} caractères...`);
         
         const start = Date.now();
-        // learnText découpe par phrases et gère l'ingestion bit à bit
-        brain.learnText(cleanContent, true); 
+        // On augmente le poids à 5 pour que les transitions soient marquées dès le premier passage
+        brain.learnText(cleanContent, true, 5); 
         const duration = Date.now() - start;
         
         if (!fs.existsSync("./experts_chunks/")) fs.mkdirSync("./experts_chunks/");
@@ -72,8 +72,8 @@ export async function runWikipediaTraining(moe) {
 
         // Prédiction avec une tolérance de score légèrement plus souple
         const prediction = brain.predictSense(amorce, 30, {
-            creativity: 0.05,
-            topK: 1,
+            creativity: 0.01,
+            topK: 3,
             attention: attention
         });
 

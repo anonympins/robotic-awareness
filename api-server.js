@@ -14,6 +14,9 @@ if (!fs.existsSync(EXPERTS_DIR)) fs.mkdirSync(EXPERTS_DIR);
 const moe = new GNeuroMoE(16);
 const attention = new SemanticAttentionLayer();
 
+// Charger l'état global pour le routage et le vocabulaire dès le démarrage
+moe.loadSharedState(`${EXPERTS_DIR}shared_state.gnr`);
+
 /**
  * Récupère un expert et charge son état binaire si nécessaire
  */
@@ -23,10 +26,26 @@ function getExpertForContent(text) {
     const path = `${EXPERTS_DIR}expert_${domain}.gnr`;
 
     if (!brain.hasBeenLoaded && fs.existsSync(path)) {
-        console.log(`[MoE] Chargement binaire de l'expert : ${domain}`);
+        console.log(`\x1b[2m[MoE] Chargement binaire de l'expert : ${domain}\x1b[0m`);
         brain.importState(fs.readFileSync(path));
         brain.hasBeenLoaded = true;
     }
+
+    // Statistiques de mémorisation de l'expert
+    const vocabSize = brain.vocabulary.size;
+    const grammarSize = brain.grammarMap.size;
+    const totalTokens = brain.sharedState ? brain.sharedState.totalTokensProcessed : (brain.totalTokensProcessed || 0);
+    
+    console.log(`\x1b[2m[DEBUG] Expert [${domain}]: Vocab=${vocabSize}, Transitions=${grammarSize}, Tokens vus=${totalTokens}\x1b[0m`);
+
+    // Analyse de la compréhension du prompt
+    const tokens = text.toLowerCase().match(brain.tokenizer) || [];
+    const known = tokens.filter(t => brain.vocabulary.has(t)).length;
+    if (tokens.length > 0) {
+        const ratio = (known / tokens.length * 100).toFixed(0);
+        console.log(`\x1b[2m[DEBUG] Compréhension du prompt: ${known}/${tokens.length} mots connus (${ratio}%)\x1b[0m`);
+    }
+
     return { brain, domain, path };
 }
 
@@ -98,6 +117,10 @@ app.post('/query', async (req, res) => {
             topK: topK,
             attention: attention
         });
+
+        if (!prediction || prediction.trim().length === 0) {
+            console.log("\x1b[33m[!] Alerte : La réponse est vide. L'expert n'a trouvé aucun candidat viable pour ce contexte.\x1b[0m");
+        }
 
         res.json({
             success: true,

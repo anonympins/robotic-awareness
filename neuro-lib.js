@@ -4,6 +4,8 @@
 // ============================================================
 
 import zlib from 'node:zlib';
+import fs from 'node:fs';
+import path from 'node:path';
 
 // ---------- Noyau Mathématique : Quaternions ----------
 export class Quaternion {
@@ -1684,8 +1686,7 @@ export class SemanticRelationalMemory {
 
         // 1. Vocab
         const vocabSize = raw.readUInt32LE(offset); offset += 4;
-        this.vocabulary = new Map();
-        this.reverseVocab = new Map();
+        // On ne vide plus : on met à jour le vocabulaire partagé
         for (let i = 0; i < vocabSize; i++) {
             const sLen = raw.readUInt16LE(offset); offset += 2;
             const word = raw.toString('utf8', offset, offset + sLen); offset += sLen;
@@ -1701,7 +1702,7 @@ export class SemanticRelationalMemory {
 
         // 2. WordCounts
         const countSize = raw.readUInt32LE(offset); offset += 4;
-        this.wordCounts = new Map();
+        // On fusionne les statistiques de comptage
         this.totalTokensProcessed = 0;
         for (let i = 0; i < countSize; i++) {
             const id = raw.readUInt32LE(offset); offset += 4;
@@ -1712,7 +1713,7 @@ export class SemanticRelationalMemory {
 
         // 3. Grammaire
         const grammarSize = raw.readUInt32LE(offset); offset += 4;
-        this.grammarMap = new Map();
+        this.grammarMap.clear();
         for (let i = 0; i < grammarSize; i++) {
             const type = raw.readUInt8(offset);
             let key;
@@ -2121,7 +2122,7 @@ export class SemanticRelationalMemory {
                 const transitionProb = this.bitEngine.scoreId(id);
                 
                 // FIDÉLITÉ ABSOLUE : Si le binaire dit 0, le mot est exclu immédiatement.
-                if (transitionProb === 0 && creativity < 0.2) continue;
+                if (transitionProb < 0.0001 && creativity < 0.01 && !hasTrigramOptions) continue;
 
                 // Pondération dynamique de transitionProb basée sur la créativité
                 // Quand creativity est 0, transitionWeight est 10.0. Quand creativity est 1.0, transitionWeight est 4.0.
@@ -2200,7 +2201,7 @@ export class SemanticRelationalMemory {
 
                 // Si on est en mode Verbatim (transitionProb élevé), on ignore la grammaire et le sens.
                 // Le binaire devient le SEUL décideur.
-                const verbatimBoost = transitionProb > 0.9 ? 1000000.0 : 1.0;
+                const verbatimBoost = transitionProb > 0.8 ? 100.0 : 1.0;
 
                 let score = (grammarScore + transitionProb * transitionWeight + meaningPower) * 
                             contextBoost * verbatimBoost * structuralPenalty * flowBias;
@@ -2211,10 +2212,16 @@ export class SemanticRelationalMemory {
                     else if (bigramHit) score *= 20.0;
                     else if (transitionProb > 0.8) score *= 10.0;
                 }
+                
+                // Sécurité pour les petits modèles : si on a un hit grammatical, on force le score
+                if (hasTrigramOptions && trigramHit) {
+                    score += 1000;
+                }
 
                 // 4. Filtre de bruit sémantique (Heuristique)
                 // On pénalise les balises HTML communes et les identifiants techniques (mixte lettres/chiffres)
-                if (['div', 'span', 'class', 'id', 'href', 'width', 'height', 'style', 'mw', 'parser', 'output', 'ch', 'sc', 'sc2', 'sc3', 'en', 'http', 'www', 'oldid', 'news', 'title', 'index', 'php'].includes(word)) score *= 0.000001;
+                if (['<unk>', 'div', 'span', 'class', 'id', 'href', 'width', 'height', 'style', 'mw', 'parser', 'output', 'ch', 'sc', 'sc2', 'sc3', 'en', 'http', 'www', 'oldid', 'news', 'title', 'index', 'php'].includes(word)) score *= 0.000001;
+                if (word === "<unk>") score *= 0.00001; // Penalty for unknown token during generation
                 if (word.length > 20) score *= 0.1; // Mots anormalement longs
                 
                 // Filtre anti-nombre strict
@@ -2238,11 +2245,11 @@ export class SemanticRelationalMemory {
 
             // --- DÉTECTION DE FIN DE COHÉRENCE ---
             // On calcule la confiance relative du meilleur candidat
-            const topScore = candidates[0].score;
-            rollingConfidence = (rollingConfidence * 0.8) + (Math.min(1.0, topScore / 10) * 0.2);
+            const topScore = candidates.length > 0 ? candidates[0].score : 0;
+            rollingConfidence = (rollingConfidence * 0.9) + (Math.min(1.0, topScore) * 0.1);
 
             // Si la confiance chute trop bas ou si le score est dérisoire, on arrête
-            if (topScore < 1e-11 || (i > 5 && rollingConfidence < 0.05)) {
+            if (topScore < 1e-18 || (i > 5 && rollingConfidence < 0.001)) {
                 break; 
             }
             
@@ -5587,9 +5594,10 @@ export class BitwiseWordLearner {
  * G-NEURO MOE : Orchestrateur de Mixture d'Experts (Chunks)
  */
 export class GNeuroMoE {
-    constructor(contextSize = 16, maxExpertsInRam = 3) {
+    constructor(contextSize = 16, maxExpertsInRam = 3, storagePath = './experts_chunks/') {
         this.contextSize = contextSize;
         this.maxExpertsInRam = maxExpertsInRam;
+        this.storagePath = storagePath;
         this.sharedState = {
             vocabulary: new Map(),
             reverseVocab: new Map(),
@@ -5609,6 +5617,30 @@ export class GNeuroMoE {
         this.experts = new Map();
     }
 
+    /**
+     * Sauvegarde l'état global (Vocabulaire et statistiques)
+     */
+    saveSharedState(filePath) {
+        const brain = new SemanticRelationalMemory(this.contextSize, this.sharedState);
+        // On exporte seulement le vocabulaire et les counts, pas le moteur binaire d'un expert
+        const buffer = brain.exportBinary(true);
+        fs.writeFileSync(filePath, buffer);
+    }
+
+    /**
+     * Charge l'état global
+     */
+    loadSharedState(filePath) {
+        if (!fs.existsSync(filePath)) return;
+        const brain = new SemanticRelationalMemory(this.contextSize, this.sharedState);
+        brain.importBinary(fs.readFileSync(filePath));
+        
+        // Synchronisation du sharedState après import
+        this.sharedState.nextId = brain.sharedState.nextId;
+        this.sharedState.totalTokensProcessed = brain.sharedState.totalTokensProcessed;
+        console.log(`\x1b[2m[MoE] État global chargé : ${this.sharedState.vocabulary.size} mots connus.\x1b[0m`);
+    }
+
     getExpert(domain) {
         if (this.experts.has(domain)) {
             // Système LRU : On remonte l'expert à la fin de la Map pour marquer son usage récent
@@ -5621,8 +5653,20 @@ export class GNeuroMoE {
         // Si on dépasse la limite de RAM, on décharge l'expert le moins récemment utilisé
         if (this.experts.size >= this.maxExpertsInRam) {
             const oldestDomain = this.experts.keys().next().value;
+            const oldestExpert = this.experts.get(oldestDomain);
+
+            // Auto-sauvegarde avant éviction
+            if (this.storagePath && oldestExpert) {
+                try {
+                    const buffer = oldestExpert.exportBinary();
+                    if (!fs.existsSync(this.storagePath)) fs.mkdirSync(this.storagePath, { recursive: true });
+                    fs.writeFileSync(path.join(this.storagePath, `expert_${oldestDomain}.gnr`), buffer);
+                } catch (e) {
+                    console.error(`\x1b[31m[MoE Error]\x1b[0m Échec de l'auto-sauvegarde pour ${oldestDomain}:`, e.message);
+                }
+            }
+
             this.experts.delete(oldestDomain);
-            // Note: Le Garbage Collector libérera la mémoire au prochain cycle
         }
 
         const brain = new SemanticRelationalMemory(this.contextSize, this.sharedState);
@@ -5636,7 +5680,8 @@ export class GNeuroMoE {
      * @param {string[]} highImpactTokens Liste de mots (ex: du titre) qui bypassent la maturité
      */
     route(text, highImpactTokens = []) {
-        const tokens = text.toLowerCase().match(/[a-z0-9àâäéèêëïîôöùûüç]{4,}/g) || [];
+        // Changement de {4,} à {2,} pour accepter les mots courts mais porteurs de sens (IA, ADN, EST, etc.)
+        const tokens = text.toLowerCase().match(/[a-z0-9àâäéèêëïîôöùûüç]{2,}/g) || [];
         if (tokens.length === 0) return "general";
 
         const MATURITY_THRESHOLD = 5;
