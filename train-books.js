@@ -105,30 +105,56 @@ export async function runBookTraining() {
                 break; // Plus de livres sur cette page, ou fin des résultats
             }
 
-            for (const book of booksOnPage) {
-                const currentStatsForBook = getDailyStats(); // Récupère les stats à jour avant chaque livre
-                // Vérifie si on a assez de quota pour la requête de contenu du livre
-                if (currentStatsForBook.count + 1 > MAX_REQ_PER_DAY) {
-                    console.log(`\x1b[33m[Books] Quota journalier presque atteint (${currentStatsForBook.count}/${MAX_REQ_PER_DAY}). Arrêt du traitement des livres.\x1b[0m`);
-                    break; // Arrête le traitement des livres sur cette page
+            // 2. Récupération Parallèle : On remplit un buffer de textes avant l'entraînement lourd
+            const pageTextBuffer = [];
+            const BATCH_SIZE = 10;
+
+            for (let i = 0; i < booksOnPage.length; i += BATCH_SIZE) {
+                const currentStatsForBatch = getDailyStats();
+                if (currentStatsForBatch.count + BATCH_SIZE > MAX_REQ_PER_DAY) {
+                    console.log(`\x1b[33m[Books] Quota insuffisant pour le prochain lot. Bufferisation partielle.\x1b[0m`);
+                    break;
                 }
 
-                console.log(`\x1b[34m[Books]\x1b[0m Lecture de : "${book.title}" (ID: ${book.id})...`);
-                // 2. Récupération du texte nettoyé directement via l'API
-                const textData = await fetchFromRapidAPI(`/books/${book.id}/text?cleaning_mode=simple`);
-                const text = textData.text || textData.content || "";
-
-                if (!text) {
-                    console.warn(`\x1b[33m[Books] Contenu textuel indisponible pour "${book.title}".\x1b[0m`);
-                    continue; // Passe au livre suivant
-                }
+                const batch = booksOnPage.slice(i, i + BATCH_SIZE);
+                console.log(`\x1b[34m[Books]\x1b[0m Récupération parallèle du lot ${Math.floor(i/BATCH_SIZE)+1}...`);
                 
-                // 3. Utilisation de learnText de neuro-lib.js pour un apprentissage optimisé
-                // Le paramètre 'continuous: true' permet de garder le contexte entre les phrases du même livre
-                brain.learnText(text, true);
-                booksProcessedCount++;
-                console.log(`\x1b[32m[Books] Apprentissage de "${book.title}" terminé. Livres traités: ${booksProcessedCount}.\x1b[0m`);
+                const batchResults = await Promise.all(batch.map(async (book) => {
+                    try {
+                        const textData = await fetchFromRapidAPI(`/books/${book.id}/text?cleaning_mode=simple`);
+                        return { title: book.title, text: textData.text || textData.content || "" };
+                    } catch (e) {
+                        return { title: book.title, text: "" };
+                    }
+                }));
+
+                pageTextBuffer.push(...batchResults.filter(b => b.text.length > 100));
             }
+
+            // 3. Traitement Séquentiel CPU : On entraîne le cerveau sur les données sécurisées en mémoire
+            console.log(`\x1b[34m[Books]\x1b[0m Début de l'entraînement lourd sur ${pageTextBuffer.length} livres sécurisés...`);
+            
+            for (const bookData of pageTextBuffer) {
+                const subPhrases = bookData.text.split(/(?<=[.!,?;])(?:\s+|\n+|$)/)
+                    .map(s => s.trim())
+                    .filter(s => {
+                        if (s.length < 3) return false;
+                        const tokens = s.match(brain.tokenizer) || [];
+                        return tokens.length >= 2;
+                    });
+
+                const iterations = 30;
+                console.log(`\x1b[32m[CPU]\x1b[0m Apprentissage Verbatim : "${bookData.title}" (${subPhrases.length} segments)`);
+
+                for (let i = 0; i < iterations; i++) {
+                    // Mélange pour éviter les biais de linéarité
+                    subPhrases.sort(() => Math.random() - 0.5);
+                    subPhrases.forEach(phrase => {
+                        brain.learnSense(phrase, true, 1);
+                    });
+                }
+            }
+            booksProcessedCount += pageTextBuffer.length;
 
             currentPage++;
             // Si la boucle interne a été interrompue à cause du quota, on sort aussi de la boucle de pagination

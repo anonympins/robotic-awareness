@@ -111,12 +111,18 @@ Each vortex develops its own statistical "personality":
 *   **Local Grammar**: Transition probabilities (`grammarMap`) are unique to each expert.
 *   **Bitwise Sculpting**: The `NeuralBitPredictor` within each vortex refines its 256 KB probability table based on its specific domain.
 
-### 3. Dynamic RAM Management
+### 3. Fractal MoE (Sub-Experts)
+Each Vortex expert further subdivides its knowledge into **Virtualized Sub-Experts**:
+*   **Granular Specialization**: Within a single domain (e.g., "Robotics"), sub-experts focus on specific sub-contexts (e.g., "Navigation" vs "Hardware specs") based on local sentence seeds.
+*   **Boosted Specialty**: Sub-experts apply a weight boost (x3) to transitions learned within their specific micro-context, significantly increasing fidelity for complex sub-topics.
+*   **Resource Efficiency**: These sub-experts are virtualized within the expert's `grammarMap`, maintaining a low memory footprint while providing deep specialization.
+
+### 4. Dynamic RAM Management
 To allow the system to handle thousands of experts on low-memory hardware:
 *   **LRU System (Least Recently Used)**: Only the most active experts are kept in RAM.
 *   **Binary Persistence**: Inactive experts are serialized in `GNRZ` format (Zlib compressed) to the disk and reloaded instantly when their specific concept is triggered.
 
-### 4. Learning via "Sense"
+### 5. Learning via "Sense"
 The `learnSense` method does not store raw text. It converts semantic units into **12-bit binary IDs** and uses the `bitEngine` to physically modify the probabilistic memory. This is a non-destructive, cumulative memorization process.
  
 ---
