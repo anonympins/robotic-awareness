@@ -1294,6 +1294,7 @@ export class SemanticAttentionLayer {
         // Matrice de corrélation bit à bit (ID -> ID)
         // Utilise un Uint32Array pour compter les co-occurrences entre IDs
         this.correlationMatrix = new Map(); 
+        this.maxCorrelations = 80000; // Limite de densité pour éviter l'explosion RAM
     }
 
     /**
@@ -1301,6 +1302,11 @@ export class SemanticAttentionLayer {
      * Plus deux mots sont proches dans la phrase, plus leur lien est fort.
      */
     correlate(ids, weight = 1, maxWindow = 15) {
+        // Pruning proactif si la matrice sature
+        if (this.correlationMatrix.size > this.maxCorrelations) {
+            this.pruneMatrix(0.5); // On remonte le seuil brutalement pour faire de la place
+        }
+
         // Sécurité : Si la phrase est anormalement longue, on évite le O(N^2) total
         for (let i = 0; i < ids.length; i++) {
             // Fenêtre glissante limitée : la corrélation sémantique au-delà de 15 mots est souvent du bruit
@@ -1508,7 +1514,12 @@ export class SemanticAttentionLayer {
 export class SemanticRelationalMemory {
     constructor(contextSize = 16, sharedState = null) {
         // On utilise la mémoire bitwise comme moteur de transition
-        this.bitEngine = new BitwiseRelationalMemory(contextSize * 12); 
+        // Remplacement de BitwiseRelationalMemory (Map) par NeuralBitPredictor (TypedArray fixe)
+        this.bitEngine = new NeuralBitPredictor(contextSize * 12, 18);
+
+        // --- PARAMÈTRES DE PRUNING PROACTIF ---
+        this.maxContexts = 120000; // Seuil de sécurité RAM (environ 250Mo d'objets Map)
+        this.maxTargetsPerContext = 32; // Richesse grammaticale max par mot
 
         if (sharedState) {
             this.sharedState = sharedState;
@@ -1565,7 +1576,14 @@ export class SemanticRelationalMemory {
             if (state.grammar) {
                 this.grammarMap = new Map(state.grammar.map(([id, t]) => [id, new Map(t)]));
             }
-            if (state.bitEngine?.data) this.bitEngine.importState(state.bitEngine.data);
+            if (state.bitEngine?.data) {
+                // Gestion adaptative selon le moteur utilisé (Map ou TypedArray)
+                if (this.bitEngine.setState) {
+                    this.bitEngine.setState(new Uint8Array(state.bitEngine.data));
+                } else {
+                    this.bitEngine.importState(state.bitEngine.data);
+                }
+            }
         }
     }
 
@@ -1609,16 +1627,24 @@ export class SemanticRelationalMemory {
         const grammarHead = Buffer.alloc(4);
         grammarHead.writeUInt32LE(this.grammarMap.size, 0);
         buffers.push(grammarHead);
+
         for (let [key, targets] of this.grammarMap) {
             const isString = typeof key === 'string';
+            const isBigInt = typeof key === 'bigint';
+            const type = isString ? 1 : (isBigInt ? 2 : 0); // 0: Number, 1: String, 2: BigInt
+
             const kBuf = isString ? Buffer.from(key, 'utf8') : Buffer.alloc(0);
-            const b = Buffer.alloc(1 + 4 + 2 + kBuf.length + 4);
-            b.writeUInt8(isString ? 1 : 0, 0);
-            if (!isString) b.writeUInt32LE(Number(key), 1);
-            b.writeUInt16LE(kBuf.length, 5);
-            kBuf.copy(b, 7);
-            b.writeUInt32LE(targets.size, 7 + kBuf.length);
+            const b = Buffer.alloc(1 + 8 + 2 + kBuf.length + 4); // 8 bytes for ID/BigInt
+            
+            b.writeUInt8(type, 0);
+            if (type === 0) b.writeUInt32LE(Number(key), 1);
+            else if (type === 2) b.writeBigUInt64LE(key, 1);
+            
+            b.writeUInt16LE(kBuf.length, 9);
+            kBuf.copy(b, 11);
+            b.writeUInt32LE(targets.size, 11 + kBuf.length);
             buffers.push(b);
+
             for (let [tId, w] of targets) {
                 const tb = Buffer.alloc(8);
                 tb.writeUInt32LE(tId, 0);
@@ -1627,22 +1653,9 @@ export class SemanticRelationalMemory {
             }
         }
 
-        // 4. BitEngine (Raw data)
-        const engineEntries = Array.from(this.bitEngine.data.entries());
-        const contextBytes = Math.ceil(this.bitEngine.contextSize / 8);
-        const entrySize = contextBytes + 8; // context + 2xUint32
-        const engineBuf = Buffer.alloc(engineEntries.length * entrySize);
-
-        for (let j = 0; j < engineEntries.length; j++) {
-            const [ctx, counts] = engineEntries[j];
-            let tempCtx = ctx;
-            for (let b = 0; b < contextBytes; b++) {
-                engineBuf.writeUInt8(Number(tempCtx & 0xFFn), (j * entrySize) + b);
-                tempCtx >>= 8n;
-            }
-            engineBuf.writeUInt32LE(counts[0], (j * entrySize) + contextBytes);
-            engineBuf.writeUInt32LE(counts[1], (j * entrySize) + contextBytes + 4);
-        }
+        // 4. BitEngine (Fix: NeuralBitPredictor uses .table buffer directly)
+        const table = this.bitEngine.getState();
+        const engineBuf = Buffer.from(table.buffer);
         const engineHead = Buffer.alloc(4);
         engineHead.writeUInt32LE(engineBuf.length, 0);
         buffers.push(engineHead, engineBuf);
@@ -1701,11 +1714,15 @@ export class SemanticRelationalMemory {
         const grammarSize = raw.readUInt32LE(offset); offset += 4;
         this.grammarMap = new Map();
         for (let i = 0; i < grammarSize; i++) {
-            const isString = raw.readUInt8(offset) === 1;
-            let key = isString ? "" : raw.readUInt32LE(offset + 1);
-            const sLen = raw.readUInt16LE(offset + 5);
-            if (isString) key = raw.toString('utf8', offset + 7, offset + 7 + sLen);
-            offset += 7 + sLen;
+            const type = raw.readUInt8(offset);
+            let key;
+            if (type === 0) key = raw.readUInt32LE(offset + 1);
+            else if (type === 2) key = raw.readBigUInt64LE(offset + 1);
+            
+            const sLen = raw.readUInt16LE(offset + 9);
+            if (type === 1) key = raw.toString('utf8', offset + 11, offset + 11 + sLen);
+            offset += 11 + sLen;
+
             const tCount = raw.readUInt32LE(offset); offset += 4;
             const targets = new Map();
             for (let j = 0; j < tCount; j++) {
@@ -1716,20 +1733,10 @@ export class SemanticRelationalMemory {
             this.grammarMap.set(key, targets);
         }
 
-        // 4. BitEngine
+        // 4. BitEngine (Fix: Direct table load)
         const engineLen = raw.readUInt32LE(offset); offset += 4;
-        const contextBytes = Math.ceil(this.bitEngine.contextSize / 8);
-        const entrySize = contextBytes + 8;
-        this.bitEngine.data.clear();
-        for (let j = 0; j < engineLen; j += entrySize) {
-            let ctx = 0n;
-            for (let b = 0; b < contextBytes; b++) {
-                ctx |= BigInt(raw.readUInt8(offset + j + b)) << BigInt(b * 8);
-            }
-            const c0 = raw.readUInt32LE(offset + j + contextBytes);
-            const c1 = raw.readUInt32LE(offset + j + contextBytes + 4);
-            this.bitEngine.data.set(ctx, new Uint32Array([c0, c1]));
-        }
+        const engineData = raw.subarray(offset, offset + engineLen);
+        this.bitEngine.setState(new Uint8Array(engineData));
         offset += engineLen;
     }
 
@@ -1739,172 +1746,13 @@ export class SemanticRelationalMemory {
     exportState() {
         return {
             vocab: Array.from(this.vocabulary.entries()),
-            bitEngine: { data: this.bitEngine.data }, // Référence directe au TypedArray
+            bitEngine: { 
+                data: this.bitEngine.getState ? Array.from(this.bitEngine.getState()) : this.bitEngine.exportState() 
+            },
             grammar: Array.from(this.grammarMap.entries()).map(([id, targets]) => [id, Array.from(targets.entries())]),
             wordCounts: Array.from(this.wordCounts.entries())
         };
     }
-
-    /**
-     * Exporte le modèle au format binaire consolidé (Random Access Mode)
-     * Format V2 : 100% binaire sans JSON intermédiaire
-     */
-    exportBinary() {
-        const buffers = [];
-        
-        // 1. Header
-        const head = Buffer.alloc(4);
-        head.write("GNR2", 0); 
-        buffers.push(head);
-
-        // 2. Vocabulaire
-        const vocabBuf = Buffer.alloc(4);
-        vocabBuf.writeUInt32LE(this.vocabulary.size, 0);
-        buffers.push(vocabBuf);
-        for (let [word, id] of this.vocabulary) {
-            const sBuf = Buffer.from(word, 'utf8');
-            const b = Buffer.alloc(2 + sBuf.length + 4);
-            b.writeUInt16LE(sBuf.length, 0);
-            sBuf.copy(b, 2);
-            b.writeUInt32LE(id, 2 + sBuf.length);
-            buffers.push(b);
-        }
-
-        // 3. WordCounts
-        const countHead = Buffer.alloc(4);
-        countHead.writeUInt32LE(this.wordCounts.size, 0);
-        buffers.push(countHead);
-        for (let [id, count] of this.wordCounts) {
-            const b = Buffer.alloc(8);
-            b.writeUInt32LE(id, 0);
-            b.writeUInt32LE(count, 4);
-            buffers.push(b);
-        }
-
-        // 4. Grammaire (Plus complexe car clés mixtes : nombre ou "ID-ID")
-        const grammarHead = Buffer.alloc(4);
-        grammarHead.writeUInt32LE(this.grammarMap.size, 0);
-        buffers.push(grammarHead);
-        for (let [key, targets] of this.grammarMap) {
-            const isStringKey = typeof key === 'string';
-            const kBuf = isStringKey ? Buffer.from(key, 'utf8') : Buffer.alloc(0);
-            
-            const b = Buffer.alloc(1 + 2 + kBuf.length + 4 + 4);
-            b.writeUInt8(isStringKey ? 1 : 0, 0); // Type
-            if (!isStringKey) b.writeUInt32LE(Number(key), 1); // Key ID
-            b.writeUInt16LE(kBuf.length, 5); // String Key Len
-            kBuf.copy(b, 7);
-            b.writeUInt32LE(targets.size, 7 + kBuf.length);
-            buffers.push(b);
-
-            for (let [tId, weight] of targets) {
-                const tb = Buffer.alloc(8);
-                tb.writeUInt32LE(tId, 0);
-                tb.writeUInt32LE(weight, 4);
-                buffers.push(tb);
-            }
-        }
-
-        // 5. BitEngine
-        const engineEntries = Array.from(this.bitEngine.data.entries());
-        const contextBytes = Math.ceil(this.bitEngine.contextSize / 8);
-        const entrySize = contextBytes + 8;
-        const engineBuf = Buffer.alloc(engineEntries.length * entrySize);
-
-        for (let j = 0; j < engineEntries.length; j++) {
-            const [ctx, counts] = engineEntries[j];
-            let tempCtx = ctx;
-            for (let b = 0; b < contextBytes; b++) {
-                engineBuf.writeUInt8(Number(tempCtx & 0xFFn), (j * entrySize) + b);
-                tempCtx >>= 8n;
-            }
-            engineBuf.writeUInt32LE(counts[0], (j * entrySize) + contextBytes);
-            engineBuf.writeUInt32LE(counts[1], (j * entrySize) + contextBytes + 4);
-        }
-        const engineSize = Buffer.alloc(4);
-        engineSize.writeUInt32LE(engineBuf.length, 0);
-        buffers.push(engineSize, engineBuf);
-
-        return Buffer.concat(buffers);
-    }
-
-    /**
-     * Importe le modèle depuis un buffer binaire Random Access
-     */
-    importBinary(buffer) {
-        let offset = 0;
-        const sig = buffer.toString('utf8', 0, 4);
-        if (sig !== "GNR2") throw new Error("Format binaire incompatible ou corrompu");
-        offset += 4;
-
-        // 2. Vocab
-        const vocabSize = buffer.readUInt32LE(offset); offset += 4;
-        this.vocabulary = new Map();
-        for (let i = 0; i < vocabSize; i++) {
-            const sLen = buffer.readUInt16LE(offset); offset += 2;
-            const word = buffer.toString('utf8', offset, offset + sLen); offset += sLen;
-            const id = buffer.readUInt32LE(offset); offset += 4;
-            this.vocabulary.set(word, id);
-        }
-
-        // 3. WordCounts
-        const countSize = buffer.readUInt32LE(offset); offset += 4;
-        this.wordCounts = new Map();
-        this.totalTokensProcessed = 0;
-        for (let i = 0; i < countSize; i++) {
-            const id = buffer.readUInt32LE(offset); offset += 4;
-            const count = buffer.readUInt32LE(offset); offset += 4;
-            this.wordCounts.set(id, count);
-            this.totalTokensProcessed += count;
-        }
-
-        // 4. Grammaire
-        const grammarSize = buffer.readUInt32LE(offset); offset += 4;
-        this.grammarMap = new Map();
-        for (let i = 0; i < grammarSize; i++) {
-            const isString = buffer.readUInt8(offset) === 1;
-            let key = isString ? "" : buffer.readUInt32LE(offset + 1);
-            const sLen = buffer.readUInt16LE(offset + 5); 
-            if (isString) key = buffer.toString('utf8', offset + 7, offset + 7 + sLen);
-            offset += 7 + sLen;
-            
-            const tCount = buffer.readUInt32LE(offset); offset += 4;
-            const targets = new Map();
-            for (let j = 0; j < tCount; j++) {
-                const tId = buffer.readUInt32LE(offset); offset += 4;
-                const weight = buffer.readUInt32LE(offset); offset += 4;
-                targets.set(tId, weight);
-            }
-            this.grammarMap.set(key, targets);
-        }
-
-        // 5. BitEngine
-        const engineLen = buffer.readUInt32LE(offset); offset += 4;
-        const contextBytes = Math.ceil(this.bitEngine.contextSize / 8);
-        const entrySize = contextBytes + 8;
-        this.bitEngine.data.clear();
-        for (let j = 0; j < engineLen; j += entrySize) {
-            let ctx = 0n;
-            for (let b = 0; b < contextBytes; b++) {
-                ctx |= BigInt(buffer.readUInt8(offset + j + b)) << BigInt(b * 8);
-            }
-            const c0 = buffer.readUInt32LE(offset + j + contextBytes);
-            const c1 = buffer.readUInt32LE(offset + j + contextBytes + 4);
-            this.bitEngine.data.set(ctx, new Uint32Array([c0, c1]));
-        }
-        offset += engineLen;
-
-        this.reverseVocab = new Map();
-        for (let [word, id] of this.vocabulary) {
-            this.reverseVocab.set(id, word);
-            if (this.sharedState) {
-                if (id >= this.sharedState.nextId) this.sharedState.nextId = id + 1;
-            } else {
-                if (id >= this.nextId) this.nextId = id + 1;
-            }
-        }
-    }
-
     /**
      * Transforme une phrase en unités de sens avant de les mémoriser
      * @param {string} sentence La phrase à apprendre
@@ -1996,21 +1844,22 @@ export class SemanticRelationalMemory {
                 const bigramTransitions = this.grammarMap.get(prevId);
                 bigramTransitions.set(id, (bigramTransitions.get(id) || 0) + weight);
 
-                // Normalisation Bigramme
-                if (bigramTransitions.size > 50) { 
-                    this._normalizeGrammarMap(bigramTransitions);
+                // Pruning Proactif Bigramme
+                if (bigramTransitions.size > this.maxTargetsPerContext) { 
+                    this._intelligentPruning(bigramTransitions, this.maxTargetsPerContext);
                 }
 
                 // 2. Enregistrement Trigramme (A + B -> C)
                 if (prevPrevId !== null) {
-                    const contextKey = `${prevPrevId}-${prevId}`;
+                    // Optimisation RAM : Packing BigInt au lieu d'une String template
+                    const contextKey = (BigInt(prevPrevId) << 32n) | BigInt(prevId);
                     if (!this.grammarMap.has(contextKey)) this.grammarMap.set(contextKey, new Map());
                     const trigramTransitions = this.grammarMap.get(contextKey);
                     trigramTransitions.set(id, (trigramTransitions.get(id) || 0) + weight);
 
-                    // Normalisation Trigramme
-                    if (trigramTransitions.size > 20) {
-                        this._normalizeGrammarMap(trigramTransitions);
+                    // Pruning Proactif Trigramme (plus strict sur les trigrammes)
+                    if (trigramTransitions.size > Math.floor(this.maxTargetsPerContext / 2)) {
+                        this._intelligentPruning(trigramTransitions, Math.floor(this.maxTargetsPerContext / 2));
                     }
                 }
             }
@@ -2019,6 +1868,16 @@ export class SemanticRelationalMemory {
             prevPrevId = prevId; // Décale les IDs pour la prochaine itération
             this._updateId(id, weight);
             prevId = id;         // Le mot actuel devient le mot précédent
+        }
+
+        // Vérification de la limite globale de la grammaire
+        if (this.grammarMap.size > this.maxContexts) {
+            this._globalGrammarCleanup();
+        }
+
+        // Applique une légère érosion synaptique après chaque bloc d'apprentissage
+        if (Math.random() > 0.8) {
+            this._applySynapticDecay(0.98);
         }
     }
 
@@ -2043,14 +1902,101 @@ export class SemanticRelationalMemory {
     }
 
     /**
-     * Empêche une structure de devenir statistiquement insignifiante
-     * en plafonnant la somme des poids d'un contexte.
+     * PRUNING INTELLIGENT (Local)
+     * Supprime le bruit et garde les relations les plus saillantes.
      */
-    _normalizeGrammarMap(map) {
-        let total = 0;
-        for (let v of map.values()) total += v;
-        if (total < 100) return;
-        for (let [k, v] of map) map.set(k, Math.max(1, Math.floor(v * 0.5)));
+    _intelligentPruning(targetMap, limit) {
+        let totalEnergy = 0;
+        for (let w of targetMap.values()) totalEnergy += w;
+
+        // 1. Calcul du seuil de saillance (on ignore ce qui pèse moins de 2% de l'énergie totale)
+        const noiseThreshold = totalEnergy * 0.02;
+
+        // --- FILTRE D'ENTROPIE ---
+        // Si un mot mène à trop de cibles avec des poids quasi-égaux, 
+        // c'est un "bruit de liaison" (ex: "le" -> tout le dictionnaire).
+        // On réduit drastiquement sa limite pour ne garder que les cas exceptionnels.
+        const isHighEntropy = (totalEnergy / targetMap.size) < 1.5 && targetMap.size > 10;
+        const effectiveLimit = isHighEntropy ? Math.floor(limit / 4) : limit;
+
+        const entries = Array.from(targetMap.entries());
+        entries.sort((a, b) => b[1] - a[1]); // Trier par poids descendant
+
+        targetMap.clear();
+        
+        // 2. On ne garde que les meilleures transitions
+        const toKeep = entries.slice(0, effectiveLimit);
+        for (let [id, weight] of toKeep) {
+            if (weight < noiseThreshold && targetMap.size > 2) continue;
+            // On applique une légère érosion (oubli) pour laisser la place aux futurs apprentissages
+            targetMap.set(id, weight);
+        }
+    }
+
+    /**
+     * ÉROSION SYNAPTIQUE (Oubli Progressif)
+     * Simule le cerveau biologique : les connexions non renforcées s'effacent.
+     */
+    _applySynapticDecay(factor = 0.99) {
+        for (let [key, targets] of this.grammarMap) {
+            // On ne decay que les contextes "vieux" ou peu solides
+            let total = 0;
+            for (let [id, weight] of targets) {
+                const newWeight = weight * factor;
+                if (newWeight < 1.1) {
+                    targets.delete(id);
+                } else {
+                    targets.set(id, newWeight);
+                    total += newWeight;
+                }
+            }
+            // Si le contexte est devenu vide ou insignifiant, on le supprime totalement
+            if (targets.size === 0 || total < 2) {
+                this.grammarMap.delete(key);
+            }
+        }
+    }
+
+    /**
+     * NETTOYAGE GLOBAL (Éviction par Saillance)
+     * Si la mémoire sature, on supprime les contextes les moins "énergétiques".
+     */
+    _globalGrammarCleanup() {
+        const initialSize = this.grammarMap.size;
+        
+        // On calcule l'UTILITÉ des contextes : (Fréquence) * (Spécificité)
+        // Un contexte est spécifique s'il a une cible dominante.
+        const scores = [];
+        let i = 0;
+        const sampleSize = 10000; // Échantillon plus large pour précision
+
+        for (let [key, targets] of this.grammarMap) {
+            let sum = 0;
+            let max = 0;
+            for (let w of targets.values()) {
+                sum += w;
+                if (w > max) max = w;
+            }
+            // Score = Poids de la cible principale (récompense la certitude)
+            scores.push({ key, utility: max });
+            if (++i > sampleSize) break;
+        }
+        
+        scores.sort((a, b) => a.utility - b.utility);
+        const utilityThreshold = scores[Math.floor(scores.length / 2)]?.utility || 1;
+
+        // Suppression des contextes sous le seuil d'utilité
+        let deleted = 0;
+        for (let [key, targets] of this.grammarMap) {
+            let energy = 0;
+            for (let w of targets.values()) energy += w;
+            if (energy <= utilityThreshold) {
+                this.grammarMap.delete(key);
+                deleted++;
+            }
+            if (this.grammarMap.size < this.maxContexts * 0.8) break;
+        }
+        console.log(`\x1b[2m[Grammar] ${deleted} contextes faibles évincés.\x1b[0m`);
     }
 
     /**
@@ -2117,7 +2063,8 @@ export class SemanticRelationalMemory {
         // --- OPTIMISATION : Analyse du contexte hors-boucle ---
         let trigramContext = null;
         if (activeIds.length >= 2) {
-            const trigramKey = `${activeIds[activeIds.length - 2]}-${activeIds[activeIds.length - 1]}`;
+            // Lookup par BigInt packé
+            const trigramKey = (BigInt(activeIds[activeIds.length - 2]) << 32n) | BigInt(activeIds[activeIds.length - 1]);
             trigramContext = this.grammarMap.get(trigramKey);
         }
         const bigramKey = activeIds[activeIds.length - 1];
@@ -2359,7 +2306,7 @@ export class SemanticRelationalMemory {
 
             // Mise à jour du contexte pour l'itération suivante
             if (activeIds.length >= 2) {
-                const nextTrigramKey = `${activeIds[activeIds.length - 2]}-${activeIds[activeIds.length - 1]}`;
+                const nextTrigramKey = (BigInt(activeIds[activeIds.length - 2]) << 32n) | BigInt(activeIds[activeIds.length - 1]);
                 trigramContext = this.grammarMap.get(nextTrigramKey);
             }
             const nextBigramKey = activeIds[activeIds.length - 1];
@@ -2415,17 +2362,39 @@ class NeuralBitPredictor {
     }
 
     /**
+     * Évalue la probabilité qu'une séquence de bits (ID) soit la suite logique du contexte.
+     * @param {number} id L'ID à tester
+     * @param {number} bitLen Nombre de bits (12 par défaut)
+     */
+    scoreId(id, bitLen = 12) {
+        let score = 1.0;
+        const savedContext = this.context;
+        for (let i = bitLen - 1; i >= 0; i--) {
+            const val = this.table[this._getHash()];
+            const bit = (id >> i) & 1;
+            // Calcul de la probabilité du bit actuel (128 = neutre)
+            const prob1 = val / 255;
+            score *= (bit === 1) ? prob1 : (1.0 - prob1);
+            // On avance temporairement le contexte pour le bit suivant de l'ID
+            this.context = ((this.context << 1n) | BigInt(bit)) & this.mask;
+        }
+        this.context = savedContext; // Restauration du contexte original
+        return score;
+    }
+
+    /**
      * Met à jour le cerveau après avoir vu le bit réel
      */
-    update(bit) {
+    update(bit, weight = 1) {
         const h = this._getHash();
         let state = this.table[h];
+        const step = Math.max(1, Math.floor(8 * weight));
 
         // Apprentissage par renforcement de l'état (Maillage de poids temporel)
         if (bit === 1) {
-            this.table[h] = Math.min(255, state + (state < 220 ? 8 : 1));
+            this.table[h] = Math.min(255, state + (state < 220 ? step : 1));
         } else {
-            this.table[h] = Math.max(0, state - (state > 35 ? 8 : 1));
+            this.table[h] = Math.max(0, state - (state > 35 ? step : 1));
         }
 
         // Mise à jour du contexte (Shift register en BigInt)
@@ -2462,6 +2431,8 @@ class NeuralBitPredictor {
         this.context = 0n;
         if (clearMemory) this.table.fill(128);
     }
+
+    resetContext() { this.reset(false); }
 }
 
 /**
@@ -5616,8 +5587,9 @@ export class BitwiseWordLearner {
  * G-NEURO MOE : Orchestrateur de Mixture d'Experts (Chunks)
  */
 export class GNeuroMoE {
-    constructor(contextSize = 16) {
+    constructor(contextSize = 16, maxExpertsInRam = 3) {
         this.contextSize = contextSize;
+        this.maxExpertsInRam = maxExpertsInRam;
         this.sharedState = {
             vocabulary: new Map(),
             reverseVocab: new Map(),
@@ -5638,36 +5610,93 @@ export class GNeuroMoE {
     }
 
     getExpert(domain) {
-        if (!this.experts.has(domain)) {
-            const brain = new SemanticRelationalMemory(this.contextSize, this.sharedState);
-            this.experts.set(domain, brain);
+        if (this.experts.has(domain)) {
+            // Système LRU : On remonte l'expert à la fin de la Map pour marquer son usage récent
+            const instance = this.experts.get(domain);
+            this.experts.delete(domain);
+            this.experts.set(domain, instance);
+            return instance;
         }
-        return this.experts.get(domain);
+
+        // Si on dépasse la limite de RAM, on décharge l'expert le moins récemment utilisé
+        if (this.experts.size >= this.maxExpertsInRam) {
+            const oldestDomain = this.experts.keys().next().value;
+            this.experts.delete(oldestDomain);
+            // Note: Le Garbage Collector libérera la mémoire au prochain cycle
+        }
+
+        const brain = new SemanticRelationalMemory(this.contextSize, this.sharedState);
+        this.experts.set(domain, brain);
+        return brain;
     }
 
-    route(text) {
-        const tokens = text.toLowerCase().match(/[a-z0-9àâäéèêëïîôöùûüç]+/g) || [];
+    /**
+     * Route le texte vers un expert.
+     * @param {string} text Le texte à analyser
+     * @param {string[]} highImpactTokens Liste de mots (ex: du titre) qui bypassent la maturité
+     */
+    route(text, highImpactTokens = []) {
+        const tokens = text.toLowerCase().match(/[a-z0-9àâäéèêëïîôöùûüç]{4,}/g) || [];
         if (tokens.length === 0) return "general";
 
-        // Scoring par densité de vocabulaire connu par domaine
-        const scores = { history: 0, science: 0, tech: 0, general: 0 };
-        
-        // Mots-clés de secours pour l'amorçage
-        const anchors = {
-            history: ["histoire", "siècle", "roi", "guerre", "politique", "empire"],
-            science: ["science", "physique", "math", "biologie", "espace", "planète"],
-            tech: ["robot", "code", "tech", "web", "ordinateur", "numérique"]
-        };
+        const MATURITY_THRESHOLD = 1; 
+        const MAX_VORTEX = 64;         // Limite stricte de 64 fichiers experts + general
+        const highImpactSet = new Set(highImpactTokens.map(t => t.toLowerCase()));
 
+        // --- ROUTAGE CONCEPTUEL DYNAMIQUE ---
+        const localCounts = new Map();
         tokens.forEach(t => {
-            for (let [domain, keywords] of Object.entries(anchors)) {
-                if (keywords.includes(t)) scores[domain] += 5;
-            }
+            localCounts.set(t, (localCounts.get(t) || 0) + 1);
         });
 
-        const best = Object.entries(scores).sort((a, b) => b[1] - a[1])[0];
-        if (best[1] > 0) return best[0];
-        return "general";
+        const candidates = [];
+        const totalTokens = this.sharedState.totalTokensProcessed || 1;
+
+        for (let [token, localCount] of localCounts) {
+            const id = this.sharedState.vocabulary.get(token);
+            const globalCount = id ? (this.sharedState.wordCounts.get(id) || 0) : 0;
+            const globalFreq = globalCount / (totalTokens || 1);
+
+            // --- ANALYSE STRUCTURELLE DYNAMIQUE ---
+            // Un mot est considéré comme "structurel" (bruit de fond linguistique) 
+            // s'il apparaît trop souvent dans le corpus global (> 0.5%).
+            // On ignore ces mots pour le routage des experts.
+            if (globalFreq > 0.005) continue;
+
+            // Heuristique de Force Conceptuelle (Spécificité) :
+            // On cherche le mot qui a la plus forte "densité d'information" :
+            // - localCount : il est important dans ce texte précis.
+            // - 1 / (globalFreq + epsilon) : il est rare dans la langue globale.
+            // - length / 4 : les mots longs sont souvent des noms propres ou techniques.
+            
+            const specificity = 1 / (globalFreq + 0.0001);
+            
+            // Bonus pour l'émergence : si le mot est totalement nouveau (globalCount = 0),
+            // il reçoit un score de curiosité élevé pour créer un nouvel expert.
+            const score = localCount * specificity * (token.length / 4);
+            
+            candidates.push({ token, score });
+        }
+
+        if (candidates.length === 0) return "general";
+
+        candidates.sort((a, b) => b.score - a.score);
+        
+        const top = candidates[0].token;
+        const id = this.sharedState.vocabulary.get(top);
+        const globalCount = id ? (this.sharedState.wordCounts.get(id) || 0) : 0;
+
+            // 1. FILTRE DE MATURITÉ (Bypassé si impact local fort)
+            // Si le concept est trop "jeune", on ne l'utilise que s'il est à haut impact (ex: titre).
+            const isHighImpact = highImpactSet.has(top);
+            if (!isHighImpact && globalCount < MATURITY_THRESHOLD) return "general";
+
+        // 2. CONSOLIDATION EN VORTEX :
+        // On hache le concept pour le placer dans un des 64 experts disponibles.
+        // Les concepts qui survivent au 'pruning' finiront par dominer leur vortex.
+        let hash = 0;
+        for (let i = 0; i < top.length; i++) hash = ((hash << 5) - hash) + top.charCodeAt(i);
+        return `vortex_${Math.abs(hash) % MAX_VORTEX}`;
     }
 }
 

@@ -17,8 +17,20 @@ export async function runWikipediaTraining(moe) {
             .replace(/\s+/g, ' ')    // Normaliser les espaces et sauts de ligne
             .trim();
 
+        // --- ANALYSE D'IMPACT LOCAL POUR LE ROUTAGE ---
+        // On identifie les mots clés de la page avant le routage
+        const localTokens = cleanContent.toLowerCase().match(/[a-z0-9àâäéèêëïîôöùûüç]{4,}/g) || [];
+        const localFreq = new Map();
+        localTokens.forEach(t => localFreq.set(t, (localFreq.get(t) || 0) + 1));
+
+        // Mots à haut impact : présents dans le titre OU répétés au moins 3 fois
+        const titleLower = title.toLowerCase();
+        const highImpact = Array.from(localFreq.keys()).filter(t => 
+            titleLower.includes(t) || localFreq.get(t) >= 3
+        );
+
         // --- ROUTAGE MOE ---
-        const domain = moe.route(title + " " + cleanContent.slice(0, 500));
+        const domain = moe.route(title + " " + cleanContent.slice(0, 500), highImpact);
         console.log(`[MoE] Domaine détecté : \x1b[33m${domain.toUpperCase()}\x1b[0m (Titre: ${title})`);
         
         const brain = moe.getExpert(domain);
