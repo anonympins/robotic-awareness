@@ -5640,7 +5640,7 @@ export class GNeuroMoE {
         if (tokens.length === 0) return "general";
 
         const MATURITY_THRESHOLD = 5;
-        const MAX_VORTEX = 64;         // Limite stricte de 64 fichiers experts + general
+        const MAX_VORTEX = 16;         // Limite stricte de 64 fichiers experts + general
         const highImpactSet = new Set(highImpactTokens.map(t => t.toLowerCase()));
 
         // --- ROUTAGE CONCEPTUEL DYNAMIQUE ---
