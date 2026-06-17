@@ -1510,6 +1510,106 @@ export class SemanticAttentionLayer {
 }
 
 /**
+ * ANALYSEUR DE STRUCTURES GÉNÉRATRICES
+ * Extrait les "lois" de syntaxe apprises par un expert.
+ */
+export class SyntaxAnalyzer {
+    constructor(brain) {
+        this.brain = brain;
+    }
+
+    /**
+     * Identifie les paires structurelles (parenthèses, guillemets, balises)
+     * en cherchant les tokens qui créent une dépendance forte.
+     */
+    detectStructuralPairs() {
+        const pairs = [];
+        const tokens = Array.from(this.brain.vocabulary.entries());
+
+        for (const [word, id] of tokens) {
+            if (word.length > 3) continue; // Souvent de la ponctuation
+
+            const transitions = this.brain.grammarMap.get(id);
+            if (!transitions) continue;
+
+            // Si un token mène souvent à une grande variété de mots (haute entropie)
+            // puis qu'un autre token ferme souvent ces séquences, c'est une paire.
+            if (transitions.size > 20) {
+                // Analyse de clôture : on cherche quel mot suit souvent les séquences issues de 'id'
+                // C'est une heuristique basée sur le "bit mémoriel"
+                pairs.push({ anchor: word, id: id, type: 'OPEN_STRUCTURE', entropy: transitions.size });
+            }
+        }
+        return pairs;
+    }
+
+    /**
+     * Extrait les "Signatures de Syntaxe" (ex: Adverbe + Verbe, ou Sujet + COD)
+     * en analysant les trigrammes à haute probabilité.
+     */
+    extractGenerativeSignatures() {
+        const signatures = [];
+
+        for (const [contextKey, targets] of this.brain.grammarMap) {
+            if (typeof contextKey !== 'bigint') continue; // On veut les trigrammes
+
+            const idA = Number(contextKey >> 32n);
+            const idB = Number(contextKey & 0xFFFFFFFFn);
+
+            // Calcul de la certitude (est-ce une règle rigide ?)
+            let totalWeight = 0;
+            let maxWeight = 0;
+            let bestTarget = null;
+            for (const [tId, w] of targets) {
+                totalWeight += w;
+                if (w > maxWeight) { maxWeight = w; bestTarget = tId; }
+            }
+
+            const certainty = maxWeight / totalWeight;
+
+            if (certainty > 0.8 && totalWeight > 5) {
+                const wordA = this.brain.reverseVocab.get(idA);
+                const wordB = this.brain.reverseVocab.get(idB);
+                const wordC = this.brain.reverseVocab.get(bestTarget);
+
+                // Catégorisation simplifiée
+                let type = "SEQUENCE";
+                if (this.brain.isStructural(idA) && !this.brain.isStructural(idB)) type = "SYNTAX_START";
+                if (wordB.endsWith('ment')) type = "ADVERB_PATH"; // Heuristique française
+                
+                signatures.push({
+                    pattern: [wordA, wordB, wordC],
+                    type: type,
+                    certainty: certainty,
+                    strength: totalWeight
+                });
+            }
+        }
+
+        return signatures.sort((a, b) => b.strength - a.strength);
+    }
+
+    /**
+     * Analyse si un mot agit comme un pivot (ex: "que", "qui", "dont")
+     */
+    identifyPivots() {
+        const pivots = [];
+        for (const [id, count] of this.brain.wordCounts) {
+            if (this.brain.isStructural(id)) {
+                const transitions = this.brain.grammarMap.get(id);
+                if (transitions && transitions.size > 50) {
+                    pivots.push({
+                        word: this.brain.reverseVocab.get(id),
+                        fanOut: transitions.size
+                    });
+                }
+            }
+        }
+        return pivots;
+    }
+}
+
+/**
  * MÉMOIRE RELATIONNELLE SÉMANTIQUE
  * Aligne la structure bit à bit sur des unités de sens (Tokens).
  */
@@ -1522,6 +1622,9 @@ export class SemanticRelationalMemory {
         // --- PARAMÈTRES DE PRUNING PROACTIF ---
         this.maxContexts = 120000; // Seuil de sécurité RAM (environ 250Mo d'objets Map)
         this.maxTargetsPerContext = 32; // Richesse grammaticale max par mot
+
+        this.subExperts = new Map(); // Sous-experts virtualisés (Sub-MoE)
+        this.maxSubExperts = 6;     // Limite par vortex pour la RAM
 
         if (sharedState) {
             this.sharedState = sharedState;
@@ -1655,9 +1758,37 @@ export class SemanticRelationalMemory {
             }
         }
 
-        // 4. BitEngine (Fix: NeuralBitPredictor uses .table buffer directly)
+        // 4. Sous-Experts (Fractal MoE)
+        const subHead = Buffer.alloc(4);
+        subHead.writeUInt32LE(this.subExperts.size, 0);
+        buffers.push(subHead);
+        for (const [subId, subGrammar] of this.subExperts) {
+            const sBuf = Buffer.from(subId, 'utf8');
+            const b = Buffer.alloc(2 + sBuf.length + 4);
+            b.writeUInt16LE(sBuf.length, 0);
+            sBuf.copy(b, 2);
+            b.writeUInt32LE(subGrammar.size, 2 + sBuf.length);
+            buffers.push(b);
+
+            for (const [key, targets] of subGrammar) {
+                const kb = Buffer.alloc(8);
+                kb.writeBigUInt64LE(typeof key === 'bigint' ? key : BigInt(key), 0);
+                buffers.push(kb);
+                const tbHead = Buffer.alloc(4);
+                tbHead.writeUInt32LE(targets.size, 0);
+                buffers.push(tbHead);
+                for (const [tId, w] of targets) {
+                    const tb = Buffer.alloc(8);
+                    tb.writeUInt32LE(tId, 0);
+                    tb.writeUInt32LE(w, 4);
+                    buffers.push(tb);
+                }
+            }
+        }
+
+        // 5. BitEngine
         const table = this.bitEngine.getState();
-        const engineBuf = Buffer.from(table.buffer);
+        const engineBuf = Buffer.from(table.buffer, table.byteOffset, table.byteLength);
         const engineHead = Buffer.alloc(4);
         engineHead.writeUInt32LE(engineBuf.length, 0);
         buffers.push(engineHead, engineBuf);
@@ -1683,12 +1814,19 @@ export class SemanticRelationalMemory {
         const raw = zlib.inflateSync(buffer.subarray(8));
         
         let offset = 0;
+        const safeRead = (size) => {
+            if (offset + size > raw.length) return false;
+            return true;
+        };
 
         // 1. Vocab
+        if (!safeRead(4)) return;
         const vocabSize = raw.readUInt32LE(offset); offset += 4;
         // On ne vide plus : on met à jour le vocabulaire partagé
         for (let i = 0; i < vocabSize; i++) {
+            if (!safeRead(2)) break;
             const sLen = raw.readUInt16LE(offset); offset += 2;
+            if (!safeRead(sLen + 4)) break;
             const word = raw.toString('utf8', offset, offset + sLen); offset += sLen;
             const id = raw.readUInt32LE(offset); offset += 4;
             this.vocabulary.set(word, id);
@@ -1701,10 +1839,12 @@ export class SemanticRelationalMemory {
         }
 
         // 2. WordCounts
+        if (!safeRead(4)) return;
         const countSize = raw.readUInt32LE(offset); offset += 4;
         // On fusionne les statistiques de comptage
         this.totalTokensProcessed = 0;
         for (let i = 0; i < countSize; i++) {
+            if (!safeRead(8)) break;
             const id = raw.readUInt32LE(offset); offset += 4;
             const count = raw.readUInt32LE(offset); offset += 4;
             this.wordCounts.set(id, count);
@@ -1712,21 +1852,26 @@ export class SemanticRelationalMemory {
         }
 
         // 3. Grammaire
+        if (!safeRead(4)) return;
         const grammarSize = raw.readUInt32LE(offset); offset += 4;
         this.grammarMap.clear();
         for (let i = 0; i < grammarSize; i++) {
+            if (!safeRead(11)) break;
             const type = raw.readUInt8(offset);
             let key;
             if (type === 0) key = raw.readUInt32LE(offset + 1);
             else if (type === 2) key = raw.readBigUInt64LE(offset + 1);
             
             const sLen = raw.readUInt16LE(offset + 9);
+            if (type === 1 && !safeRead(11 + sLen)) break;
             if (type === 1) key = raw.toString('utf8', offset + 11, offset + 11 + sLen);
             offset += 11 + sLen;
 
+            if (!safeRead(4)) break;
             const tCount = raw.readUInt32LE(offset); offset += 4;
             const targets = new Map();
             for (let j = 0; j < tCount; j++) {
+                if (!safeRead(8)) break;
                 const tId = raw.readUInt32LE(offset); offset += 4;
                 const w = raw.readUInt32LE(offset); offset += 4;
                 targets.set(tId, w);
@@ -1734,8 +1879,37 @@ export class SemanticRelationalMemory {
             this.grammarMap.set(key, targets);
         }
 
-        // 4. BitEngine (Fix: Direct table load)
+        // 4. Sous-Experts
+        if (!safeRead(4)) return;
+        const subSize = raw.readUInt32LE(offset); offset += 4;
+        this.subExperts.clear();
+        for (let i = 0; i < subSize; i++) {
+            if (!safeRead(2)) break;
+            const sLen = raw.readUInt16LE(offset); offset += 2;
+            if (!safeRead(sLen + 4)) break;
+            const subId = raw.toString('utf8', offset, offset + sLen); offset += sLen;
+            const gSize = raw.readUInt32LE(offset); offset += 4;
+            const subGrammar = new Map();
+            for (let j = 0; j < gSize; j++) {
+                if (!safeRead(12)) break;
+                const key = raw.readBigUInt64LE(offset); offset += 8;
+                const tCount = raw.readUInt32LE(offset); offset += 4;
+                const targets = new Map();
+            for (let k = 0; k < tCount; k++) {
+                    if (!safeRead(8)) break;
+                    const tId = raw.readUInt32LE(offset); offset += 4;
+                    const w = raw.readUInt32LE(offset); offset += 4;
+                    targets.set(tId, w);
+                }
+                subGrammar.set(key, targets);
+            }
+            this.subExperts.set(subId, subGrammar);
+        }
+
+        // 5. BitEngine
+        if (!safeRead(4)) return;
         const engineLen = raw.readUInt32LE(offset); offset += 4;
+        if (!safeRead(engineLen)) return;
         const engineData = raw.subarray(offset, offset + engineLen);
         this.bitEngine.setState(new Uint8Array(engineData));
         offset += engineLen;
@@ -1774,6 +1948,19 @@ export class SemanticRelationalMemory {
 
         // Automatisation : On corrèle tous les IDs de la phrase entre eux dans la matrice
         if (this.attention) this.attention.correlate(ids, weight);
+    }
+
+    /**
+     * Détermine un sous-expert interne au vortex basé sur le début de phrase
+     */
+    _routeSubExpert(tokens) {
+        const seeds = tokens.filter(t => t.length > 3).slice(0, 3);
+        if (seeds.length === 0) return "core";
+        
+        let hash = 0;
+        const key = seeds.join(':');
+        for (let i = 0; i < key.length; i++) hash = ((hash << 5) - hash) + key.charCodeAt(i);
+        return `sub_${Math.abs(hash) % this.maxSubExperts}`;
     }
 
     /**
@@ -1819,6 +2006,11 @@ export class SemanticRelationalMemory {
     _ingestTokens(tokens, ids, weight = 1) {
         let prevPrevId = null; // Pour les trigrammes
         let prevId = null;     // Pour les trigrammes
+        
+        const subId = this._routeSubExpert(tokens);
+        if (!this.subExperts.has(subId)) this.subExperts.set(subId, new Map());
+        const subGrammar = this.subExperts.get(subId);
+
         for (const token of tokens) {
             let id = this.vocabulary.get(token);
             if (id === undefined) {
@@ -1858,6 +2050,11 @@ export class SemanticRelationalMemory {
                     const trigramTransitions = this.grammarMap.get(contextKey);
                     trigramTransitions.set(id, (trigramTransitions.get(id) || 0) + weight);
 
+                    // Enregistrement dans le sous-expert virtualisé
+                    if (!subGrammar.has(contextKey)) subGrammar.set(contextKey, new Map());
+                    const subTransitions = subGrammar.get(contextKey);
+                    subTransitions.set(id, (subTransitions.get(id) || 0) + weight * 2); // Boost de spécialité
+
                     // Pruning Proactif Trigramme (plus strict sur les trigrammes)
                     if (trigramTransitions.size > Math.floor(this.maxTargetsPerContext / 2)) {
                         this._intelligentPruning(trigramTransitions, Math.floor(this.maxTargetsPerContext / 2));
@@ -1893,11 +2090,6 @@ export class SemanticRelationalMemory {
         // Un mot est considéré comme structurel s'il représente plus de 0.5% du corpus
         // ou s'il fait partie du socle de base si le corpus est trop petit.
         const total = this.sharedState ? this.sharedState.totalTokensProcessed : (this.totalTokensProcessed || 0);
-        if (total < 500) {
-            const word = this.reverseVocab.get(id);
-            return word && ['et', 'ou', 'le', 'la', 'un', 'une', 'de', 'à', 'est', 'a'].includes(word.toLowerCase());
-        }
-
         const count = this.wordCounts.get(id) || 0;
         return (count / total) > 0.005;
     }
@@ -2062,11 +2254,17 @@ export class SemanticRelationalMemory {
         let sentencesGenerated = 0;
 
         // --- OPTIMISATION : Analyse du contexte hors-boucle ---
+        const subId = this._routeSubExpert(tokens);
+        const subGrammar = this.subExperts.get(subId);
+
         let trigramContext = null;
+        let subTrigramContext = null;
+
         if (activeIds.length >= 2) {
             // Lookup par BigInt packé
             const trigramKey = (BigInt(activeIds[activeIds.length - 2]) << 32n) | BigInt(activeIds[activeIds.length - 1]);
             trigramContext = this.grammarMap.get(trigramKey);
+            subTrigramContext = subGrammar ? subGrammar.get(trigramKey) : null;
         }
         const bigramKey = activeIds[activeIds.length - 1];
         let bigramContext = this.grammarMap.get(bigramKey);
@@ -2136,7 +2334,12 @@ export class SemanticRelationalMemory {
 
                 // Tentative Trigramme (Priorité absolue)
                 if (hasTrigramOptions && trigramContext.has(id)) {
-                    grammarWeight = trigramContext.get(id) * 50.0; // Boost Trigramme massif
+                    let boost = 50.0;
+                    // Si le sous-expert virtualisé confirme, on booste encore plus
+                    if (subTrigramContext && subTrigramContext.has(id)) {
+                        boost *= 3.0;
+                    }
+                    grammarWeight = trigramContext.get(id) * boost;
                     totalStructuralWeight = Array.from(trigramContext.values()).reduce((a,b)=>a+b, 0);
                     trigramHit = true;
                 }
@@ -5594,10 +5797,11 @@ export class BitwiseWordLearner {
  * G-NEURO MOE : Orchestrateur de Mixture d'Experts (Chunks)
  */
 export class GNeuroMoE {
-    constructor(contextSize = 16, maxExpertsInRam = 3, storagePath = './experts_chunks/') {
+    constructor(contextSize = 16, maxExpertsInRam = 3, storagePath = './experts_chunks/', maxVortex = 16) {
         this.contextSize = contextSize;
         this.maxExpertsInRam = maxExpertsInRam;
         this.storagePath = storagePath;
+        this.maxVortex = maxVortex;
         this.sharedState = {
             vocabulary: new Map(),
             reverseVocab: new Map(),
@@ -5684,8 +5888,7 @@ export class GNeuroMoE {
         const tokens = text.toLowerCase().match(/[a-z0-9àâäéèêëïîôöùûüç]{2,}/g) || [];
         if (tokens.length === 0) return "general";
 
-        const MATURITY_THRESHOLD = 5;
-        const MAX_VORTEX = 16;         // Limite stricte de 64 fichiers experts + general
+        const MATURITY_THRESHOLD = 3; // Réduit pour une spécialisation plus rapide
         const highImpactSet = new Set(highImpactTokens.map(t => t.toLowerCase()));
 
         // --- ROUTAGE CONCEPTUEL DYNAMIQUE ---
@@ -5701,12 +5904,16 @@ export class GNeuroMoE {
             const id = this.sharedState.vocabulary.get(token);
             const globalCount = id ? (this.sharedState.wordCounts.get(id) || 0) : 0;
             const globalFreq = globalCount / (totalTokens || 1);
+// Bonus pour l'émergence : boosté pour favoriser les nouveaux concepts
+            const impactBoost = highImpactSet.has(token) ? 8.0 : 1.0;
 
             // --- ANALYSE STRUCTURELLE DYNAMIQUE ---
             // Un mot est considéré comme "structurel" (bruit de fond linguistique) 
             // s'il apparaît trop souvent dans le corpus global (> 0.5%).
             // On ignore ces mots pour le routage des experts.
-            if (globalFreq > 0.005) continue;
+// On pénalise lourdement les mots-outils (0.05) pour qu'ils ne soient
+            // jamais "le concept de base" si un mot plus rare existe.
+            const weightFactor = (globalFreq > 0.005) ? 0.05 : 1.0;
 
             // Heuristique de Force Conceptuelle (Spécificité) :
             // On cherche le mot qui a la plus forte "densité d'information" :
@@ -5716,11 +5923,10 @@ export class GNeuroMoE {
             
             const specificity = 1 / (globalFreq + 0.0001);
             
-            // Bonus pour l'émergence : si le mot est totalement nouveau (globalCount = 0),
-            // il reçoit un score de curiosité élevé pour créer un nouvel expert.
-            const impactBoost = highImpactSet.has(token) ? 5.0 : 1.0;
-            const score = localCount * specificity * (token.length / 4) * impactBoost;
-            
+            // Heuristique de Force : on privilégie la rareté (spécificité) et la longueur
+            // On ajoute un log sur la longueur pour ne pas sur-favoriser les mots trop longs
+            const score = localCount * specificity * Math.log2(token.length) * impactBoost * weightFactor;
+
             candidates.push({ token, score });
         }
 
@@ -5738,11 +5944,11 @@ export class GNeuroMoE {
             if (!isHighImpact && globalCount < MATURITY_THRESHOLD) return "general";
 
         // 2. CONSOLIDATION EN VORTEX :
-        // On hache le concept pour le placer dans un des 64 experts disponibles.
+        // On hache le concept pour le placer dans un des experts disponibles.
         // Les concepts qui survivent au 'pruning' finiront par dominer leur vortex.
         let hash = 0;
         for (let i = 0; i < top.length; i++) hash = ((hash << 5) - hash) + top.charCodeAt(i);
-        return `vortex_${Math.abs(hash) % MAX_VORTEX}`;
+        return `vortex_${Math.abs(hash) % this.maxVortex}`;
     }
 }
 

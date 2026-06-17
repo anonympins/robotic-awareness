@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { runWikipediaTraining } from './train-wikipedia.js';
-import { GNeuroMoE } from './neuro-lib.js';
+import { GNeuroMoE, SyntaxAnalyzer } from './neuro-lib.js';
 import fs from 'node:fs';
 import path from 'node:path';
 
@@ -37,6 +37,17 @@ async function main() {
         
         if (cycleCount % 5 === 0) {
             console.log(`[INFO] Global Token Count: ${moe.sharedState.totalTokensProcessed}`);
+            
+            console.log(`\n\x1b[36m[SYNTAX] Analyse des structures émergentes...\x1b[0m`);
+            for (const [domain, expert] of moe.experts) {
+                const analyzer = new SyntaxAnalyzer(expert);
+                const sigs = analyzer.extractGenerativeSignatures();
+                if (sigs.length > 0) {
+                    const top = sigs[0];
+                    console.log(`  > [Expert ${domain}] Règle : "${top.pattern.join(' ')}" (Certitude: ${(top.certainty*100).toFixed(0)}%)`);
+                }
+            }
+            console.log("");
         }
 
         try {
