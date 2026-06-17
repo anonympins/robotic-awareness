@@ -135,7 +135,11 @@ export async function runBookTraining() {
             console.log(`\x1b[34m[Books]\x1b[0m Début de l'entraînement lourd sur ${pageTextBuffer.length} livres sécurisés...`);
             
             for (const bookData of pageTextBuffer) {
-                const subPhrases = bookData.text.split(/(?<=[.!,?;])(?:\s+|\n+|$)/)
+                const cleanBookText = bookData.text
+                    .replace(/<script\b[^>]*>([\s\S]*?)<\/script>/gim, "")
+                    .replace(/<style\b[^>]*>([\s\S]*?)<\/style>/gim, "");
+
+                const subPhrases = cleanBookText.split(/(?<=[.!,?;])(?:\s+|\n+|$)/)
                     .map(s => s.trim())
                     .filter(s => {
                         if (s.length < 3) return false;

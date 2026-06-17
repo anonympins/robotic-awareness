@@ -47,10 +47,16 @@ async function main() {
             console.log(`\n\x1b[36m[SYNTAX] Analyse des structures émergentes...\x1b[0m`);
             for (const [domain, expert] of moe.experts) {
                 const analyzer = new SyntaxAnalyzer(expert);
-                const sigs = analyzer.extractGenerativeSignatures();
-                if (sigs.length > 0) {
-                    const top = sigs[0];
-                    console.log(`  > [Expert ${domain}] Règle : "${top.pattern.join(' ')}" (Certitude: ${(top.certainty*100).toFixed(0)}%)`);
+                const allSigs = analyzer.extractGenerativeSignatures();
+                
+                // Pour éviter la stagnation, on pioche 3 signatures aléatoires parmi les 12 meilleures
+                const diverseSigs = allSigs.slice(0, 12).sort(() => Math.random() - 0.5).slice(0, 3);
+
+                if (diverseSigs.length > 0) {
+                    console.log(`  > [Expert ${domain}] :`);
+                    diverseSigs.forEach(sig => {
+                        console.log(`    - [${sig.type}] "${sig.pattern.join(' ')}" (Certitude: ${(sig.certainty*100).toFixed(0)}%, Force: ${sig.strength})`);
+                    });
                 }
             }
             console.log("");

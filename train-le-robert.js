@@ -7,8 +7,11 @@ export async function runRobertTraining(moe) {
         console.log("\n[1/3] Exploration du Guide Le Robert...");
         const { title, content: htmlContent } = await getRandomRobertPage();
 
-        // Nettoyage agressif des balises et du boilerplate spécifique au Robert
-        const content = htmlContent.replace(/<[^>]*>?/gm, '');
+        // Nettoyage des blocs de code et des balises
+        const content = htmlContent
+            .replace(/<script\b[^>]*>([\s\S]*?)<\/script>/gim, "")
+            .replace(/<style\b[^>]*>([\s\S]*?)<\/style>/gim, "")
+            .replace(/<[^>]*>?/gm, '');
         
         let cleanContent = content
             .replace(/Le Robert|Dico en ligne|Découvrir|Abonnement|Boutique|Le Robert Correcteur/gi, '')

@@ -19,21 +19,26 @@ export async function scrapeRobertContent(path = '/guide') {
                     return reject(new Error(`Erreur HTTP: ${res.statusCode}`));
                 }
 
+                // Nettoyage des blocs de code avant extraction du contenu
+                const sanitizedData = data
+                    .replace(/<script\b[^>]*>([\s\S]*?)<\/script>/gim, "")
+                    .replace(/<style\b[^>]*>([\s\S]*?)<\/style>/gim, "");
+
                 // Extraction du titre
-                const titleMatch = data.match(/<h1[^>]*>([\s\S]*?)<\/h1>/i);
+                const titleMatch = sanitizedData.match(/<h1[^>]*>([\s\S]*?)<\/h1>/i);
                 const title = titleMatch ? titleMatch[1].replace(/<[^>]*>/g, '').trim() : "Guide Robert";
 
                 // Extraction du contenu principal (souvent dans .bourse-content ou article)
-                const contentMatch = data.match(/<article[^>]*>([\s\S]*?)<\/article>/i) || 
-                                   data.match(/<div class="content"[^>]*>([\s\S]*?)<\/div>/i);
+                const contentMatch = sanitizedData.match(/<article[^>]*>([\s\S]*?)<\/article>/i) || 
+                                   sanitizedData.match(/<div class="content"[^>]*>([\s\S]*?)<\/div>/i);
                 
-                const content = contentMatch ? contentMatch[1] : data;
+                const content = contentMatch ? contentMatch[1] : sanitizedData;
 
                 // Extraction des liens internes du guide pour la suite
                 const linkRegex = /href="(\/guide\/[^"]+)"/g;
                 const internalLinks = [];
                 let match;
-                while ((match = linkRegex.exec(data)) !== null) {
+                while ((match = linkRegex.exec(sanitizedData)) !== null) {
                     if (!internalLinks.includes(match[1])) internalLinks.push(match[1]);
                 }
 

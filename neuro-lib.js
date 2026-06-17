@@ -1572,9 +1572,20 @@ export class SyntaxAnalyzer {
                 const wordB = this.brain.reverseVocab.get(idB);
                 const wordC = this.brain.reverseVocab.get(bestTarget);
 
+                // --- FILTRAGE DE PERTINENCE ---
+                const isAStruct = this.brain.isStructural(idA);
+                const isBStruct = this.brain.isStructural(idB);
+                const isCStruct = this.brain.isStructural(bestTarget);
+
+                // Si les 3 mots sont des "mots-outils" (le, de, et, ou...), 
+                // la règle est grammaticalement correcte mais conceptuellement pauvre.
+                if (isAStruct && isBStruct && isCStruct) continue;
+
                 // Catégorisation simplifiée
                 let type = "SEQUENCE";
-                if (this.brain.isStructural(idA) && !this.brain.isStructural(idB)) type = "SYNTAX_START";
+                if (idA === 2) type = "PHRASE_START"; // <eos> est l'ID 2
+                else if (isAStruct && !isBStruct) type = "CONSTRUCT";
+                else if (!isAStruct && !isBStruct) type = "CONCEPT_CHAIN";
 
                 signatures.push({
                     pattern: [wordA, wordB, wordC],
@@ -2015,8 +2026,8 @@ export class SemanticRelationalMemory {
     }
 
     _ingestTokens(tokens, ids, weight = 1) {
-        let prevPrevId = null; // Pour les trigrammes
-        let prevId = null;     // Pour les trigrammes
+        let prevPrevId = null;
+        let prevId = 2; // Initialisation sur <eos> (id:2) pour capturer systématiquement les débuts de phrases
         
         const subId = this._routeSubExpert(tokens);
         if (!this.subExperts.has(subId)) this.subExperts.set(subId, new Map());
@@ -2257,7 +2268,7 @@ export class SemanticRelationalMemory {
         let rollingConfidence = 1.0;
         const topK = options.topK || 5;
 
-        let lastId = activeIds[activeIds.length - 1] || null;
+        let lastId = activeIds[activeIds.length - 1] || 2; // <eos> par défaut si pas de contexte pour amorcer une ancre
         let lastWord = lastId ? this.reverseVocab.get(lastId) : "";
         let lastWasConnector = this.isStructural(lastId);
         let lastWasPunctuation = ['.', ',', ';', '!', '?'].includes(lastWord);
@@ -2271,9 +2282,12 @@ export class SemanticRelationalMemory {
         let trigramContext = null;
         let subTrigramContext = null;
 
-        if (activeIds.length >= 2) {
-            // Lookup par BigInt packé
-            const trigramKey = (BigInt(activeIds[activeIds.length - 2]) << 32n) | BigInt(activeIds[activeIds.length - 1]);
+        // Initialisation hiérarchique du contexte de recherche
+        if (activeIds.length >= 1) {
+            const prevId = activeIds.length >= 2 ? activeIds[activeIds.length - 2] : 2;
+            const currId = activeIds[activeIds.length - 1];
+            const trigramKey = (BigInt(prevId) << 32n) | BigInt(currId);
+            
             trigramContext = this.grammarMap.get(trigramKey);
             subTrigramContext = subGrammar ? subGrammar.get(trigramKey) : null;
         }
@@ -2284,18 +2298,12 @@ export class SemanticRelationalMemory {
         // On s'assure qu'elle est suffisante pour le quota de phrases calculé.
         const maxSafetyLimit = Math.max(depth, targetSentences * 25);
 
-        for (let i = 0; i < maxSafetyLimit; i++) {
+        for (let i = 0; i < maxSafetyLimit; i++) {// Génère un ID via le moteur de bits pour le diagnostic visuel (correspondance binaire)
+            const tossedId = this.bitEngine.tossId ? this.bitEngine.tossId() : null;
+
             const hasTrigramOptions = trigramContext && trigramContext.size > 0;
             const hasBigramOptions = bigramContext && bigramContext.size > 0;
             const structureReconnue = hasTrigramOptions || hasBigramOptions;
-
-            // 1. JET PROBABILISTE : Uniquement si aucune structure (Tri/Bi) n'est connue
-            let tossedId = null;
-            let tossedWord = null;
-            if (!structureReconnue) {
-                tossedId = this.bitEngine.tossId(12);
-                tossedWord = this.reverseVocab.get(tossedId);
-            }
 
             const candidates = [];
             
@@ -2304,7 +2312,9 @@ export class SemanticRelationalMemory {
                 // Ignore l'ID 0 (souvent <PAD> ou <UNK>)
                 if (id === 0) continue;
 
-                const isConnector = this.isStructural(id);
+                const isConnector = this.isStructural(id) || [',', ';', 'et', 'mais', 'car', 'puis', 'donc', 'ou', 'si', 'or', 'ni'].includes(word);
+                // Est-ce un mot qui débute souvent une phrase ? (Suit <eos> id:2)
+                const isStarter = this.grammarMap.get(2)?.has(id);
 
                 // 0. RÉSONANCE SÉMANTIQUE (Le "Sens")
                 let semanticResonance = 0;
@@ -2382,11 +2392,17 @@ export class SemanticRelationalMemory {
                 // Au lieu de tuer le mot s'il n'est pas statistique, on vérifie s'il a du sens
                 let structuralPenalty = 1.0;
 
-                // APPLICATION ABSOLUE : Si une structure est reconnue, on pénalise lourdement tout ce qui n'en fait pas partie
+                // 1. PRIORITÉ AU VERBATIM (Verrouillage de trajectoire)
                 if (structureReconnue && !isStructureHit) {
-                    structuralPenalty = 0.000000001; 
-                } else if (!structureReconnue && semanticResonance === 0 && !isVerbatim) {
-                    structuralPenalty = 0.00000001; 
+                    structuralPenalty = 1e-25; // Verrouillage strict : on suit le rail grammatical connu
+                } else if (!structureReconnue) {
+                    // 2. GESTIONNAIRE DE JUXTAPOSITION (Recherche de Pontage)
+                    // On cherche activement des connecteurs ou des ancres sémantiques
+                    if (isConnector) structuralPenalty *= 10.0;
+                    if (isStarter) structuralPenalty *= 5.0;
+                    
+                    // 3. RECHERCHE DE SÉQUENCE ANCRE : Si aucune structure, on exige un lien sémantique fort
+                    if (!isConnector && !isStarter && semanticResonance < 0.001) structuralPenalty = 1e-15;
                 }
 
                 // 2. Injecter un "Biais de Pontage" (Correctif 2)
@@ -2437,14 +2453,6 @@ export class SemanticRelationalMemory {
 
                 let score = (grammarScore + transitionProb * transitionWeight + meaningPower) * 
                             contextBoost * verbatimBoost * structuralPenalty * flowBias * bridgingBias;
-
-                // BONUS DE JET : Si le mot correspond au "candidat binaire favori", boost massif
-                if (tossedId !== null && id === tossedId) {
-                    // 3. Harmonisation du Jet (Correctif 3)
-                    // Si l'attention est diffuse (résonance faible), le jet probabiliste binaire devient le candidat par défaut.
-                    const jetPower = (semanticResonance < 0.1) ? 2000.0 : 500.0;
-                    score *= jetPower;
-                }
 
                 // Si c'est un hit structurel, c'est presque certainement la fin de phrase voulue
                 if (word === "<eos>") {
@@ -2562,10 +2570,11 @@ export class SemanticRelationalMemory {
             this._shiftId(selected.id);
 
             // Mise à jour du contexte pour l'itération suivante
-            if (activeIds.length >= 2) {
-                const nextTrigramKey = (BigInt(activeIds[activeIds.length - 2]) << 32n) | BigInt(activeIds[activeIds.length - 1]);
-                trigramContext = this.grammarMap.get(nextTrigramKey);
-            }
+            const nextPrevId = activeIds.length >= 2 ? activeIds[activeIds.length - 2] : 2;
+            const nextCurrId = activeIds[activeIds.length - 1];
+            const nextTrigramKey = (BigInt(nextPrevId) << 32n) | BigInt(nextCurrId);
+            trigramContext = this.grammarMap.get(nextTrigramKey);
+            
             const nextBigramKey = activeIds[activeIds.length - 1];
             bigramContext = this.grammarMap.get(nextBigramKey);
         }

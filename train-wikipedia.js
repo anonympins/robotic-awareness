@@ -7,8 +7,11 @@ export async function runWikipediaTraining(moe) {
         console.log("\n[1/3] Récupération d'une page aléatoire...");
         const { title, content: htmlContent } = await scrapeRandomWikipediaContent();
 
-        // Nettoyage des balises HTML pour obtenir du texte brut traitable par le cerveau
-        const content = htmlContent.replace(/<[^>]*>?/gm, '');
+        // Nettoyage des blocs de code et des balises HTML
+        const content = htmlContent
+            .replace(/<script\b[^>]*>([\s\S]*?)<\/script>/gim, "") // Supprime le JS complet
+            .replace(/<style\b[^>]*>([\s\S]*?)<\/style>/gim, "")   // Supprime le CSS complet
+            .replace(/<[^>]*>?/gm, '');                           // Supprime les balises restantes
         
         let cleanContent = content
             .replace(/==.*?==/g, '') // Enlever les titres de section
