@@ -5639,7 +5639,7 @@ export class GNeuroMoE {
         const tokens = text.toLowerCase().match(/[a-z0-9àâäéèêëïîôöùûüç]{4,}/g) || [];
         if (tokens.length === 0) return "general";
 
-        const MATURITY_THRESHOLD = 1; 
+        const MATURITY_THRESHOLD = 5;
         const MAX_VORTEX = 64;         // Limite stricte de 64 fichiers experts + general
         const highImpactSet = new Set(highImpactTokens.map(t => t.toLowerCase()));
 
@@ -5673,7 +5673,8 @@ export class GNeuroMoE {
             
             // Bonus pour l'émergence : si le mot est totalement nouveau (globalCount = 0),
             // il reçoit un score de curiosité élevé pour créer un nouvel expert.
-            const score = localCount * specificity * (token.length / 4);
+            const impactBoost = highImpactSet.has(token) ? 5.0 : 1.0;
+            const score = localCount * specificity * (token.length / 4) * impactBoost;
             
             candidates.push({ token, score });
         }
