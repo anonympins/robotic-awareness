@@ -27,6 +27,11 @@ async function main() {
     }
 
     const moe = new GNeuroMoE(16, 5, EXPERTS_DIR);
+
+    // Chargement de l'état global existant pour assurer la continuité de l'apprentissage
+    console.log("[INFO] Chargement de l'index global et du vocabulaire...");
+    moe.loadSharedState(path.join(EXPERTS_DIR, 'shared_state.gnr'));
+
     let cycleCount = 1;
 
     while (true) {

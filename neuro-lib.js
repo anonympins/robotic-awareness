@@ -5839,9 +5839,10 @@ export class GNeuroMoE {
         const brain = new SemanticRelationalMemory(this.contextSize, this.sharedState);
         brain.importBinary(fs.readFileSync(filePath));
         
-        // Synchronisation du sharedState après import
-        this.sharedState.nextId = brain.sharedState.nextId;
-        this.sharedState.totalTokensProcessed = brain.sharedState.totalTokensProcessed;
+        // Synchronisation des primitives (les Maps sont déjà liées par référence)
+        // On récupère la valeur calculée par importBinary sur l'instance temporaire
+        this.sharedState.nextId = brain.sharedState ? brain.sharedState.nextId : brain.nextId;
+        this.sharedState.totalTokensProcessed = brain.totalTokensProcessed;
         console.log(`\x1b[2m[MoE] État global chargé : ${this.sharedState.vocabulary.size} mots connus.\x1b[0m`);
     }
 
