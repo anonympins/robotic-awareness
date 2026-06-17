@@ -67,7 +67,8 @@ async function main() {
             
             // Sauvegarde de l'index global pour le routage
             moe.saveSharedState(path.join(EXPERTS_DIR, 'shared_state.gnr'));
-            
+            await new Promise(resolve => setTimeout(resolve, 2000));
+
         } catch (trainErr) {
             console.error(`\x1b[31m[ERREUR CYCLE #${cycleCount}]\x1b[0m Impossible de joindre Wikipedia ou erreur de script :`);
             console.error(trainErr.message);

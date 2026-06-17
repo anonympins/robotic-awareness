@@ -1575,8 +1575,7 @@ export class SyntaxAnalyzer {
                 // Catégorisation simplifiée
                 let type = "SEQUENCE";
                 if (this.brain.isStructural(idA) && !this.brain.isStructural(idB)) type = "SYNTAX_START";
-                if (wordB.endsWith('ment')) type = "ADVERB_PATH"; // Heuristique française
-                
+
                 signatures.push({
                     pattern: [wordA, wordB, wordC],
                     type: type,
@@ -2274,10 +2273,19 @@ export class SemanticRelationalMemory {
         const maxSafetyLimit = Math.max(depth, targetSentences * 25);
 
         for (let i = 0; i < maxSafetyLimit; i++) {
-            const candidates = [];
-
             const hasTrigramOptions = trigramContext && trigramContext.size > 0;
             const hasBigramOptions = bigramContext && bigramContext.size > 0;
+            const structureReconnue = hasTrigramOptions || hasBigramOptions;
+
+            // 1. JET PROBABILISTE : Uniquement si aucune structure (Tri/Bi) n'est connue
+            let tossedId = null;
+            let tossedWord = null;
+            if (!structureReconnue) {
+                tossedId = this.bitEngine.tossId(12);
+                tossedWord = this.reverseVocab.get(tossedId);
+            }
+
+            const candidates = [];
             
             // Itère sur tous les mots du vocabulaire pour trouver les candidats
             for (let [word, id] of this.vocabulary) {
@@ -2291,7 +2299,7 @@ export class SemanticRelationalMemory {
                 if (attLayer) {
                     // Focus Global (Le prompt)
                     const hasQuery = queryIds.length > 0;
-                    // Focus Fenêtre (Les mots qu'on vient de dire)
+                    // Focus Fenêtre (Les mots qu'on vient de générer)
                     const hasWindow = activeIds.length > 0;
 
                     queryIds.forEach(qId => {
@@ -2302,13 +2310,13 @@ export class SemanticRelationalMemory {
                         }
                     });
 
-                    // NOUVEAU : Résonance de la fenêtre contextuelle (Auto-cohérence)
+                    // Résonance de la fenêtre contextuelle (Auto-cohérence)
                     // Cela force le modèle à rester dans le même "article" Wikipedia
                     activeIds.forEach(aId => {
                         const relations = attLayer.correlationMatrix.get(aId);
                         if (relations && relations.has(id)) {
                             // On donne un poids fort à la continuité immédiate
-                            semanticResonance += relations.get(id) * 2.5;
+                            semanticResonance += relations.get(id) * 3.5;
                         }
                     });
 
@@ -2329,8 +2337,7 @@ export class SemanticRelationalMemory {
                 // 2. Score de Schéma (BACK-OFF HIÉRARCHIQUE : Tri > Bi > Raw)
                 let grammarWeight = 0;
                 let totalStructuralWeight = 1;
-                let trigramHit = false;
-                let bigramHit = false;
+                let isStructureHit = false;
 
                 // Tentative Trigramme (Priorité absolue)
                 if (hasTrigramOptions && trigramContext.has(id)) {
@@ -2339,16 +2346,16 @@ export class SemanticRelationalMemory {
                     if (subTrigramContext && subTrigramContext.has(id)) {
                         boost *= 3.0;
                     }
-                    grammarWeight = trigramContext.get(id) * boost;
+                    grammarWeight = trigramContext.get(id) * boost * 100.0; // Boost massif
                     totalStructuralWeight = Array.from(trigramContext.values()).reduce((a,b)=>a+b, 0);
-                    trigramHit = true;
+                    isStructureHit = true;
                 }
 
                 // Fallback Bigramme (Si pas de hit Trigramme)
-                if (!trigramHit && hasBigramOptions && bigramContext.has(id)) {
-                    grammarWeight = bigramContext.get(id) * 5.0;
+                if (!isStructureHit && hasBigramOptions && bigramContext.has(id)) {
+                    grammarWeight = bigramContext.get(id) * 500.0; // Boost massif
                     totalStructuralWeight = Array.from(bigramContext.values()).reduce((a,b)=>a+b, 0);
-                    bigramHit = true;
+                    isStructureHit = true;
                 }
 
                 let grammarScore = grammarWeight / (totalStructuralWeight || 1);
@@ -2359,18 +2366,19 @@ export class SemanticRelationalMemory {
                 // --- LOGIQUE DE COHÉRENCE FLEXIBLE ---
                 // Au lieu de tuer le mot s'il n'est pas statistique, on vérifie s'il a du sens
                 let structuralPenalty = 1.0;
-                const hasGrammarHit = trigramHit || bigramHit;
 
-                if (!hasGrammarHit && !isVerbatim) {
-                    // Si le mot n'est ni statistique ni verbatim, il ne survit que s'il a une forte résonance sémantique
-                    structuralPenalty = Math.max(0.000001, semanticResonance * 2.0);
+                // APPLICATION ABSOLUE : Si une structure est reconnue, on pénalise lourdement tout ce qui n'en fait pas partie
+                if (structureReconnue && !isStructureHit) {
+                    structuralPenalty = 0.000000001; 
+                } else if (!structureReconnue && semanticResonance === 0 && !isVerbatim) {
+                    structuralPenalty = 0.00000001; 
                 }
 
                // const verbatimBoost = isVerbatim ? 100.0 : 1.0; // Boost Verbatim augmenté
                 // --- BIAIS DE FLUX GRAMMATICAL (NOUVEAU) ---
                 let flowBias = 1.0;
                 // 1. Si on a un hit grammatical sur un connecteur, on le booste (fluidité)
-                if (isConnector && (trigramHit || bigramHit)) flowBias *= 2.5;
+                if (isConnector && isStructureHit) flowBias *= 2.5;
                 // 2. Interdiction : Pas de ponctuation ou de connecteur juste après un connecteur (ex: "et ." ou "mais et")
                 if (lastWasConnector && (['.', ',', ';', '!', '?'].includes(word) || isConnector)) flowBias *= 0.001;
                 // 3. Relance : Après une virgule, on favorise les connecteurs ou les sujets
@@ -2391,7 +2399,7 @@ export class SemanticRelationalMemory {
                             bitMatch += ((id >> b) & 1) ? bias[b] : -bias[b];
                         }
                         // Si c'est une question, on augmente radicalement l'importance de l'attention globale
-                        const queryStrength = isQuestion ? 0.4 : 0.2;
+                        const queryStrength = isQuestion ? 0.8 : 0.3;
                         contextBoost = Math.exp(Math.max(-4.0, Math.min(6.0, (bitMatch / (totalWeight * queryStrength)) * effectiveAttention)));
                         
                         // Courbe de boost plus raide (0.2) et plage élargie (-4 à 6)
@@ -2400,7 +2408,7 @@ export class SemanticRelationalMemory {
 
                 // FUSION FINALE : On ajoute la résonance sémantique au score global
                 // La résonance agit comme un aimant qui attire les mots liés au sujet
-                const meaningPower = semanticResonance * 50.0; 
+                const meaningPower = semanticResonance * 150.0; 
 
                 // Si on est en mode Verbatim (transitionProb élevé), on ignore la grammaire et le sens.
                 // Le binaire devient le SEUL décideur.
@@ -2409,15 +2417,20 @@ export class SemanticRelationalMemory {
                 let score = (grammarScore + transitionProb * transitionWeight + meaningPower) * 
                             contextBoost * verbatimBoost * structuralPenalty * flowBias;
 
+                // BONUS DE JET : Si le mot correspond au "candidat binaire favori", boost massif
+                if (tossedId !== null && id === tossedId) {
+                    score *= 500.0;
+                }
+
                 // Si c'est un hit structurel, c'est presque certainement la fin de phrase voulue
                 if (word === "<eos>") {
-                    if (trigramHit) score *= 100.0; // Priorité absolue à la fin apprise
-                    else if (bigramHit) score *= 20.0;
-                    else if (transitionProb > 0.8) score *= 10.0;
+                    if (hasTrigramOptions && isStructureHit) score *= 100.0; 
+                    else if (hasBigramOptions && isStructureHit) score *= 20.0;
+                    else if (!structureReconnue && transitionProb > 0.8) score *= 10.0;
                 }
                 
                 // Sécurité pour les petits modèles : si on a un hit grammatical, on force le score
-                if (hasTrigramOptions && trigramHit) {
+                if (hasTrigramOptions && isStructureHit) {
                     score += 1000;
                 }
 
@@ -2439,7 +2452,7 @@ export class SemanticRelationalMemory {
                 if (word.length <= 3 && result.slice(-3).includes(word)) score *= isConnector ? 0.1 : 0.01;
                 if (result.length > 0 && result[result.length - 1] === word) score *= 0.0001;
 
-                candidates.push({ id, word, score });
+                candidates.push({ id, word, score, isStructureHit });
             }
 
             if (candidates.length === 0) break;
@@ -2490,6 +2503,16 @@ export class SemanticRelationalMemory {
             const word = selected.word;
             // Signal d'arrêt : si le mot sélectionné est le jeton de fin, on stoppe
             if (word === "<eos>") break;
+
+            // AFFICHAGE LIVE :
+            if (selected.isStructureHit) {
+                process.stdout.write(`\x1b[36m${word}\x1b[0m `); // Cyan pour structure reconnue
+            } else if (tossedId !== null && selected.id === tossedId) {
+                process.stdout.write(`\x1b[35m${word}\x1b[0m `); // Magenta pour le jet réussi
+            } else {
+                process.stdout.write(`${word} `);
+            }
+
             result.push(word);
 
             // ARRÊT INTELLIGENT :
@@ -2556,9 +2579,9 @@ class NeuralBitPredictor {
         this.table = new Uint8Array(this.tableSize).fill(128); // 128 = probabilité 0.5 (neutre)
     }
 
-    _getHash() {
+    _getHash(ctx = this.context) {
         // Hachage non-linéaire du contexte pour indexer la table
-        let h = this.context ^ (this.context >> 17n) ^ (this.context >> 33n);
+        let h = ctx ^ (ctx >> 17n) ^ (ctx >> 33n);
         return Number(h & BigInt(this.tableSize - 1));
     }
 
@@ -2569,6 +2592,23 @@ class NeuralBitPredictor {
     getProbability() {
         // Échelle 0-4096 pour le compresseur arithmétique
         return (this.table[this._getHash()] << 4);
+    }
+
+    /**
+     * Prédit un ID complet de manière probabiliste bit à bit.
+     * @param {number} bitLen 
+     */
+    tossId(bitLen = 12) {
+        let id = 0;
+        let tempCtx = this.context;
+        for (let i = bitLen - 1; i >= 0; i--) {
+            const prob1 = this.table[this._getHash(tempCtx)] / 255;
+            // Jet de dés basé sur la probabilité apprise
+            const bit = Math.random() < prob1 ? 1 : 0;
+            id |= (bit << i);
+            tempCtx = ((tempCtx << 1n) | BigInt(bit)) & this.mask;
+        }
+        return id;
     }
 
     /**

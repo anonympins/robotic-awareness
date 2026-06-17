@@ -55,7 +55,7 @@ async function main() {
     });
 
     let depth = 150;
-    let creativity = 0.05;
+    let creativity = 0.15;
 
     console.log("\n\x1b[32mPrêt pour l'interrogation. Tapez votre amorce.\x1b[0m");
     console.log("Commandes spéciales : /depth [n], /creativity [0-1], /exit\n");
@@ -85,17 +85,17 @@ async function main() {
         brain.attachAttention(attention);
 
         try {
+            process.stdout.write(`\x1b[1mRESP: \x1b[0m`);
             const response = brain.predictSense(prompt, depth, {
                 creativity: creativity,
-                topK: 3,
+                topK: 10,
                 attention: attention
             });
+            process.stdout.write(`\n`); // Fin de ligne après la réponse générée live
 
             if (!response || response.trim().length === 0) {
                 console.log("\x1b[33m[!] Alerte : La réponse est vide. L'expert n'a trouvé aucun candidat viable pour ce contexte.\x1b[0m");
             }
-            
-            console.log(`\x1b[1mRESP:${response}\x1b[0m`);
         } catch (err) {
             console.log("\n\x1b[31m[Erreur de prédiction]\x1b[0m", err.message);
         }

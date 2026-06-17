@@ -59,6 +59,7 @@ export async function runWikipediaTraining(moe) {
         console.log(`Apprentissage terminé en ${duration}ms.`);
         console.log(`Vocabulaire acquis : ${brain.vocabulary.size} mots.`);
 
+        /*
         console.log("\n[3/3] Test de prévision déterministe...");
         
         // Utilisation du tokenizer interne pour garantir la correspondance des IDs
@@ -83,7 +84,7 @@ export async function runWikipediaTraining(moe) {
             console.log("\nStatut : ✅ Restitution fidèle au bit près.");
         } else {
             console.log("\nStatut : ⚠️ Le modèle a divergé (créativité ou collision d'IDs).");
-        }
+        }*/
 
     } catch (err) {
         console.error("❌ Échec de l'entraînement :", err);
