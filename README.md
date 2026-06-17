@@ -58,6 +58,31 @@ This is the link between "understanding" and "moving".
 *   **`RobotActuator`**: Represents a physical joint (Servo, Motor).
 ---
 
+## 🧩 Mixture of Experts (G-NEURO MoE)
+
+The MoE architecture is the core of the system's scalability. Instead of a single massive "brain," G-NEURO divides knowledge into specialized "experts" called **Vortexes**.
+
+### 1. Conceptual Routing (`GNeuroMoE.route`)
+When text is ingested, the orchestrator analyzes the **information density** of words:
+*   **Specificity**: Rare and long words are prioritized to determine the target expert.
+*   **Local Impact**: High-impact tokens (like Wikipedia titles) can force the selection of a specific vortex to ensure context purity.
+*   **The Vortex**: The routing result is a deterministic index pointing to a unique `SemanticRelationalMemory` instance.
+
+### 2. Expert Specialization
+Each vortex develops its own statistical "personality":
+*   **Local Grammar**: Transition probabilities (`grammarMap`) are unique to each expert.
+*   **Bitwise Sculpting**: The `NeuralBitPredictor` within each vortex refines its 256 KB probability table based on its specific domain.
+
+### 3. Dynamic RAM Management
+To allow the system to handle thousands of experts on low-memory hardware:
+*   **LRU System (Least Recently Used)**: Only the most active experts are kept in RAM.
+*   **Binary Persistence**: Inactive experts are serialized in `GNRZ` format (Zlib compressed) to the disk and reloaded instantly when their specific concept is triggered.
+
+### 4. Learning via "Sense"
+The `learnSense` method does not store raw text. It converts semantic units into **12-bit binary IDs** and uses the `bitEngine` to physically modify the probabilistic memory. This is a non-destructive, cumulative memorization process.
+ 
+---
+
 ## 📄 Example Configuration (`robot_config.json`)
 
 This file defines the physical structure, the bitwise logic for safety, and the predefined postures.
