@@ -10,10 +10,13 @@ export async function runWikipediaTraining(moe) {
         // Nettoyage des balises HTML pour obtenir du texte brut traitable par le cerveau
         const content = htmlContent.replace(/<[^>]*>?/gm, '');
         
-        const cleanContent = content
+        let cleanContent = content
             .replace(/==.*?==/g, '') // Enlever les titres de section
             .replace(/\[\d+\]/g, '') // Enlever les références type [1], [2]
             .replace(/\(écoute\)/g, '') // Enlever les tags audio
+            // CORRECTIF : Filtrage agressif du boilerplate Wikipedia qui pollue la grammaire
+            .replace(/Modifier le code|Creative Commons|licence CC-BY-SA|Consulter l'historique|Navigation|Rechercher|Portail de/gi, '')
+            .replace(/\[modifier\]|\[modifier le code\]/gi, '')
             .replace(/\s+/g, ' ')    // Normaliser les espaces et sauts de ligne
             .trim();
 

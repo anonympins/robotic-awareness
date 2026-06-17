@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import { runWikipediaTraining } from './train-wikipedia.js';
+import { runRobertTraining } from './train-le-robert.js';
 import { GNeuroMoE, SyntaxAnalyzer } from './neuro-lib.js';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -56,7 +57,12 @@ async function main() {
         }
 
         try {
-            await runWikipediaTraining(moe);
+            // Alternance entre Wikipedia et Le Robert pour un cerveau équilibré
+            if (cycleCount % 2 === 0) {
+                await runRobertTraining(moe);
+            } else {
+                await runWikipediaTraining(moe);
+            }
 
             // Sauvegarde de l'état des experts pour query-brain.js
             console.log(`[INFO] Sauvegarde des experts sur le disque...`);

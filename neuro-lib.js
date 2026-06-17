@@ -1934,7 +1934,10 @@ export class SemanticRelationalMemory {
      * @param {number} weight Poids de l'apprentissage
      */
     learnSense(sentence, resetContext = true, weight = 1) {
-        const tokens = sentence.match(this.tokenizer) || [];
+        let tokens = sentence.match(this.tokenizer) || [];
+        // Filtrage pour exclure les signes de ponctuation (virgules, points, etc.) de l'apprentissage
+        tokens = tokens.filter(t => /[a-z0-9àâäéèêëïîôöùûüç]/i.test(t));
+
         if (tokens.length === 0) return;
 
         // Ajout du jeton de fin pour que le réseau apprenne à "fermer" la phrase
@@ -1967,7 +1970,7 @@ export class SemanticRelationalMemory {
      * NETTOYAGE DE L'ENTRAÎNEMENT : Filtre les listes de noms et métadonnées.
      */
     learnText(text, continuous = false, weight = 1) {
-        // Découpage par phrases (., !, ?)
+        // Découpage initial par phrases majeures pour l'analyse de qualité globale
         const sentences = text.split(/(?<=[.!?])(?:\s+|\n+|$)/);
         
         sentences.forEach((s, index) => {
@@ -1997,8 +2000,17 @@ export class SemanticRelationalMemory {
             const numericIds = tokens.filter(t => /^\d{3,}$/.test(t)).length;
             if (numericIds / tokens.length > 0.15) return; 
 
-            const shouldReset = index === 0 || !continuous;
-            this.learnSense(cleanS, shouldReset, weight);
+            // --- DÉCOUPAGE EN SOUS-PHRASES (Virgules, points-virgules, etc.) ---
+            // On segmente pour apprendre des unités de sens pures sans les connecteurs de ponctuation
+            const segments = cleanS.split(/[,.;!?:…\n]+/);
+            segments.forEach((seg, segIndex) => {
+                const cleanSeg = seg.trim();
+                if (cleanSeg.length < 2) return;
+                
+                const isFirstOfAll = (index === 0 && segIndex === 0);
+                const shouldReset = isFirstOfAll || !continuous;
+                this.learnSense(cleanSeg, shouldReset, weight);
+            });
         });
     }
 
@@ -2330,9 +2342,12 @@ export class SemanticRelationalMemory {
                 // FIDÉLITÉ ABSOLUE : Si le binaire dit 0, le mot est exclu immédiatement.
                 if (transitionProb < 0.0001 && creativity < 0.01 && !hasTrigramOptions) continue;
 
-                // Pondération dynamique de transitionProb basée sur la créativité
+                // 1. Augmenter l'influence du neurone binaire (Correctif 1)
                 // Quand creativity est 0, transitionWeight est 10.0. Quand creativity est 1.0, transitionWeight est 4.0.
-                const transitionWeight = 4.0 + ((1.0 - creativity) * 6.0);
+                let transitionWeight = 4.0 + ((1.0 - creativity) * 6.0);
+                if (!structureReconnue) {
+                    transitionWeight *= 2.5; // Le binaire guide plus fermement si la grammaire manque
+                }
 
                 // 2. Score de Schéma (BACK-OFF HIÉRARCHIQUE : Tri > Bi > Raw)
                 let grammarWeight = 0;
@@ -2372,6 +2387,12 @@ export class SemanticRelationalMemory {
                     structuralPenalty = 0.000000001; 
                 } else if (!structureReconnue && semanticResonance === 0 && !isVerbatim) {
                     structuralPenalty = 0.00000001; 
+                }
+
+                // 2. Injecter un "Biais de Pontage" (Correctif 2)
+                let bridgingBias = 1.0;
+                if (!structureReconnue && isConnector) {
+                    bridgingBias = 3.5; // Favorise les mots de liaison quand on est "hors-piste"
                 }
 
                // const verbatimBoost = isVerbatim ? 100.0 : 1.0; // Boost Verbatim augmenté
@@ -2415,11 +2436,14 @@ export class SemanticRelationalMemory {
                 const verbatimBoost = transitionProb > 0.8 ? 100.0 : 1.0;
 
                 let score = (grammarScore + transitionProb * transitionWeight + meaningPower) * 
-                            contextBoost * verbatimBoost * structuralPenalty * flowBias;
+                            contextBoost * verbatimBoost * structuralPenalty * flowBias * bridgingBias;
 
                 // BONUS DE JET : Si le mot correspond au "candidat binaire favori", boost massif
                 if (tossedId !== null && id === tossedId) {
-                    score *= 500.0;
+                    // 3. Harmonisation du Jet (Correctif 3)
+                    // Si l'attention est diffuse (résonance faible), le jet probabiliste binaire devient le candidat par défaut.
+                    const jetPower = (semanticResonance < 0.1) ? 2000.0 : 500.0;
+                    score *= jetPower;
                 }
 
                 // Si c'est un hit structurel, c'est presque certainement la fin de phrase voulue
@@ -5962,7 +5986,9 @@ export class GNeuroMoE {
             // - 1 / (globalFreq + epsilon) : il est rare dans la langue globale.
             // - length / 4 : les mots longs sont souvent des noms propres ou techniques.
             
-            const specificity = 1 / (globalFreq + 0.0001);
+            // CORRECTIF : Utilisation du Logarithme pour éviter qu'un mot rare 
+            // ne domine artificiellement le score de routage (Lissage de spécificité)
+            const specificity = Math.log10(1 / (globalFreq + 0.00001));
             
             // Heuristique de Force : on privilégie la rareté (spécificité) et la longueur
             // On ajoute un log sur la longueur pour ne pas sur-favoriser les mots trop longs
