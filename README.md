@@ -58,6 +58,44 @@ This is the link between "understanding" and "moving".
 *   **`RobotActuator`**: Represents a physical joint (Servo, Motor).
 ---
 
+## 🌐 API Server (`api-server.js`)
+
+The project includes a REST API to interact with the MoE system, allowing remote ingestion of knowledge and semantic querying.
+
+### 1. Data Ingestion (`POST /ingest`)
+Used to feed the "experts" with new text. The orchestrator automatically routes the content to the relevant **Vortex**.
+
+*   **Endpoint**: `http://localhost:7701/ingest`
+*   **Payload**:
+    ```json
+    {
+      "text": "The battery level is a critical parameter for autonomous navigation...",
+      "weight": 1
+    }
+    ```
+*   **Behavior**: The orchestrator filters noise, identifies the core concept, updates the binary probability table of the relevant expert, and persists changes to disk (`.gnr` files).
+
+### 2. Semantic Query (`POST /query`)
+Queries the brain to generate a prediction or a "continuation of thought" based on a prompt.
+
+*   **Endpoint**: `http://localhost:7701/query`
+*   **Payload**:
+    ```json
+    {
+      "prompt": "When the battery is low, the robot must",
+      "depth": 150,
+      "creativity": 0.15,
+      "topK": 10
+    }
+    ```
+*   **Parameters**:
+    *   `prompt`: The seed text used to "warm up" the neural context.
+    *   `depth`: Maximum number of tokens to generate.
+    *   `creativity` (0.0 to 1.0): Higher values increase the variety of word choices (temperature).
+    *   `topK`: Number of most likely candidates considered for each token selection.
+
+---
+
 ## 🧩 Mixture of Experts (G-NEURO MoE)
 
 The MoE architecture is the core of the system's scalability. Instead of a single massive "brain," G-NEURO divides knowledge into specialized "experts" called **Vortexes**.
