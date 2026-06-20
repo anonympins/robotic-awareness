@@ -1,7 +1,5 @@
 #!/usr/bin/env node
 
-import { runWikipediaTraining } from './train-wikipedia.js';
-import { runRobertTraining } from './train-le-robert.js';
 import { GNeuroMoE, SyntaxAnalyzer } from './neuro-lib.js';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -9,6 +7,68 @@ import path from 'node:path';
 const EXPERTS_DIR = './experts_chunks/';
 
 async function main() {
+    // --- NOUVEAU : Gestion de l'option --local ---
+    const args = process.argv.slice(2);
+    const useLocalCorpus = args.includes('--local');
+
+    /**
+     * Fonction d'entraînement sur un corpus local (fichiers .txt)
+     * @param {GNeuroMoE} moe L'instance du Mixture of Experts
+     * @param {string} corpusType 'wikipedia' ou 'le_robert'
+     * @param {number} weight Poids de l'apprentissage
+     */
+    async function runLocalTraining(moe, corpusType, weight) {
+        const corpusDir = `./training_corpus/${corpusType}/`;
+        if (!fs.existsSync(corpusDir)) {
+            console.log(`\x1b[33m[LOCAL] Répertoire corpus '${corpusDir}' non trouvé. Saut.\x1b[0m`);
+            return;
+        }
+        const files = fs.readdirSync(corpusDir);
+        if (files.length === 0) {
+            console.log(`\x1b[33m[LOCAL] Corpus '${corpusType}' est vide. Saut.\x1b[0m`);
+            return;
+        }
+
+        // Sélection d'un fichier aléatoire dans le corpus
+        const file = files[Math.floor(Math.random() * files.length)];
+        const filePath = path.join(corpusDir, file);
+        const content = fs.readFileSync(filePath, 'utf-8');
+        
+        // Le nom du fichier (sans extension) sert de pseudo-titre pour le routage
+        const title = path.basename(file, '.txt').replace(/_/g, ' ');
+
+        console.log(`\n\x1b[32m[LOCAL]\x1b[0m Entraînement sur '${file}'...`);
+
+        // Logique de routage et d'apprentissage (similaire aux scripts de scraping)
+        const highImpact = title.toLowerCase().match(/[a-z0-9àâäéèêëïîôöùûüç]{4,}/g) || [];
+        const domain = moe.route(title + " " + content.slice(0, 500), highImpact);
+        console.log(`[MoE] Domaine détecté : \x1b[33m${domain.toUpperCase()}\x1b[0m`);
+
+        const brain = moe.getExpert(domain);
+        const STORAGE_PATH = `./experts_chunks/expert_${domain}.gnr`;
+
+        if (!brain.hasBeenLoaded && fs.existsSync(STORAGE_PATH)) {
+            console.log(`[MoE] Chargement du chunk : ${domain}`);
+            brain.importState(fs.readFileSync(STORAGE_PATH));
+            brain.hasBeenLoaded = true;
+        }
+
+        const start = Date.now();
+        brain.learnText(content, true, weight);
+        const duration = Date.now() - start;
+
+        console.log(`Apprentissage local terminé en ${duration}ms.`);
+    }
+
+    // --- Fin des nouvelles fonctions ---
+
+    // Importation dynamique seulement si nécessaire (pour ne pas charger les scrapers en mode --local)
+    let runWikipediaTraining, runRobertTraining;
+    if (!useLocalCorpus) {
+        ({ runWikipediaTraining } = await import('./train-wikipedia.js'));
+        ({ runRobertTraining } = await import('./train-le-robert.js'));
+    }
+
     console.log("\x1b[35m%s\x1b[0m", "=== G-NEURO CONTINUOUS TRAINER : LOCAL DIAGNOSTIC ===");
     
     // Vérification de l'environnement local
@@ -18,7 +78,7 @@ async function main() {
         process.exit(1);
     }
 
-    if (!fs.existsSync('./train-wikipedia.js')) {
+    if (!useLocalCorpus && !fs.existsSync('./train-wikipedia.js')) {
         console.error("\x1b[31m[ERREUR]\x1b[0m Fichier 'train-wikipedia.js' manquant dans le répertoire courant.");
         process.exit(1);
     }
@@ -63,11 +123,18 @@ async function main() {
         }
 
         try {
-            // Alternance entre Wikipedia et Le Robert pour un cerveau équilibré
-            if (cycleCount % 2 === 0) {
-                await runRobertTraining(moe);
+            if (useLocalCorpus) {
+                console.log("\x1b[36m[MODE] Entraînement sur le corpus local.\x1b[0m");
+                // En mode local, on alterne aussi entre les deux sources
+                if (cycleCount % 2 === 0) {
+                    await runLocalTraining(moe, 'le_robert', 8);
+                } else {
+                    await runLocalTraining(moe, 'wikipedia', 5);
+                }
             } else {
-                await runWikipediaTraining(moe);
+                // Comportement normal : scraping en ligne
+                if (cycleCount % 2 === 0) await runRobertTraining(moe);
+                else await runWikipediaTraining(moe);
             }
 
             // Sauvegarde de l'état des experts pour query-brain.js
@@ -82,7 +149,7 @@ async function main() {
             await new Promise(resolve => setTimeout(resolve, 2000));
 
         } catch (trainErr) {
-            console.error(`\x1b[31m[ERREUR CYCLE #${cycleCount}]\x1b[0m Impossible de joindre Wikipedia ou erreur de script :`);
+            console.error(`\x1b[31m[ERREUR CYCLE #${cycleCount}]\x1b[0m`, trainErr.message);
             console.error(trainErr.message);
             console.log("Attente de 10 secondes avant nouvelle tentative...");
             await new Promise(resolve => setTimeout(resolve, 10000));

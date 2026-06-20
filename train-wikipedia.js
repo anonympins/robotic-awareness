@@ -1,6 +1,9 @@
 import { SemanticAttentionLayer } from "./neuro-lib.js";
 import { scrapeRandomWikipediaContent } from "./wikipedia-scraper.js";
 import fs from 'node:fs';
+import { appendFile, stat } from 'node:fs/promises';
+
+const TRAINING_CORPUS_PATH = 'training_corpus.txt';
 
 export async function runWikipediaTraining(moe) {
     try {
@@ -22,6 +25,21 @@ export async function runWikipediaTraining(moe) {
             .replace(/\[modifier\]|\[modifier le code\]/gi, '')
             .replace(/\s+/g, ' ')    // Normaliser les espaces et sauts de ligne
             .trim();
+
+        // --- Sauvegarde du contenu pour le corpus unifié ---
+        try {
+            const stats = await stat(TRAINING_CORPUS_PATH).catch(() => ({ size: 0 }));
+            const ONE_GIGABYTE = 1024 * 1024 * 1024;
+            if (stats.size < ONE_GIGABYTE) {
+                const corpusEntry = `${title}\n${cleanContent}\n\n`;
+                await appendFile(TRAINING_CORPUS_PATH, corpusEntry, 'utf-8');
+                console.log(`\x1b[2m[CORPUS] Contenu de "${title}" ajouté au corpus principal.\x1b[0m`);
+            } else {
+                console.log(`\x1b[2m[CORPUS] Le fichier de corpus a atteint sa taille maximale. Pas d'ajout.\x1b[0m`);
+            }
+        } catch (e) {
+            console.error(`\x1b[31m[CORPUS] Erreur lors de la sauvegarde : ${e.message}\x1b[0m`);
+        }
 
         // --- ANALYSE D'IMPACT LOCAL POUR LE ROUTAGE ---
         // On identifie les mots clés de la page avant le routage
