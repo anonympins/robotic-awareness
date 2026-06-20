@@ -1677,6 +1677,56 @@ export class SemanticRelationalMemory {
         this.CACHE_UPDATE_THRESHOLD = 100; // Mettre à jour le cache tous les 100 mots
     }
 
+    /**
+     * NOUVEAU : Évalue la pertinence d'un ensemble de tokens pour cet expert.
+     * Calcule un score basé sur le besoin d'information (mots inconnus) et
+     * le potentiel de connectivité (liens avec la grammaire existante).
+     * @param {string[]} tokens Les tokens du texte à évaluer.
+     * @returns {{needScore: number, connectivityScore: number, combinedScore: number}}
+     */
+    evaluateRelevance(tokens) {
+        if (tokens.length === 0) {
+            return { needScore: 0, connectivityScore: 0, combinedScore: 0 };
+        }
+
+        let unknownTokens = 0;
+        let knownBigrams = 0;
+        let knownTrigrams = 0;
+
+        const ids = tokens.map(t => this.vocabulary.get(t));
+
+        for (let i = 0; i < tokens.length; i++) {
+            const token = tokens[i];
+            const id = ids[i];
+
+            if (id === undefined) {
+                unknownTokens++;
+            } else {
+                // Potentiel de connectivité
+                if (i > 0 && this.grammarMap.has(ids[i-1]) && this.grammarMap.get(ids[i-1]).has(id)) {
+                    knownBigrams++;
+                }
+                // CORRECTIF : S'assurer que les IDs du contexte existent avant de créer la clé BigInt
+                if (i > 1 && ids[i-2] !== undefined && ids[i-1] !== undefined) {
+                    const trigramKey = (BigInt(ids[i-2]) << 32n) | BigInt(ids[i-1]);
+                    if (this.grammarMap.has(trigramKey) && this.grammarMap.get(trigramKey).has(id)) {
+                        knownTrigrams++;
+                    }
+                }
+            }
+        }
+
+        // Score de besoin : Plus il y a de mots inconnus, plus le besoin est grand. Normalisé par la longueur.
+        const needScore = unknownTokens / tokens.length;
+
+        // Score de connectivité : Plus il y a de liens existants, plus le texte est pertinent.
+        const connectivityScore = (knownBigrams + knownTrigrams * 2) / (tokens.length * 3); // On donne plus de poids aux trigrammes
+
+        // Score combiné : On favorise un équilibre entre nouveauté et pertinence.
+        const combinedScore = (needScore * 0.4) + (connectivityScore * 0.6);
+
+        return { needScore, connectivityScore, combinedScore };
+    }
 
     attachAttention(layer) {
         this.attention = layer;
@@ -6373,32 +6423,49 @@ export class GNeuroMoE {
     learnWithSpecialization(text, options = {}) {
         const { weight = 1.0, secondary_weight = 0.1 } = options;
 
-        const sentences = text.split(/(?<=[.!?])(?:\s+|\n+|$)/).filter(s => s.trim().length > 3);
+        const tokenizer = /[a-z0-9àâäéèêëïîôöùûüç]+(?:['][a-z0-9àâäéèêëïîôöùûüç]*)?|[^\w\s]/gi;
+
+        const sentences = text.split(/(?<=[.!?])(?:\s+|\n+|$)/).map(s => s.trim()).filter(s => s.length > 3);
         if (sentences.length === 0) {
             return { report: {}, modifiedExperts: new Set(), sentences: [] };
         }
 
         const ingestionReport = {};
         const modifiedExperts = new Set();
-        const initialVocabSizes = {};
 
-        // Initialiser le rapport pour les experts déjà chargés
-        for (const [domain, expert] of this.experts.entries()) {
-            if (expert.hasBeenLoaded) {
-                initialVocabSizes[domain] = expert.vocabulary.size;
-                ingestionReport[domain] = { sentences: 0, new_tokens: 0 };
-            }
-        }
+        const initialVocabSizes = new Map(Array.from(this.experts.entries()).map(([domain, expert]) => [domain, expert.vocabulary.size]));
+
 
         for (const sentence of sentences) {
-            // 1. Identifier l'expert principal pour cette phrase
-            const mainDomain = this.route(sentence);
-            const mainExpert = this.getExpert(mainDomain); // Assure sa création si nouveau
+            const tokens = sentence.toLowerCase().match(tokenizer) || [];
+            if (tokens.length === 0) continue;
 
-            // 2. Tous les experts apprennent la phrase, mais avec des poids différents
+            let bestDomain = 'general';
+            let highestScore = -1;
+
+            // 1. SONDER LE RÉSEAU : Chaque expert évalue la pertinence de la phrase.
+            const activeExperts = Array.from(this.experts.entries()).filter(([_, expert]) => expert.hasBeenLoaded);
+            if (activeExperts.length === 0) { // Si aucun expert n'est chargé, on se rabat sur le routage simple
+                bestDomain = this.route(sentence);
+            } else {
+                for (const [domain, expert] of activeExperts) {
+                    const { combinedScore } = expert.evaluateRelevance(tokens);
+                    if (combinedScore > highestScore) {
+                        highestScore = combinedScore;
+                        bestDomain = domain;
+                    }
+                }
+            }
+
+            // Si aucun expert n'a trouvé la phrase pertinente, on utilise le routage par défaut
+            if (highestScore <= 0) {
+                bestDomain = this.route(sentence);
+            }
+
+            // 2. APPRENTISSAGE CIBLÉ : L'expert principal apprend fortement, les autres faiblement.
             for (const [domain, expert] of this.experts.entries()) {
-                // On ne fait apprendre qu'aux experts déjà chargés ou celui qui vient d'être créé
-                if (!expert.hasBeenLoaded && domain !== mainDomain) continue;
+                // On ne fait apprendre qu'aux experts déjà chargés ou celui qui vient d'être sélectionné
+                if (!expert.hasBeenLoaded && domain !== bestDomain) continue;
 
                 // Initialise le rapport pour un expert nouvellement créé
                 if (!ingestionReport[domain]) {
@@ -6406,7 +6473,7 @@ export class GNeuroMoE {
                     ingestionReport[domain] = { sentences: 0, new_tokens: 0 };
                 }
 
-                const learningWeight = (domain === mainDomain) ? weight : secondary_weight;
+                const learningWeight = (domain === bestDomain) ? weight : secondary_weight;
                 expert.learnSense(sentence, true, learningWeight);
                 ingestionReport[domain].sentences++;
                 modifiedExperts.add(domain);

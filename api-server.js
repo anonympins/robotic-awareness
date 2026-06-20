@@ -108,14 +108,16 @@ app.post('/ingest', async (req, res) => {
 
         // Persistance de tous les experts modifiés
         for (const domain of modifiedExperts) {
-            const expert = moe.getExpert(domain);
+            const expert = moe.experts.get(domain); // Accès direct car on sait qu'il est en mémoire
             if (!expert) continue;
 
             const expertPath = path.join(EXPERTS_DIR, `expert_${domain}.gnr`);
             fs.writeFileSync(expertPath, expert.exportBinary());
             
             const expertReport = report[domain];
-            expertReport.new_tokens = expert.vocabulary.size - initialVocabSizes[domain];
+            // La taille initiale du vocabulaire est maintenant gérée dans learnWithSpecialization
+            // et le rapport est plus direct.
+            expertReport.new_tokens = expert.vocabulary.size - (initialVocabSizes.get(domain) || expert.vocabulary.size);
             console.log(`\x1b[32m[API]\x1b[0m Ingestion [${domain}] : ${expertReport.sentences} phrases, +${expertReport.new_tokens} tokens.`);
         }
 

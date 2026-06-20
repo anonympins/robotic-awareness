@@ -70,9 +70,14 @@ async function main() {
 
         const start = Date.now();
         // --- NOUVELLE LOGIQUE : Utilisation de la méthode d'apprentissage centralisée ---
-        // On utilise un poids secondaire plus faible pour l'entraînement de fond.
-        moe.learnWithSpecialization(content, { weight: weight, secondary_weight: 0.05 });
+        const { report, modifiedExperts } = moe.learnWithSpecialization(content, { weight: weight, secondary_weight: 0.05 });
         const duration = Date.now() - start;
+
+        // Log plus détaillé sur les experts qui ont appris
+        for (const domain of modifiedExperts) {
+            console.log(`  \x1b[2m> Expert [${domain}] a appris ${report[domain].sentences} phrases.\x1b[0m`);
+        }
+
         console.log(`\x1b[2mApprentissage local terminé en ${duration}ms.\x1b[0m`);
     }
 
