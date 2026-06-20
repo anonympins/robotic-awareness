@@ -14,6 +14,7 @@ if (!fs.existsSync(EXPERTS_DIR)) fs.mkdirSync(EXPERTS_DIR);
 // Orchestrateur Mixture of Experts
 const moe = new GNeuroMoE(16);
 const attention = new SemanticAttentionLayer();
+let coreBrain = null; // Variable pour stocker l'expert grammatical de base
 
 // Charger l'état global pour le routage et le vocabulaire dès le démarrage
 moe.loadSharedState(`${EXPERTS_DIR}shared_state.gnr`);
@@ -41,6 +42,10 @@ console.log("\x1b[2m[MoE] Pré-chargement terminé.\x1b[0m");
  * Récupère un expert et charge son état binaire si nécessaire
  * La fonction est maintenant asynchrone pour ne pas bloquer le serveur.
  */
+
+// On récupère l'expert 'core' une seule fois au démarrage pour le fallback
+coreBrain = moe.getCoreExpert();
+
 async function getExpertForContent(text) {
     const domain = moe.route(text);
     const brain = moe.getExpert(domain);
@@ -139,7 +144,8 @@ app.post('/query', async (req, res) => {
         let prediction = brain.predictSense(prompt, depth, {
             creativity: creativity,
             topK: topK,
-            attention: attention
+            attention: attention,
+            coreBrain: coreBrain // On passe l'expert de base en option
         });
 
         if (!prediction || prediction.trim().length === 0) {
