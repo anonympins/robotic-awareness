@@ -2555,7 +2555,7 @@ export class SemanticRelationalMemory {
                 // 2. Si toujours rien, on utilise les mots les plus fréquents comme base
                 if (candidateIds.size === 0) {
                     const frequent = this.frequentWordsCache.length > 0 ? this.frequentWordsCache : options.coreBrain?.frequentWordsCache;
-                    if (frequent) {
+                    if (frequent?.length > 0) {
                         frequent.forEach(id => candidateIds.add(id));
                     }
                 }
