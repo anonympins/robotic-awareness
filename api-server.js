@@ -16,6 +16,11 @@ const attention = new SemanticAttentionLayer();
 
 // Charger l'état global pour le routage et le vocabulaire dès le démarrage
 moe.loadSharedState(`${EXPERTS_DIR}shared_state.gnr`);
+console.log(`\x1b[2m[MoE] Vocabulaire partagé initialisé avec ${moe.sharedState.vocabulary.size} tokens.\x1b[0m`);
+
+// --- NOUVEAU : Pré-chargement de l'expert grammatical de base ---
+const coreBrain = moe.getCoreExpert();
+coreBrain.attachAttention(attention);
 
 /**
  * Récupère un expert et charge son état binaire si nécessaire
@@ -115,7 +120,8 @@ app.post('/query', async (req, res) => {
         let prediction = brain.predictSense(prompt, depth, {
             creativity: creativity,
             topK: topK,
-            attention: attention
+            attention: attention,
+            coreBrain: coreBrain // On injecte l'expert grammatical de base
         });
 
         if (!prediction || prediction.trim().length === 0) {

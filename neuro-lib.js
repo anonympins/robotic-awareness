@@ -1664,6 +1664,7 @@ export class SemanticRelationalMemory {
         this.tokenizer = /[a-z0-9àâäéèêëïîôöùûüç]+(?:['][a-z0-9àâäéèêëïîôöùûüç]*)?|[^\w\s]/gi;
     }
 
+
     attachAttention(layer) {
         this.attention = layer;
     }
@@ -1946,8 +1947,6 @@ export class SemanticRelationalMemory {
      */
     learnSense(sentence, resetContext = true, weight = 1) {
         let tokens = sentence.match(this.tokenizer) || [];
-        // Filtrage pour exclure les signes de ponctuation (virgules, points, etc.) de l'apprentissage
-        tokens = tokens.filter(t => /[a-z0-9àâäéèêëïîôöùûüç]/i.test(t));
 
         if (tokens.length === 0) return;
 
@@ -2011,17 +2010,12 @@ export class SemanticRelationalMemory {
             const numericIds = tokens.filter(t => /^\d{3,}$/.test(t)).length;
             if (numericIds / tokens.length > 0.15) return; 
 
-            // --- DÉCOUPAGE EN SOUS-PHRASES (Virgules, points-virgules, etc.) ---
-            // On segmente pour apprendre des unités de sens pures sans les connecteurs de ponctuation
-            const segments = cleanS.split(/[,.;!?:…\n]+/);
-            segments.forEach((seg, segIndex) => {
-                const cleanSeg = seg.trim();
-                if (cleanSeg.length < 2) return;
-                
-                const isFirstOfAll = (index === 0 && segIndex === 0);
-                const shouldReset = isFirstOfAll || !continuous;
-                this.learnSense(cleanSeg, shouldReset, weight);
-            });
+            // --- APPRENTISSAGE DE LA PHRASE COMPLÈTE ---
+            // On n'entraîne plus sur des sous-phrases, mais sur la phrase entière
+            // pour capturer les dépendances à longue portée.
+            const isFirstOfAll = (index === 0);
+            const shouldReset = isFirstOfAll || !continuous;
+            this.learnSense(cleanS, shouldReset, weight);
         });
     }
 
@@ -2215,6 +2209,69 @@ export class SemanticRelationalMemory {
     }
 
     /**
+     * Évalue la qualité d'une séquence d'IDs générée.
+     * Retourne un score de confiance (0 à 1).
+     * Un score faible indique une "hallucination" ou une erreur structurelle.
+     * @param {number[]} ids La séquence d'IDs de mots générés.
+     * @returns {{confidence: number, weakLinks: Array}}
+     */
+    _critiquePrediction(ids) {
+        if (ids.length < 2) return { confidence: 1.0, weakLinks: [] };
+
+        let totalConfidence = 0;
+        const weakLinks = [];
+        let prevPrevId = 2; // <eos>
+        let prevId = ids[0];
+
+        for (let i = 1; i < ids.length; i++) {
+            const currentId = ids[i];
+            const trigramKey = (BigInt(prevPrevId) << 32n) | BigInt(prevId);
+
+            const trigramTransitions = this.grammarMap.get(trigramKey);
+            const bigramTransitions = this.grammarMap.get(prevId);
+
+            let linkStrength = 0;
+            let totalWeight = 1;
+
+            if (trigramTransitions && trigramTransitions.has(currentId)) {
+                linkStrength = trigramTransitions.get(currentId);
+                totalWeight = Array.from(trigramTransitions.values()).reduce((a, b) => a + b, 1);
+            } else if (bigramTransitions && bigramTransitions.has(currentId)) {
+                linkStrength = bigramTransitions.get(currentId) * 0.5; // Les bigrammes sont moins fiables
+                totalWeight = Array.from(bigramTransitions.values()).reduce((a, b) => a + b, 1);
+            }
+
+            const confidence = linkStrength / totalWeight;
+            totalConfidence += confidence;
+
+            if (confidence < 0.1) { // Seuil de "maillon faible"
+                weakLinks.push({ from: [prevPrevId, prevId], to: currentId, confidence });
+            }
+
+            prevPrevId = prevId;
+            prevId = currentId;
+        }
+
+        return { confidence: totalConfidence / (ids.length - 1), weakLinks };
+    }
+
+    /**
+     * Applique une "punition" en affaiblissant les transitions qui ont mené à une erreur.
+     * C'est le coeur de "l'apprentissage de ses propres erreurs".
+     */
+    _punishSequence(weakLinks, punishmentFactor = 0.8) {
+        weakLinks.forEach(link => {
+            const trigramKey = (BigInt(link.from[0]) << 32n) | BigInt(link.from[1]);
+            const transitions = this.grammarMap.get(trigramKey);
+            if (transitions && transitions.has(link.to)) {
+                const currentWeight = transitions.get(link.to);
+                // On réduit le poids, mais on ne le supprime pas complètement pour permettre un ré-apprentissage
+                transitions.set(link.to, Math.max(1, currentWeight * punishmentFactor));
+            }
+        });
+    }
+
+    /**
      * Prédit la suite non pas par lettre, mais par concept
      * @param {Object} options { depth, focusBias: Map<ID, weight> }
      */
@@ -2222,7 +2279,7 @@ export class SemanticRelationalMemory {
         const tokens = seedSentence.match(this.tokenizer) || [];
         this.bitEngine.resetContext();
         
-        const activeIds = [];
+        let activeIds = [];
         const queryIds = tokens.map(t => this.vocabulary.get(t) || 0).filter(id => id > 0);
         const identityIds = [];
         const isQuestion = seedSentence.includes('?');
@@ -2262,7 +2319,7 @@ export class SemanticRelationalMemory {
         }
 
         const attLayer = options.attention || this.attention;
-        let result = [];
+        let generatedIds = [];
         const wordCounts = new Map();
         const creativity = (options.creativity !== undefined) ? options.creativity : 0.01; 
         let rollingConfidence = 1.0;
@@ -2298,18 +2355,38 @@ export class SemanticRelationalMemory {
         // On s'assure qu'elle est suffisante pour le quota de phrases calculé.
         const maxSafetyLimit = Math.max(depth, targetSentences * 25);
 
-        for (let i = 0; i < maxSafetyLimit; i++) {// Génère un ID via le moteur de bits pour le diagnostic visuel (correspondance binaire)
+        for (let i = 0; i < maxSafetyLimit; i++) {
             const tossedId = this.bitEngine.tossId ? this.bitEngine.tossId() : null;
 
             const hasTrigramOptions = trigramContext && trigramContext.size > 0;
             const hasBigramOptions = bigramContext && bigramContext.size > 0;
             const structureReconnue = hasTrigramOptions || hasBigramOptions;
 
+            // --- OPTIMISATION MAJEURE : Sélection des Candidats ---
+            // Au lieu de parcourir tout le vocabulaire, on ne teste que les mots
+            // suggérés par la grammaire (trigrammes/bigrammes).
+            const candidateIds = new Set();
+            if (hasTrigramOptions) {
+                trigramContext.forEach((_, id) => candidateIds.add(id));
+            }
+            if (hasBigramOptions) {
+                bigramContext.forEach((_, id) => candidateIds.add(id));
+            }
+            // Si la grammaire est muette, on se rabat sur une exploration plus large (mais c'est rare)
+            if (candidateIds.size === 0) {
+                // --- CORRECTIF ROBUSTESSE ---
+                // Si l'expert local est vide, on utilise le vocabulaire partagé du MoE pour avoir une base.
+                const vocabToUse = this.vocabulary.size > 3 ? this.vocabulary : (this.sharedState?.vocabulary || this.vocabulary);
+                vocabToUse.forEach((id, word) => { 
+                    if (id > 2) candidateIds.add(id); 
+                });
+            }
+
             const candidates = [];
             
-            // Itère sur tous les mots du vocabulaire pour trouver les candidats
-            for (let [word, id] of this.vocabulary) {
-                // Ignore l'ID 0 (souvent <PAD> ou <UNK>)
+            // On itère uniquement sur le set réduit de candidats pertinents
+            for (const id of candidateIds) {
+                const word = this.reverseVocab.get(id);
                 if (id === 0) continue;
 
                 const isConnector = this.isStructural(id) || [',', ';', 'et', 'mais', 'car', 'puis', 'donc', 'ou', 'si', 'or', 'ni'].includes(word);
@@ -2366,20 +2443,20 @@ export class SemanticRelationalMemory {
 
                 // Tentative Trigramme (Priorité absolue)
                 if (hasTrigramOptions && trigramContext.has(id)) {
-                    let boost = 50.0;
+                    let boost = 40.0; // Réduction du boost pour ne pas écraser les autres signaux
                     // Si le sous-expert virtualisé confirme, on booste encore plus
                     if (subTrigramContext && subTrigramContext.has(id)) {
                         boost *= 3.0;
                     }
-                    grammarWeight = trigramContext.get(id) * boost * 100.0; // Boost massif
-                    totalStructuralWeight = Array.from(trigramContext.values()).reduce((a,b)=>a+b, 0);
+                    grammarWeight = trigramContext.get(id) * boost;
+                    totalStructuralWeight = Array.from(trigramContext.values()).reduce((a,b)=>a+b, 1);
                     isStructureHit = true;
                 }
 
                 // Fallback Bigramme (Si pas de hit Trigramme)
                 if (!isStructureHit && hasBigramOptions && bigramContext.has(id)) {
-                    grammarWeight = bigramContext.get(id) * 500.0; // Boost massif
-                    totalStructuralWeight = Array.from(bigramContext.values()).reduce((a,b)=>a+b, 0);
+                    grammarWeight = bigramContext.get(id) * 20.0; // Boost plus modéré
+                    totalStructuralWeight = Array.from(bigramContext.values()).reduce((a,b)=>a+b, 1);
                     isStructureHit = true;
                 }
 
@@ -2394,7 +2471,7 @@ export class SemanticRelationalMemory {
 
                 // 1. PRIORITÉ AU VERBATIM (Verrouillage de trajectoire)
                 if (structureReconnue && !isStructureHit) {
-                    structuralPenalty = 1e-25; // Verrouillage strict : on suit le rail grammatical connu
+                    structuralPenalty = 1e-15; // Pénalité forte mais pas un verrouillage absolu
                 } else if (!structureReconnue) {
                     // 2. GESTIONNAIRE DE JUXTAPOSITION (Recherche de Pontage)
                     // On cherche activement des connecteurs ou des ancres sémantiques
@@ -2402,7 +2479,7 @@ export class SemanticRelationalMemory {
                     if (isStarter) structuralPenalty *= 5.0;
                     
                     // 3. RECHERCHE DE SÉQUENCE ANCRE : Si aucune structure, on exige un lien sémantique fort
-                    if (!isConnector && !isStarter && semanticResonance < 0.001) structuralPenalty = 1e-15;
+                    if (!isConnector && !isStarter && semanticResonance < 0.001) structuralPenalty = 1e-10;
                 }
 
                 // 2. Injecter un "Biais de Pontage" (Correctif 2)
@@ -2445,25 +2522,22 @@ export class SemanticRelationalMemory {
 
                 // FUSION FINALE : On ajoute la résonance sémantique au score global
                 // La résonance agit comme un aimant qui attire les mots liés au sujet
-                const meaningPower = semanticResonance * 150.0; 
+                // À haute créativité, on explore plus agressivement les liens sémantiques.
+                const semanticExplorationFactor = 1.0 + (creativity * 4.0);
+                const meaningPower = semanticResonance * 150.0 * semanticExplorationFactor;
 
                 // Si on est en mode Verbatim (transitionProb élevé), on ignore la grammaire et le sens.
                 // Le binaire devient le SEUL décideur.
-                const verbatimBoost = transitionProb > 0.8 ? 100.0 : 1.0;
+                const verbatimBoost = transitionProb > 0.8 ? 50.0 : 1.0; // Boost réduit
 
                 let score = (grammarScore + transitionProb * transitionWeight + meaningPower) * 
                             contextBoost * verbatimBoost * structuralPenalty * flowBias * bridgingBias;
 
                 // Si c'est un hit structurel, c'est presque certainement la fin de phrase voulue
                 if (word === "<eos>") {
-                    if (hasTrigramOptions && isStructureHit) score *= 100.0; 
-                    else if (hasBigramOptions && isStructureHit) score *= 20.0;
-                    else if (!structureReconnue && transitionProb > 0.8) score *= 10.0;
-                }
-                
-                // Sécurité pour les petits modèles : si on a un hit grammatical, on force le score
-                if (hasTrigramOptions && isStructureHit) {
-                    score += 1000;
+                    if (hasTrigramOptions && isStructureHit) score *= 50.0; 
+                    else if (hasBigramOptions && isStructureHit) score *= 10.0;
+                    else if (!structureReconnue && transitionProb > 0.8) score *= 5.0;
                 }
 
                 // 4. Filtre de bruit sémantique (Heuristique)
@@ -2477,12 +2551,14 @@ export class SemanticRelationalMemory {
                 
                 // PÉNALITÉ DE RÉPÉTITION (Dynamique)
                 // On réduit la pénalité pour les connecteurs pour permettre "Le chat et le chien"
-                const count = wordCounts.get(word) || 0;
-                if (count > 0) score *= isConnector ? 0.5 : Math.pow(0.001, count);
+                const repetitionCount = wordCounts.get(word) || 0;
+                if (repetitionCount > 0) score *= isConnector ? 0.5 : Math.pow(0.001, repetitionCount);
                 
+                // On reconstruit temporairement la fin de la phrase pour la vérification anti-bégaiement
+                const lastWords = generatedIds.slice(-3).map(id => this.reverseVocab.get(id));
                 // Anti-bégaiement immédiat (Moins sévère pour les connecteurs)
-                if (word.length <= 3 && result.slice(-3).includes(word)) score *= isConnector ? 0.1 : 0.01;
-                if (result.length > 0 && result[result.length - 1] === word) score *= 0.0001;
+                if (word.length <= 3 && lastWords.includes(word)) score *= isConnector ? 0.1 : 0.01;
+                if (lastWords.length > 0 && lastWords[lastWords.length - 1] === word) score *= 0.0001;
 
                 candidates.push({ id, word, score, isStructureHit });
             }
@@ -2497,7 +2573,7 @@ export class SemanticRelationalMemory {
             rollingConfidence = (rollingConfidence * 0.9) + (Math.min(1.0, topScore) * 0.1);
 
             // Si la confiance chute trop bas ou si le score est dérisoire, on arrête
-            if (topScore < 1e-18 || (i > 5 && rollingConfidence < 0.001)) {
+            if (topScore < 1e-25 || (i > 5 && rollingConfidence < 0.001)) {
                 break; 
             }
             
@@ -2505,7 +2581,7 @@ export class SemanticRelationalMemory {
             let selectionLimit = creativity < 0.05 ? 1 : topK;
             let topKCandidates = candidates.slice(0, selectionLimit);
 
-            if (result.length < 2) {
+            if (generatedIds.length < 2) {
                 topKCandidates.forEach(c => {
                     if (['.', '!', '?'].includes(c.word)) {
                         c.score *= 0.0001;
@@ -2533,22 +2609,23 @@ export class SemanticRelationalMemory {
             }
 
             const word = selected.word;
+            const selectedId = selected.id;
             // Signal d'arrêt : si le mot sélectionné est le jeton de fin, on stoppe
             if (word === "<eos>") break;
 
             // AFFICHAGE LIVE :
             if (selected.isStructureHit) {
-                process.stdout.write(`\x1b[36m${word}\x1b[0m `); // Cyan pour structure reconnue
-            } else if (tossedId !== null && selected.id === tossedId) {
-                process.stdout.write(`\x1b[35m${word}\x1b[0m `); // Magenta pour le jet réussi
+                // process.stdout.write(`\x1b[36m${word}\x1b[0m `); // Cyan pour structure reconnue
+            } else if (tossedId !== null && selectedId === tossedId) {
+                // process.stdout.write(`\x1b[35m${word}\x1b[0m `); // Magenta pour le jet réussi
             } else {
-                process.stdout.write(`${word} `);
+                // process.stdout.write(`${word} `);
             }
 
-            result.push(word);
+            generatedIds.push(selectedId);
 
             // ARRÊT INTELLIGENT :
-            // On s'arrête dès qu'on a produit assez de phrases pour couvrir l'objectif.
+            // On s'arrête dès qu'on a produit assez de phrases pour couvrir l'objectif
             const isTerminal = ['.', '!', '?'].includes(word);
             if (isTerminal) {
                 sentencesGenerated++;
@@ -2556,28 +2633,41 @@ export class SemanticRelationalMemory {
             }
 
             lastId = selected.id;
-            wordCounts.set(word, (wordCounts.get(word) || 0) + 1);
+            const currentRepetitionCount = wordCounts.get(word) || 0;
+            wordCounts.set(word, currentRepetitionCount + 1);
 
             // Mise à jour de l'état du flux pour le mot suivant
             lastWord = word;
-            lastWasConnector = this.isStructural(selected.id);
+            lastWasConnector = this.isStructural(selectedId);
             lastWasPunctuation = ['.', ',', ';', '!', '?'].includes(word);
             
             // Propagation de l'attention : On ajoute le mot généré au contexte actif
-            activeIds.push(selected.id);
+            activeIds.push(selectedId);
             if (activeIds.length > 2) activeIds.shift(); // Maintient la fenêtre de 2 IDs pour le trigramme
 
-            this._shiftId(selected.id);
+            this._shiftId(selectedId);
 
             // Mise à jour du contexte pour l'itération suivante
             const nextPrevId = activeIds.length >= 2 ? activeIds[activeIds.length - 2] : 2;
             const nextCurrId = activeIds[activeIds.length - 1];
             const nextTrigramKey = (BigInt(nextPrevId) << 32n) | BigInt(nextCurrId);
             trigramContext = this.grammarMap.get(nextTrigramKey);
-            
+            subTrigramContext = subGrammar ? subGrammar.get(nextTrigramKey) : null;
+
             const nextBigramKey = activeIds[activeIds.length - 1];
             bigramContext = this.grammarMap.get(nextBigramKey);
         }
+
+        // --- APPRENTISSAGE PAR L'ERREUR ---
+        const { confidence, weakLinks } = this._critiquePrediction(generatedIds);
+        // Si la confiance est faible et qu'on a identifié des maillons faibles, on punit.
+        if (confidence < 0.3 && weakLinks.length > 0) {
+            // console.log(`\n\x1b[90m[AUTO-CORRECTION] Confiance faible (${(confidence*100).toFixed(1)}%). Punition des maillons faibles.\x1b[0m`);
+            this._punishSequence(weakLinks);
+        }
+
+        const result = generatedIds.map(id => this.reverseVocab.get(id) || '<unk>');
+
         // Nettoyage des espaces avant la ponctuation pour un rendu propre
         return result.join(' ').replace(/\s([,.;!])/g, '$1');
     }
@@ -5986,13 +6076,15 @@ export class GNeuroMoE {
             // s'il apparaît trop souvent dans le corpus global (> 0.5%).
             // On ignore ces mots pour le routage des experts.
 // On pénalise lourdement les mots-outils (0.05) pour qu'ils ne soient
-            // jamais "le concept de base" si un mot plus rare existe.
-            const weightFactor = (globalFreq > 0.005) ? 0.05 : 1.0;
+            // jamais "le concept de base" si un mot plus rare existe, SAUF si c'est le seul mot du prompt.
+            const isStructural = globalFreq > 0.005;
+            const weightFactor = (isStructural && tokens.length > 1) ? 0.05 : 1.0;
 
             // Heuristique de Force Conceptuelle (Spécificité) :
             // On cherche le mot qui a la plus forte "densité d'information" :
             // - localCount : il est important dans ce texte précis.
             // - 1 / (globalFreq + epsilon) : il est rare dans la langue globale.
+            if (weightFactor < 1.0) continue; // On ignore les mots structurels si le prompt est plus long
             // - length / 4 : les mots longs sont souvent des noms propres ou techniques.
             
             // CORRECTIF : Utilisation du Logarithme pour éviter qu'un mot rare 
@@ -6013,11 +6105,12 @@ export class GNeuroMoE {
         const top = candidates[0].token;
         const id = this.sharedState.vocabulary.get(top);
         const globalCount = id ? (this.sharedState.wordCounts.get(id) || 0) : 0;
-
-            // 1. FILTRE DE MATURITÉ (Bypassé si impact local fort)
-            // Si le concept est trop "jeune", on ne l'utilise que s'il est à haut impact (ex: titre).
-            const isHighImpact = highImpactSet.has(top);
-            if (!isHighImpact && globalCount < MATURITY_THRESHOLD) return "general";
+ 
+        // 1. FILTRE DE MATURITÉ (Assoupli)
+        // Si le concept est trop "jeune", on ne l'utilise que s'il est à haut impact (ex: titre)
+        // OU si son score de pertinence pour ce prompt est très élevé (il devient le concept clé).
+        const isHighImpact = highImpactSet.has(top) || candidates[0].score > 5.0;
+        if (!isHighImpact && globalCount < MATURITY_THRESHOLD) return "general";
 
         // 2. CONSOLIDATION EN VORTEX :
         // On hache le concept pour le placer dans un des experts disponibles.
@@ -6025,6 +6118,28 @@ export class GNeuroMoE {
         let hash = 0;
         for (let i = 0; i < top.length; i++) hash = ((hash << 5) - hash) + top.charCodeAt(i);
         return `vortex_${Math.abs(hash) % this.maxVortex}`;
+    }
+
+
+    /**
+     * Récupère ou charge l'expert grammatical "core", qui sert de base pour tous les autres.
+     */
+    getCoreExpert() {
+        const domain = "vortex_core";
+        if (this.experts.has(domain)) {
+            return this.experts.get(domain);
+        }
+
+        const brain = new SemanticRelationalMemory(this.contextSize, this.sharedState);
+        const path = `${this.storagePath}expert_${domain}.gnr`;
+
+        if (fs.existsSync(path)) {
+            console.log(`\x1b[2m[MoE] Chargement de l'expert grammatical de base (core).\x1b[0m`);
+            brain.importState(fs.readFileSync(path));
+        }
+        brain.hasBeenLoaded = true;
+        this.experts.set(domain, brain);
+        return brain;
     }
 }
 
