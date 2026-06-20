@@ -74,18 +74,9 @@ export async function runWikipediaTraining(moe) {
         brain.attachAttention(attention);
 
         console.log(`[2/3] Apprentissage (${domain}) de ${blocks.length} blocs de texte...`);
-        
+
         const start = Date.now();
-        // On ingère chaque bloc (titre ou paragraphe) individuellement
-        for (const block of blocks) {
-            const cleanBlock = block
-                .replace(/\[\d+\]/g, '')
-                .replace(/\(écoute\)/g, '')
-                .trim();
-            if (cleanBlock.length > 5) {
-                brain.learnText(cleanBlock, true, 5);
-            }
-        }
+        brain.learnText(fullCleanContent, true, 5);
         const duration = Date.now() - start;
         
         if (!fs.existsSync("./experts_chunks/")) fs.mkdirSync("./experts_chunks/");
