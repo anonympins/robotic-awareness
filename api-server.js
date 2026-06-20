@@ -88,45 +88,62 @@ app.use(express.json({ limit: '10mb' }));
  * Utilise learnText de neuro-lib pour le découpage en phrases et le filtrage du bruit sémantique.
  */
 app.post('/ingest', async (req, res) => {
-    const { text, weight = 1, highImpactTokens = [] } = req.body;
+    // Ajout d'un poids secondaire pour l'apprentissage contextuel
+    const { text, weight = 1.0, secondary_weight = 0.1 } = req.body;
 
     if (!text || typeof text !== 'string' || text.trim().length < 5) {
         return res.status(400).json({ error: "Contenu textuel invalide ou trop court (min 5 chars)." });
     }
 
     try {
-        // --- NOUVELLE LOGIQUE : Multi-Ingestion par phrase ---
+        // --- LOGIQUE D'INGESTION : Apprentissage pondéré pour la spécialisation ---
         const sentences = text.split(/(?<=[.!?])(?:\s+|\n+|$)/).filter(s => s.trim().length > 3);
         if (sentences.length === 0) {
             return res.status(400).json({ error: "Aucune phrase valide à ingérer." });
         }
 
         const ingestionReport = {};
-        const modifiedExperts = new Set();
+        const initialVocabSizes = {};
+
+        // Initialiser le rapport pour tous les experts chargés
+        for (const [domain, expert] of moe.experts.entries()) {
+            if (expert.hasBeenLoaded) {
+                initialVocabSizes[domain] = expert.vocabulary.size;
+                ingestionReport[domain] = { sentences: 0, new_tokens: 0 };
+            }
+        }
 
         for (const sentence of sentences) {
-            // On route chaque phrase individuellement
-            const { brain, domain } = await getExpertForContent(sentence);
-            
-            if (!ingestionReport[domain]) {
-                ingestionReport[domain] = { sentences: 0, new_tokens: 0, initial_vocab: brain.vocabulary.size };
+            // 1. Identifier l'expert principal pour cette phrase
+            const { domain: mainDomain } = await getExpertForContent(sentence);
+
+            // 2. Tous les experts apprennent la phrase, mais avec des poids différents
+            for (const [domain, expert] of moe.experts.entries()) {
+                if (!expert.hasBeenLoaded) continue;
+
+                // --- CORRECTIF : S'assurer que le rapport est initialisé pour les nouveaux experts ---
+                if (!ingestionReport[domain]) {
+                    initialVocabSizes[domain] = expert.vocabulary.size;
+                    ingestionReport[domain] = { sentences: 0, new_tokens: 0 };
+                }
+
+                // Déterminer le poids d'apprentissage
+                const learningWeight = (domain === mainDomain) ? weight : secondary_weight;
+
+                expert.learnSense(sentence, true, learningWeight);
+                ingestionReport[domain].sentences++;
             }
-
-            // On utilise learnSense pour un apprentissage direct de la phrase
-            brain.learnSense(sentence, true, weight);
-
-            ingestionReport[domain].sentences++;
-            modifiedExperts.add(domain);
         }
 
         // Persistance de tous les experts modifiés
-        for (const domain of modifiedExperts) {
-            const expert = moe.getExpert(domain);
+        for (const [domain, expert] of moe.experts.entries()) {
+            if (!expert.hasBeenLoaded) continue;
+
             const expertPath = path.join(EXPERTS_DIR, `expert_${domain}.gnr`);
             fs.writeFileSync(expertPath, expert.exportBinary());
             
             const report = ingestionReport[domain];
-            report.new_tokens = expert.vocabulary.size - report.initial_vocab;
+            report.new_tokens = expert.vocabulary.size - initialVocabSizes[domain];
             console.log(`\x1b[32m[API]\x1b[0m Ingestion [${domain}] : ${report.sentences} phrases, +${report.new_tokens} tokens.`);
         }
 
