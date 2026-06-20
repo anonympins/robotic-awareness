@@ -96,61 +96,33 @@ app.post('/ingest', async (req, res) => {
     }
 
     try {
-        // --- LOGIQUE D'INGESTION : Apprentissage pondéré pour la spécialisation ---
-        const sentences = text.split(/(?<=[.!?])(?:\s+|\n+|$)/).filter(s => s.trim().length > 3);
+        // --- NOUVELLE LOGIQUE : Utilisation de la méthode d'apprentissage centralisée ---
+        const { report, modifiedExperts, sentences, initialVocabSizes } = moe.learnWithSpecialization(text, {
+            weight,
+            secondary_weight
+        });
+
         if (sentences.length === 0) {
             return res.status(400).json({ error: "Aucune phrase valide à ingérer." });
         }
 
-        const ingestionReport = {};
-        const initialVocabSizes = {};
-
-        // Initialiser le rapport pour tous les experts chargés
-        for (const [domain, expert] of moe.experts.entries()) {
-            if (expert.hasBeenLoaded) {
-                initialVocabSizes[domain] = expert.vocabulary.size;
-                ingestionReport[domain] = { sentences: 0, new_tokens: 0 };
-            }
-        }
-
-        for (const sentence of sentences) {
-            // 1. Identifier l'expert principal pour cette phrase
-            const { domain: mainDomain } = await getExpertForContent(sentence);
-
-            // 2. Tous les experts apprennent la phrase, mais avec des poids différents
-            for (const [domain, expert] of moe.experts.entries()) {
-                if (!expert.hasBeenLoaded) continue;
-
-                // --- CORRECTIF : S'assurer que le rapport est initialisé pour les nouveaux experts ---
-                if (!ingestionReport[domain]) {
-                    initialVocabSizes[domain] = expert.vocabulary.size;
-                    ingestionReport[domain] = { sentences: 0, new_tokens: 0 };
-                }
-
-                // Déterminer le poids d'apprentissage
-                const learningWeight = (domain === mainDomain) ? weight : secondary_weight;
-
-                expert.learnSense(sentence, true, learningWeight);
-                ingestionReport[domain].sentences++;
-            }
-        }
-
         // Persistance de tous les experts modifiés
-        for (const [domain, expert] of moe.experts.entries()) {
-            if (!expert.hasBeenLoaded) continue;
+        for (const domain of modifiedExperts) {
+            const expert = moe.getExpert(domain);
+            if (!expert) continue;
 
             const expertPath = path.join(EXPERTS_DIR, `expert_${domain}.gnr`);
             fs.writeFileSync(expertPath, expert.exportBinary());
             
-            const report = ingestionReport[domain];
-            report.new_tokens = expert.vocabulary.size - initialVocabSizes[domain];
-            console.log(`\x1b[32m[API]\x1b[0m Ingestion [${domain}] : ${report.sentences} phrases, +${report.new_tokens} tokens.`);
+            const expertReport = report[domain];
+            expertReport.new_tokens = expert.vocabulary.size - initialVocabSizes[domain];
+            console.log(`\x1b[32m[API]\x1b[0m Ingestion [${domain}] : ${expertReport.sentences} phrases, +${expertReport.new_tokens} tokens.`);
         }
 
         res.json({
             success: true,
             ingested_sentences: sentences.length,
-            report: ingestionReport,
+            report: report,
             total_vocabulary: moe.sharedState.vocabulary.size
         });
     } catch (err) {

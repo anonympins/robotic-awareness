@@ -6361,6 +6361,62 @@ export class GNeuroMoE {
     }
 
     /**
+     * Méthode d'apprentissage centralisée pour le Mixture of Experts.
+     * Chaque phrase est apprise par tous les experts, mais avec un poids différent
+     * pour favoriser la spécialisation.
+     * @param {string} text Le texte à apprendre.
+     * @param {object} options Options d'apprentissage.
+     * @param {number} [options.weight=1.0] Poids pour l'expert principal.
+     * @param {number} [options.secondary_weight=0.1] Poids pour les experts secondaires.
+     * @returns {{report: object, modifiedExperts: Set<string>, sentences: Array<string>}} Un rapport d'ingestion.
+     */
+    learnWithSpecialization(text, options = {}) {
+        const { weight = 1.0, secondary_weight = 0.1 } = options;
+
+        const sentences = text.split(/(?<=[.!?])(?:\s+|\n+|$)/).filter(s => s.trim().length > 3);
+        if (sentences.length === 0) {
+            return { report: {}, modifiedExperts: new Set(), sentences: [] };
+        }
+
+        const ingestionReport = {};
+        const modifiedExperts = new Set();
+        const initialVocabSizes = {};
+
+        // Initialiser le rapport pour les experts déjà chargés
+        for (const [domain, expert] of this.experts.entries()) {
+            if (expert.hasBeenLoaded) {
+                initialVocabSizes[domain] = expert.vocabulary.size;
+                ingestionReport[domain] = { sentences: 0, new_tokens: 0 };
+            }
+        }
+
+        for (const sentence of sentences) {
+            // 1. Identifier l'expert principal pour cette phrase
+            const mainDomain = this.route(sentence);
+            const mainExpert = this.getExpert(mainDomain); // Assure sa création si nouveau
+
+            // 2. Tous les experts apprennent la phrase, mais avec des poids différents
+            for (const [domain, expert] of this.experts.entries()) {
+                // On ne fait apprendre qu'aux experts déjà chargés ou celui qui vient d'être créé
+                if (!expert.hasBeenLoaded && domain !== mainDomain) continue;
+
+                // Initialise le rapport pour un expert nouvellement créé
+                if (!ingestionReport[domain]) {
+                    initialVocabSizes[domain] = expert.vocabulary.size;
+                    ingestionReport[domain] = { sentences: 0, new_tokens: 0 };
+                }
+
+                const learningWeight = (domain === mainDomain) ? weight : secondary_weight;
+                expert.learnSense(sentence, true, learningWeight);
+                ingestionReport[domain].sentences++;
+                modifiedExperts.add(domain);
+            }
+        }
+
+        return { report: ingestionReport, modifiedExperts, sentences, initialVocabSizes };
+    }
+
+    /**
      * Route le texte vers un expert.
      * @param {string} text Le texte à analyser
      * @param {string[]} highImpactTokens Liste de mots (ex: du titre) qui bypassent la maturité

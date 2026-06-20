@@ -62,27 +62,18 @@ async function main() {
         const progressPercentage = ((startPos + bytesRead) / stats.size * 100).toFixed(2);
         console.log(`\n\x1b[32m[LOCAL]\x1b[0m Entraînement sur un segment du corpus (Progression: ${progressPercentage}%)`);
 
-        // Logique de routage et d'apprentissage (similaire aux scripts de scraping)
-        const highImpact = title.toLowerCase().match(/[a-z0-9àâäéèêëïîôöùûüç]{4,}/g) || [];
-        const domain = moe.route(title + " " + content.slice(0, 500), highImpact);
-        console.log(`[MoE] Domaine détecté : \x1b[33m${domain.toUpperCase()}\x1b[0m`);
-
         // --- CORRECTIF : Vérifier que le contenu n'est pas vide après le découpage ---
         if (content.trim().length < 10) {
             console.log(`\x1b[33m[LOCAL] Segment de contenu trop court ou vide après nettoyage. Saut.\x1b[0m`);
             return;
         }
 
-        const brain = moe.getExpert(domain);
-
-        // Le pré-chargement des experts est déjà fait au démarrage du script,
-        // donc plus besoin de vérifier et charger le chunk ici.
-
         const start = Date.now();
-        brain.learnText(content, true, weight);
+        // --- NOUVELLE LOGIQUE : Utilisation de la méthode d'apprentissage centralisée ---
+        // On utilise un poids secondaire plus faible pour l'entraînement de fond.
+        moe.learnWithSpecialization(content, { weight: weight, secondary_weight: 0.05 });
         const duration = Date.now() - start;
-
-        console.log(`Apprentissage local terminé en ${duration}ms.`);
+        console.log(`\x1b[2mApprentissage local terminé en ${duration}ms.\x1b[0m`);
     }
 
     // --- Fin des nouvelles fonctions ---
