@@ -89,11 +89,7 @@ async function main() {
     // --- Fin des nouvelles fonctions ---
 
     // Importation dynamique seulement si nécessaire (pour ne pas charger les scrapers en mode --local)
-    let runWikipediaTraining, runRobertTraining;
-    if (!useLocalCorpus) {
-        ({ runWikipediaTraining } = await import('./train-wikipedia.js'));
-        // ({ runRobertTraining } = await import('./train-le-robert.js')); // Désactivé
-    }
+    let runWikipediaTraining;
 
     console.log("\x1b[35m%s\x1b[0m", "=== G-NEURO CONTINUOUS TRAINER : LOCAL DIAGNOSTIC ===");
     
@@ -180,12 +176,18 @@ async function main() {
                 if (isLocalTrainingDone) {
                     console.log("\x1b[32m[MODE]\x1b[0m Entraînement local terminé. Basculement vers le crawling en ligne.");
                     useLocalCorpus = false;
+                    // --- CORRECTIF : On importe le scraper Wikipedia SEULEMENT maintenant ---
+                    if (!runWikipediaTraining) {
+                        console.log("[INFO] Chargement du module de crawling Wikipedia...");
+                        ({ runWikipediaTraining } = await import('./train-wikipedia.js'));
+                    }
                 }
             } else {
-                // Comportement normal : scraping en ligne
-                // if (cycleCount % 2 === 0) await runRobertTraining(moe);
-                // else await runWikipediaTraining(moe);
-                // On entraîne uniquement sur Wikipedia en ligne pour le moment
+                // Si on démarre directement en mode crawling, on s'assure que le module est chargé
+                if (!runWikipediaTraining) {
+                    ({ runWikipediaTraining } = await import('./train-wikipedia.js'));
+                }
+                // Entraînement sur Wikipedia
                 await runWikipediaTraining(moe);
             }
 
