@@ -12,7 +12,7 @@ let localCorpusCursor = 0;
 async function main() {
     // --- NOUVEAU : Gestion de l'option --local ---
     const args = process.argv.slice(2);
-    const useLocalCorpus = args.includes('--local');
+    let useLocalCorpus = args.includes('--local');
 
     /**
      * Fonction d'entraînement sur un corpus local (fichiers .txt)
@@ -24,17 +24,17 @@ async function main() {
         const CORPUS_PATH = './training_corpus.txt';
         if (!fs.existsSync(CORPUS_PATH)) {
             console.log(`\x1b[33m[LOCAL] Fichier corpus '${CORPUS_PATH}' non trouvé. Saut.\x1b[0m`);
-            return;
+            return true; // On considère l'entraînement local "terminé" si le fichier n'existe pas.
         }
 
         // Lecture asynchrone pour ne pas bloquer sur de gros fichiers
         const stats = await fs.promises.stat(CORPUS_PATH);
         let chunkSize = 1024 * 256; // 256 KB par cycle
 
-        // Si le curseur est à la fin ou au-delà, on le réinitialise pour le cycle actuel.
+        // Si le curseur est à la fin, on signale la fin de l'entraînement local.
         if (localCorpusCursor >= stats.size) {
-            console.log(`\x1b[32m[LOCAL]\x1b[0m Fin du corpus atteinte. Reprise au début.`);
-            localCorpusCursor = 0;
+            console.log(`\x1b[32m[LOCAL]\x1b[0m Fin du corpus local atteinte.`);
+            return true; // Signal pour basculer en mode crawling.
         }
 
         const startPos = localCorpusCursor;
@@ -68,7 +68,7 @@ async function main() {
         // --- CORRECTIF : Vérifier que le contenu n'est pas vide après le découpage ---
         if (content.trim().length < 10) {
             console.log(`\x1b[33m[LOCAL] Segment de contenu trop court ou vide après nettoyage. Saut.\x1b[0m`);
-            return;
+            return false; // On continue le parcours du fichier.
         }
 
         const start = Date.now();
@@ -82,6 +82,8 @@ async function main() {
         }
 
         console.log(`\x1b[2mApprentissage local terminé en ${duration}ms.\x1b[0m`);
+
+        return false; // L'entraînement local n'est pas terminé.
     }
 
     // --- Fin des nouvelles fonctions ---
@@ -174,7 +176,11 @@ async function main() {
         try {
             if (useLocalCorpus) {
                 console.log("\x1b[36m[MODE] Entraînement sur le corpus local.\x1b[0m");
-                await runLocalTraining(moe, 5);
+                const isLocalTrainingDone = await runLocalTraining(moe, 5);
+                if (isLocalTrainingDone) {
+                    console.log("\x1b[32m[MODE]\x1b[0m Entraînement local terminé. Basculement vers le crawling en ligne.");
+                    useLocalCorpus = false;
+                }
             } else {
                 // Comportement normal : scraping en ligne
                 // if (cycleCount % 2 === 0) await runRobertTraining(moe);
