@@ -1727,10 +1727,10 @@ export class SemanticRelationalMemory {
             buffers.push(vocabHead);
             for (let [word, id] of this.vocabulary) {
                 const sBuf = Buffer.from(word, 'utf8');
-                const b = Buffer.alloc(2 + sBuf.length + 4);
-                b.writeUInt16LE(sBuf.length, 0);
-                sBuf.copy(b, 2);
-                b.writeUInt32LE(id, 2 + sBuf.length);
+                const b = Buffer.alloc(4 + sBuf.length + 4); // 2 -> 4 for word length
+                b.writeUInt32LE(sBuf.length, 0); // UInt16LE -> UInt32LE
+                sBuf.copy(b, 4);
+                b.writeUInt32LE(id, 4 + sBuf.length);
                 buffers.push(b);
             }
         } else {
@@ -1872,10 +1872,10 @@ export class SemanticRelationalMemory {
         const vocabSize = raw.readUInt32LE(offset); offset += 4;
         // On ne vide plus : on met à jour le vocabulaire partagé
         for (let i = 0; i < vocabSize; i++) {
-            if (!safeRead(2)) break;
-            const sLen = raw.readUInt16LE(offset); offset += 2;
+            if (!safeRead(4)) break;
+            const sLen = raw.readUInt32LE(offset); offset += 4; // UInt16LE -> UInt32LE
             if (!safeRead(sLen + 4)) break;
-            const word = raw.toString('utf8', offset, offset + sLen); offset += sLen;
+            const word = raw.toString('utf8', offset, offset + sLen); offset += sLen; // No change here
             const id = raw.readUInt32LE(offset); offset += 4;
             this.vocabulary.set(word, id);
             this.reverseVocab.set(id, word);
