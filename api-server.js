@@ -24,15 +24,17 @@ coreBrain.attachAttention(attention);
 
 /**
  * Récupère un expert et charge son état binaire si nécessaire
+ * La fonction est maintenant asynchrone pour ne pas bloquer le serveur.
  */
-function getExpertForContent(text) {
+async function getExpertForContent(text) {
     const domain = moe.route(text);
     const brain = moe.getExpert(domain);
     const path = `${EXPERTS_DIR}expert_${domain}.gnr`;
 
     if (!brain.hasBeenLoaded && fs.existsSync(path)) {
         console.log(`\x1b[2m[MoE] Chargement binaire de l'expert : ${domain}\x1b[0m`);
-        brain.importState(fs.readFileSync(path));
+        const data = await fs.promises.readFile(path);
+        brain.importState(data);
         brain.hasBeenLoaded = true;
     }
 
@@ -69,7 +71,7 @@ app.post('/ingest', async (req, res) => {
     }
 
     try {
-        const { brain, domain, path } = getExpertForContent(text);
+        const { brain, domain, path } = await getExpertForContent(text);
         brain.attachAttention(attention);
         
         const initialSize = brain.vocabulary.size;
@@ -110,7 +112,7 @@ app.post('/query', async (req, res) => {
     }
 
     try {
-        const { brain, domain } = getExpertForContent(prompt);
+        const { brain, domain } = await getExpertForContent(prompt);
         brain.attachAttention(attention);
 
         console.log(`\x1b[36m[API QUERY]\x1b[0m Expert: ${domain.toUpperCase()}`);
