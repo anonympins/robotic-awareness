@@ -6,6 +6,9 @@ import path from 'node:path';
 
 const EXPERTS_DIR = './experts_chunks/';
 
+// --- NOUVEAU : Curseur pour la lecture séquentielle du corpus local ---
+let localCorpusCursor = 0;
+
 async function main() {
     // --- NOUVEAU : Gestion de l'option --local ---
     const args = process.argv.slice(2);
@@ -13,31 +16,51 @@ async function main() {
 
     /**
      * Fonction d'entraînement sur un corpus local (fichiers .txt)
+     * MODIFIÉ : Lit un segment aléatoire du corpus unifié `training_corpus.txt`.
      * @param {GNeuroMoE} moe L'instance du Mixture of Experts
-     * @param {string} corpusType 'wikipedia' ou 'le_robert'
      * @param {number} weight Poids de l'apprentissage
      */
-    async function runLocalTraining(moe, corpusType, weight) {
-        const corpusDir = `./training_corpus/${corpusType}/`;
-        if (!fs.existsSync(corpusDir)) {
-            console.log(`\x1b[33m[LOCAL] Répertoire corpus '${corpusDir}' non trouvé. Saut.\x1b[0m`);
-            return;
-        }
-        const files = fs.readdirSync(corpusDir);
-        if (files.length === 0) {
-            console.log(`\x1b[33m[LOCAL] Corpus '${corpusType}' est vide. Saut.\x1b[0m`);
+    async function runLocalTraining(moe, weight) {
+        const CORPUS_PATH = './training_corpus.txt';
+        if (!fs.existsSync(CORPUS_PATH)) {
+            console.log(`\x1b[33m[LOCAL] Fichier corpus '${CORPUS_PATH}' non trouvé. Saut.\x1b[0m`);
             return;
         }
 
-        // Sélection d'un fichier aléatoire dans le corpus
-        const file = files[Math.floor(Math.random() * files.length)];
-        const filePath = path.join(corpusDir, file);
-        const content = fs.readFileSync(filePath, 'utf-8');
+        // Lecture d'un segment aléatoire pour ne pas surcharger la RAM
+        const stats = fs.statSync(CORPUS_PATH);
+        const chunkSize = 1024 * 256; // 256 KB par cycle
+        if (stats.size < chunkSize) {
+            // Si le corpus est plus petit que la taille du segment, on le lit en entier.
+            console.log(`\x1b[33m[LOCAL] Corpus plus petit que la taille du segment, lecture complète.\x1b[0m`);
+            localCorpusCursor = 0; // On s'assure de toujours le relire
+        } else if (localCorpusCursor + chunkSize > stats.size) {
+            console.log(`\x1b[32m[LOCAL]\x1b[0m Fin du corpus atteinte. Reprise au début pour le prochain cycle.`);
+            localCorpusCursor = 0;
+        }
+
+        const startPos = localCorpusCursor;
+        const buffer = Buffer.alloc(chunkSize);
+        const fd = fs.openSync(CORPUS_PATH, 'r');
+        const bytesRead = fs.readSync(fd, buffer, 0, chunkSize, startPos);
+        fs.closeSync(fd);
+
+        // Mise à jour du curseur pour le prochain cycle
+        localCorpusCursor += bytesRead;
+
+        // On cherche le début et la fin de phrases complètes dans le segment pour un apprentissage propre
+        let content = buffer.toString('utf-8');
+        const firstSentenceEnd = content.search(/(?<=[.!?])\s/);
+        const lastSentenceStart = content.lastIndexOf('.', content.length - 2);
+
+        if (firstSentenceEnd !== -1 && lastSentenceStart > firstSentenceEnd) {
+            content = content.substring(firstSentenceEnd + 1, lastSentenceStart + 1);
+        }
         
-        // Le nom du fichier (sans extension) sert de pseudo-titre pour le routage
-        const title = path.basename(file, '.txt').replace(/_/g, ' ');
+        const title = "Corpus Local"; // Titre générique pour le routage
 
-        console.log(`\n\x1b[32m[LOCAL]\x1b[0m Entraînement sur '${file}'...`);
+        const progressPercentage = ((startPos + bytesRead) / stats.size * 100).toFixed(2);
+        console.log(`\n\x1b[32m[LOCAL]\x1b[0m Entraînement sur un segment du corpus (Progression: ${progressPercentage}%)`);
 
         // Logique de routage et d'apprentissage (similaire aux scripts de scraping)
         const highImpact = title.toLowerCase().match(/[a-z0-9àâäéèêëïîôöùûüç]{4,}/g) || [];
@@ -45,13 +68,9 @@ async function main() {
         console.log(`[MoE] Domaine détecté : \x1b[33m${domain.toUpperCase()}\x1b[0m`);
 
         const brain = moe.getExpert(domain);
-        const STORAGE_PATH = `./experts_chunks/expert_${domain}.gnr`;
 
-        if (!brain.hasBeenLoaded && fs.existsSync(STORAGE_PATH)) {
-            console.log(`[MoE] Chargement du chunk : ${domain}`);
-            brain.importState(fs.readFileSync(STORAGE_PATH));
-            brain.hasBeenLoaded = true;
-        }
+        // Le pré-chargement des experts est déjà fait au démarrage du script,
+        // donc plus besoin de vérifier et charger le chunk ici.
 
         const start = Date.now();
         brain.learnText(content, true, weight);
@@ -150,14 +169,7 @@ async function main() {
         try {
             if (useLocalCorpus) {
                 console.log("\x1b[36m[MODE] Entraînement sur le corpus local.\x1b[0m");
-                // En mode local, on alterne aussi entre les deux sources
-                // if (cycleCount % 2 === 0) {
-                //     await runLocalTraining(moe, 'le_robert', 8);
-                // } else {
-                //     await runLocalTraining(moe, 'wikipedia', 5);
-                // }
-                // On entraîne uniquement sur Wikipedia en local pour le moment
-                await runLocalTraining(moe, 'wikipedia', 5);
+                await runLocalTraining(moe, 5);
             } else {
                 // Comportement normal : scraping en ligne
                 // if (cycleCount % 2 === 0) await runRobertTraining(moe);
