@@ -66,7 +66,7 @@ async function main() {
     let runWikipediaTraining, runRobertTraining;
     if (!useLocalCorpus) {
         ({ runWikipediaTraining } = await import('./train-wikipedia.js'));
-        ({ runRobertTraining } = await import('./train-le-robert.js'));
+        // ({ runRobertTraining } = await import('./train-le-robert.js')); // Désactivé
     }
 
     console.log("\x1b[35m%s\x1b[0m", "=== G-NEURO CONTINUOUS TRAINER : LOCAL DIAGNOSTIC ===");
@@ -126,15 +126,19 @@ async function main() {
             if (useLocalCorpus) {
                 console.log("\x1b[36m[MODE] Entraînement sur le corpus local.\x1b[0m");
                 // En mode local, on alterne aussi entre les deux sources
-                if (cycleCount % 2 === 0) {
-                    await runLocalTraining(moe, 'le_robert', 8);
-                } else {
-                    await runLocalTraining(moe, 'wikipedia', 5);
-                }
+                // if (cycleCount % 2 === 0) {
+                //     await runLocalTraining(moe, 'le_robert', 8);
+                // } else {
+                //     await runLocalTraining(moe, 'wikipedia', 5);
+                // }
+                // On entraîne uniquement sur Wikipedia en local pour le moment
+                await runLocalTraining(moe, 'wikipedia', 5);
             } else {
                 // Comportement normal : scraping en ligne
-                if (cycleCount % 2 === 0) await runRobertTraining(moe);
-                else await runWikipediaTraining(moe);
+                // if (cycleCount % 2 === 0) await runRobertTraining(moe);
+                // else await runWikipediaTraining(moe);
+                // On entraîne uniquement sur Wikipedia en ligne pour le moment
+                await runWikipediaTraining(moe);
             }
 
             // Sauvegarde de l'état des experts pour query-brain.js

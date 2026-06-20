@@ -8,30 +8,33 @@ const TRAINING_CORPUS_PATH = 'training_corpus.txt';
 export async function runWikipediaTraining(moe) {
     try {
         console.log("\n[1/3] Récupération d'une page aléatoire...");
-        const { title, content: htmlContent } = await scrapeRandomWikipediaContent();
+        const { title, blocks } = await scrapeRandomWikipediaContent();
 
-        // Nettoyage des blocs de code et des balises HTML
-        const content = htmlContent
-            .replace(/<script\b[^>]*>([\s\S]*?)<\/script>/gim, "") // Supprime le JS complet
-            .replace(/<style\b[^>]*>([\s\S]*?)<\/style>/gim, "")   // Supprime le CSS complet
-            .replace(/<[^>]*>?/gm, '');                           // Supprime les balises restantes
-        
-        let cleanContent = content
-            .replace(/==.*?==/g, '') // Enlever les titres de section
-            .replace(/\[\d+\]/g, '') // Enlever les références type [1], [2]
-            .replace(/\(écoute\)/g, '') // Enlever les tags audio
-            // CORRECTIF : Filtrage agressif du boilerplate Wikipedia qui pollue la grammaire
-            .replace(/Modifier le code|Creative Commons|licence CC-BY-SA|Consulter l'historique|Navigation|Rechercher|Portail de/gi, '')
-            .replace(/\[modifier\]|\[modifier le code\]/gi, '')
-            .replace(/\s+/g, ' ')    // Normaliser les espaces et sauts de ligne
-            .trim();
+        if (!blocks || blocks.length === 0) {
+            console.log("⚠️ Page vide ou sans blocs de contenu pertinents. Cycle sauté.");
+            return;
+        }
+
+        // Le nettoyage se fait maintenant bloc par bloc, mais on peut créer un contenu global pour l'analyse et le corpus
+        const fullCleanContent = blocks.map(block => {
+            return block
+                .replace(/\[\d+\]/g, '') // Enlever les références type [1], [2]
+                .replace(/\(écoute\)/g, '') // Enlever les tags audio
+                .replace(/Modifier le code|Creative Commons|licence CC-BY-SA|Consulter l'historique|Navigation|Rechercher|Portail de/gi, '')
+                .replace(/\[modifier\]|\[modifier le code\]/gi, '');
+        }).join(' ').replace(/\s+/g, ' ').trim();
+
+        if (fullCleanContent.length < 100) {
+            console.log("⚠️ Contenu trop court après nettoyage global. Cycle sauté.");
+            return;
+        }
 
         // --- Sauvegarde du contenu pour le corpus unifié ---
         try {
             const stats = await stat(TRAINING_CORPUS_PATH).catch(() => ({ size: 0 }));
             const ONE_GIGABYTE = 1024 * 1024 * 1024;
             if (stats.size < ONE_GIGABYTE) {
-                const corpusEntry = `${title}\n${cleanContent}\n\n`;
+                const corpusEntry = `${title}\n${fullCleanContent}\n\n`;
                 await appendFile(TRAINING_CORPUS_PATH, corpusEntry, 'utf-8');
                 console.log(`\x1b[2m[CORPUS] Contenu de "${title}" ajouté au corpus principal.\x1b[0m`);
             } else {
@@ -43,7 +46,7 @@ export async function runWikipediaTraining(moe) {
 
         // --- ANALYSE D'IMPACT LOCAL POUR LE ROUTAGE ---
         // On identifie les mots clés de la page avant le routage
-        const localTokens = cleanContent.toLowerCase().match(/[a-z0-9àâäéèêëïîôöùûüç]{4,}/g) || [];
+        const localTokens = fullCleanContent.toLowerCase().match(/[a-z0-9àâäéèêëïîôöùûüç]{4,}/g) || [];
         const localFreq = new Map();
         localTokens.forEach(t => localFreq.set(t, (localFreq.get(t) || 0) + 1));
 
@@ -54,7 +57,7 @@ export async function runWikipediaTraining(moe) {
         );
 
         // --- ROUTAGE MOE ---
-        const domain = moe.route(title + " " + cleanContent.slice(0, 500), highImpact);
+        const domain = moe.route(title + " " + fullCleanContent.slice(0, 500), highImpact);
         console.log(`[MoE] Domaine détecté : \x1b[33m${domain.toUpperCase()}\x1b[0m (Titre: ${title})`);
         
         const brain = moe.getExpert(domain);
@@ -70,11 +73,19 @@ export async function runWikipediaTraining(moe) {
         const attention = new SemanticAttentionLayer();
         brain.attachAttention(attention);
 
-        console.log(`[2/3] Apprentissage (${domain}) de ${cleanContent.length} caractères...`);
+        console.log(`[2/3] Apprentissage (${domain}) de ${blocks.length} blocs de texte...`);
         
         const start = Date.now();
-        // On augmente le poids à 5 pour que les transitions soient marquées dès le premier passage
-        brain.learnText(cleanContent, true, 5); 
+        // On ingère chaque bloc (titre ou paragraphe) individuellement
+        for (const block of blocks) {
+            const cleanBlock = block
+                .replace(/\[\d+\]/g, '')
+                .replace(/\(écoute\)/g, '')
+                .trim();
+            if (cleanBlock.length > 5) {
+                brain.learnText(cleanBlock, true, 5);
+            }
+        }
         const duration = Date.now() - start;
         
         if (!fs.existsSync("./experts_chunks/")) fs.mkdirSync("./experts_chunks/");
@@ -82,33 +93,6 @@ export async function runWikipediaTraining(moe) {
 
         console.log(`Apprentissage terminé en ${duration}ms.`);
         console.log(`Vocabulaire acquis : ${brain.vocabulary.size} mots.`);
-
-        /*
-        console.log("\n[3/3] Test de prévision déterministe...");
-        
-        // Utilisation du tokenizer interne pour garantir la correspondance des IDs
-        const allTokens = cleanContent.match(brain.tokenizer) || [];
-        
-        // On prend les 4 premiers tokens significatifs comme amorce
-        const amorceTokens = allTokens.slice(0, 4);
-        const amorce = amorceTokens.join(' ');
-        
-        console.log(`Amorce : "${amorce}"`);
-
-        // Prédiction avec une tolérance de score légèrement plus souple
-        const prediction = brain.predictSense(amorce, 30, {
-            creativity: 0.01,
-            topK: 3,
-            attention: attention
-        });
-
-        console.log(`${amorce} ${prediction}`);
-
-        if (cleanContent.includes(prediction)) {
-            console.log("\nStatut : ✅ Restitution fidèle au bit près.");
-        } else {
-            console.log("\nStatut : ⚠️ Le modèle a divergé (créativité ou collision d'IDs).");
-        }*/
 
     } catch (err) {
         console.error("❌ Échec de l'entraînement :", err);

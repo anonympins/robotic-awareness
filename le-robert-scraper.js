@@ -109,19 +109,3 @@ export async function getRandomRobertPage() {
     }
     return rootPage;
 }
-
-/**
- * Récupère le contenu d'une page du Robert.
- * @param {string} path Le chemin de la page à scraper.
- * @param {boolean} force Si true, ignore la vérification des pages déjà scrapées (utile pour récupérer les liens).
- * @returns {Promise<{title: string, content: string, links: string[]}|null>}
- */
-export async function scrapeRobertContent(path = '/guide', force = false) {
-    if (!force) {
-        const scrapedPages = await getScrapedPages();
-        if (scrapedPages.has(path)) {
-            console.log(`Page ${path} already scraped. Skipping.`);
-            return null;
-        }
-    }
-    // ... le reste de la fonction scrapeRobertContent reste identique

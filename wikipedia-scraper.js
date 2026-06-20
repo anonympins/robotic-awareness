@@ -10,14 +10,23 @@ export async function scrapeRandomWikipediaContent() {
 
     console.log(`[Scraper] Connexion à : ${startUrl}`);
 
-    const stripHtmlToText = (html) => {
-        return html
-            .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, '')   // Supprime le CSS
-            .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, '') // Supprime le JS
-            .replace(/<noscript[^>]*>[\s\S]*?<\/noscript>/gi, '')
-            .replace(/<[^>]+>/g, ' ')                        // Remplace TOUS les tags par des espaces (évite de coller les mots)
-            .replace(/&[a-z0-9#]+;/gi, ' ')                  // Supprime les entités HTML (&nbsp;, etc)
-            .replace(/\s+/g, ' ');                           // Normalise les espaces
+    /**
+     * Extrait les blocs de texte (titres et paragraphes) d'un fragment HTML.
+     * @param {string} html - Le fragment HTML à analyser.
+     * @returns {string[]} - Un tableau de chaînes de texte propres.
+     */
+    const extractTextBlocks = (html) => {
+        const blocks = [];
+        const blockRegex = /<(h[2-6]|p)[^>]*>([\s\S]*?)<\/\1>/gi;
+        let match;
+        while ((match = blockRegex.exec(html)) !== null) {
+            const textContent = match[2]
+                .replace(/<[^>]+>/g, ' ')      // Nettoie les balises internes (ex: <a>, <span>)
+                .replace(/&[a-z0-9#]+;/gi, ' ') // Nettoie les entités HTML
+                .replace(/\s+/g, ' ').trim();  // Normalise les espaces
+            if (textContent.length > 2) blocks.push(textContent);
+        }
+        return blocks;
     };
 
     const extractTitle = (html) => {
@@ -81,13 +90,13 @@ export async function scrapeRandomWikipediaContent() {
         if (endMarker !== -1) fragment = fragment.substring(0, endMarker);
 
         // Extraction du texte brut
-        const content = stripHtmlToText(fragment);
+        const blocks = extractTextBlocks(fragment);
 
         console.log("=== Extraction Réussie ===");
         console.log(`Titre : ${title}`);
-        console.log(`Taille récupérée : ${content.length} caractères.`);
+        console.log(`Nombre de blocs récupérés : ${blocks.length}`);
         
-        return { title, content };
+        return { title, blocks };
     } catch (error) {
         console.error(`[Erreur Scraper] : ${error.message}`);
         throw error;
