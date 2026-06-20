@@ -1662,6 +1662,10 @@ export class SemanticRelationalMemory {
         this.grammarMap = new Map(); // ID -> Map(SuivantID -> Poids)
         // Regex centralisée supportant les accents et l'élision
         this.tokenizer = /[a-z0-9àâäéèêëïîôöùûüç]+(?:['][a-z0-9àâäéèêëïîôöùûüç]*)?|[^\w\s]/gi;
+
+        // --- OPTIMISATION PRÉDICTION ---
+        this.topKCacheSize = 20; // Taille du cache pour les transitions les plus probables
+        this.topTransitionsCache = new Map(); // Map<ID, Array<{token: ID, weight: number}>>
     }
 
 
@@ -1691,6 +1695,9 @@ export class SemanticRelationalMemory {
             if (state.wordCounts) this.wordCounts = new Map(state.wordCounts);
             if (state.grammar) {
                 this.grammarMap = new Map(state.grammar.map(([id, t]) => [id, new Map(t)]));
+            }
+            if (state.topTransitionsCache) { // Import du cache JSON
+                this.topTransitionsCache = new Map(state.topTransitionsCache.map(([id, cache]) => [id, cache]));
             }
             if (state.bitEngine?.data) {
                 // Gestion adaptative selon le moteur utilisé (Map ou TypedArray)
@@ -1769,6 +1776,22 @@ export class SemanticRelationalMemory {
             }
         }
 
+        // 4. Top Transitions Cache
+        const cacheHead = Buffer.alloc(4);
+        cacheHead.writeUInt32LE(this.topTransitionsCache.size, 0);
+        buffers.push(cacheHead);
+        for (let [key, cacheEntries] of this.topTransitionsCache) {
+            const b = Buffer.alloc(4 + 4); // Key ID + Number of entries
+            b.writeUInt32LE(key, 0);
+            b.writeUInt32LE(cacheEntries.length, 4);
+            buffers.push(b);
+            for (const entry of cacheEntries) {
+                const eb = Buffer.alloc(8); // token ID + weight
+                eb.writeUInt32LE(entry.token, 0);
+                eb.writeFloatLE(entry.weight, 4); // Utilise Float pour la précision du poids
+                buffers.push(eb);
+            }
+        }
         // 4. Sous-Experts (Fractal MoE)
         const subHead = Buffer.alloc(4);
         subHead.writeUInt32LE(this.subExperts.size, 0);
@@ -1890,6 +1913,24 @@ export class SemanticRelationalMemory {
             this.grammarMap.set(key, targets);
         }
 
+        // 4. Top Transitions Cache
+        if (!safeRead(4)) return;
+        const cacheSize = raw.readUInt32LE(offset); offset += 4;
+        this.topTransitionsCache.clear();
+        for (let i = 0; i < cacheSize; i++) {
+            if (!safeRead(8)) break;
+            const key = raw.readUInt32LE(offset); offset += 4;
+            const entryCount = raw.readUInt32LE(offset); offset += 4;
+            const cacheEntries = [];
+            for (let j = 0; j < entryCount; j++) {
+                if (!safeRead(8)) break;
+                const tokenId = raw.readUInt32LE(offset); offset += 4;
+                const weight = raw.readFloatLE(offset); offset += 4;
+                cacheEntries.push({ token: tokenId, weight });
+            }
+            this.topTransitionsCache.set(key, cacheEntries);
+        }
+
         // 4. Sous-Experts
         if (!safeRead(4)) return;
         const subSize = raw.readUInt32LE(offset); offset += 4;
@@ -1936,7 +1977,8 @@ export class SemanticRelationalMemory {
                 data: this.bitEngine.getState ? Array.from(this.bitEngine.getState()) : this.bitEngine.exportState() 
             },
             grammar: Array.from(this.grammarMap.entries()).map(([id, targets]) => [id, Array.from(targets.entries())]),
-            wordCounts: Array.from(this.wordCounts.entries())
+            wordCounts: Array.from(this.wordCounts.entries()),
+            topTransitionsCache: Array.from(this.topTransitionsCache.entries()).map(([id, cache]) => [id, cache])
         };
     }
     /**
@@ -2052,6 +2094,24 @@ export class SemanticRelationalMemory {
                 if (!this.grammarMap.has(prevId)) this.grammarMap.set(prevId, new Map());
                 const bigramTransitions = this.grammarMap.get(prevId);
                 bigramTransitions.set(id, (bigramTransitions.get(id) || 0) + weight);
+
+                // --- MISE À JOUR DU CACHE DE PRÉDICTION (BIGRAMME) ---
+                if (!this.topTransitionsCache.has(prevId)) {
+                    this.topTransitionsCache.set(prevId, []);
+                }
+                let topCache = this.topTransitionsCache.get(prevId);
+                // Retire l'ancienne entrée si elle existe
+                topCache = topCache.filter(entry => entry.token !== id);
+                // Ajoute la nouvelle entrée avec son poids mis à jour
+                topCache.push({ token: id, weight: bigramTransitions.get(id) });
+                // Trie et garde seulement les meilleurs
+                topCache.sort((a, b) => b.weight - a.weight);
+                if (topCache.length > this.topKCacheSize) {
+                    topCache.length = this.topKCacheSize;
+                }
+                this.topTransitionsCache.set(prevId, topCache);
+                // --- FIN MISE À JOUR CACHE ---
+
 
                 // Pruning Proactif Bigramme
                 if (bigramTransitions.size > this.maxTargetsPerContext) { 
@@ -2362,23 +2422,20 @@ export class SemanticRelationalMemory {
             const hasBigramOptions = bigramContext && bigramContext.size > 0;
             const structureReconnue = hasTrigramOptions || hasBigramOptions;
 
-            // --- OPTIMISATION MAJEURE : Sélection des Candidats ---
-            // Au lieu de parcourir tout le vocabulaire, on ne teste que les mots
-            // suggérés par la grammaire (trigrammes/bigrammes).
+            // --- OPTIMISATION MAJEURE : Sélection des Candidats via le cache ---
             const candidateIds = new Set();
             if (hasTrigramOptions) {
                 trigramContext.forEach((_, id) => candidateIds.add(id));
             }
-            if (hasBigramOptions) {
-                bigramContext.forEach((_, id) => candidateIds.add(id));
-            }
-            // Si la grammaire est muette, on se rabat sur une exploration plus large (mais c'est rare)
+            // Pour les bigrammes, on utilise le cache pré-trié
+            const cachedBigramCandidates = this.topTransitionsCache.get(bigramKey) || [];
+            cachedBigramCandidates.forEach(c => candidateIds.add(c.token));
+
+            // Si la grammaire est muette, on se rabat sur une exploration plus large
             if (candidateIds.size === 0) {
-                // --- CORRECTIF ROBUSTESSE ---
-                // Si l'expert local est vide, on utilise le vocabulaire partagé du MoE pour avoir une base.
                 const vocabToUse = this.vocabulary.size > 3 ? this.vocabulary : (this.sharedState?.vocabulary || this.vocabulary);
                 vocabToUse.forEach((id, word) => { 
-                    if (id > 2) candidateIds.add(id); 
+                    if (id > 2) candidateIds.add(id);
                 });
             }
 
