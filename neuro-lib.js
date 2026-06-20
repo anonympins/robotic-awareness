@@ -2500,32 +2500,30 @@ export class SemanticRelationalMemory {
         
         let sentencesGenerated = 0;
 
-        // --- OPTIMISATION : Analyse du contexte hors-boucle ---
-        const subId = this._routeSubExpert(tokens);
-        const subGrammar = this.subExperts.get(subId);
-
-        let trigramKey = null; // Déclaration en dehors du bloc if
-        let trigramContext = null;
-        let subTrigramContext = null;
-
-        // Initialisation hiérarchique du contexte de recherche
-        if (activeIds.length >= 1) {
-            const prevId = activeIds.length >= 2 ? activeIds[activeIds.length - 2] : 2;
-            const currId = activeIds[activeIds.length - 1];
-            trigramKey = (BigInt(prevId) << 32n) | BigInt(currId);
-            
-            trigramContext = this.grammarMap.get(trigramKey);
-            subTrigramContext = subGrammar ? subGrammar.get(trigramKey) : null;
-        }
-        const bigramKey = activeIds[activeIds.length - 1];
-        let bigramContext = this.grammarMap.get(bigramKey);
-
         // 'depth' devient maintenant une limite de sécurité (budget maximum).
         // On s'assure qu'elle est suffisante pour le quota de phrases calculé.
         const maxSafetyLimit = Math.max(depth, targetSentences * 25);
 
         for (let i = 0; i < maxSafetyLimit; i++) {
             const tossedId = this.bitEngine.tossId ? this.bitEngine.tossId() : null;
+
+            // --- CORRECTIF : Le contexte doit être mis à jour À CHAQUE itération ---
+            const subId = this._routeSubExpert(tokens);
+            const subGrammar = this.subExperts.get(subId);
+
+            let trigramKey = null;
+            let trigramContext = null;
+            let subTrigramContext = null;
+
+            if (activeIds.length >= 2) {
+                const prevId = activeIds[activeIds.length - 2];
+                const currId = activeIds[activeIds.length - 1];
+                trigramKey = (BigInt(prevId) << 32n) | BigInt(currId);
+                trigramContext = this.grammarMap.get(trigramKey);
+                subTrigramContext = subGrammar ? subGrammar.get(trigramKey) : null;
+            }
+            const bigramKey = activeIds.length > 0 ? activeIds[activeIds.length - 1] : 2; // Fallback sur <eos>
+            let bigramContext = this.grammarMap.get(bigramKey);
 
             const hasTrigramOptions = trigramContext && trigramContext.size > 0;
             const hasBigramOptions = bigramContext && bigramContext.size > 0;
@@ -2756,17 +2754,21 @@ export class SemanticRelationalMemory {
             }
 
             // Normalisation des Top-K avec la température (créativité)
-            const temperature = Math.max(0.01, creativity);
+            // La température est maintenant un exposant qui aplatit la distribution.
+            // Une créativité de 0 donne une température de 1 (pas de changement).
+            // Une créativité de 1 donne une température de 0.1 (distribution très plate).
+            const temperature = 1.0 - (creativity * 0.9);
+
             let adjustedCandidates = topKCandidates.map(c => ({
                 ...c,
-                prob: Math.pow(c.score, 1 / temperature)
+                // On utilise Math.pow sur le score normalisé pour éviter les nombres astronomiques
+                prob: Math.pow(c.score, temperature)
             }));
             
             // Recalcul de la somme des probabilités ajustées (Crucial pour la Roulette)
             let totalScore = adjustedCandidates.reduce((acc, c) => acc + c.prob, 0);
             if (totalScore <= 0 || isNaN(totalScore)) break;
 
-            // Sélection stochastique (Roulette)
             let pick = Math.random() * totalScore;
             let selected = adjustedCandidates[0];
             for (const cand of adjustedCandidates) {
@@ -2812,16 +2814,6 @@ export class SemanticRelationalMemory {
             if (activeIds.length > 2) activeIds.shift(); // Maintient la fenêtre de 2 IDs pour le trigramme
 
             this._shiftId(selectedId);
-
-            // Mise à jour du contexte pour l'itération suivante
-            const nextPrevId = activeIds.length >= 2 ? activeIds[activeIds.length - 2] : 2;
-            const nextCurrId = activeIds[activeIds.length - 1];
-            const nextTrigramKey = (BigInt(nextPrevId) << 32n) | BigInt(nextCurrId);
-            trigramContext = this.grammarMap.get(nextTrigramKey);
-            subTrigramContext = subGrammar ? subGrammar.get(nextTrigramKey) : null;
-
-            const nextBigramKey = activeIds[activeIds.length - 1];
-            bigramContext = this.grammarMap.get(nextBigramKey);
         }
 
         // --- APPRENTISSAGE PAR L'ERREUR ---

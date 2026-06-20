@@ -120,6 +120,10 @@ async function main() {
             
             console.log(`\n\x1b[36m[SYNTAX] Analyse des structures émergentes...\x1b[0m`);
 
+            // --- ÉROSION SYNAPTIQUE GLOBALE ---
+            console.log(`\x1b[36m[MAINTENANCE] Application de l'érosion synaptique (oubli)... \x1b[0m`);
+            moe.experts.forEach(expert => expert._applySynapticDecay(0.98));
+
             // On ne parcourt que les experts actuellement chargés en mémoire
             const activeExperts = Array.from(moe.experts.entries()).filter(([_, expert]) => expert.grammarMap.size > 0);
             if (activeExperts.length === 0) {
