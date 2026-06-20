@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import express from 'express';
+import path from 'node:path';
 import fs from 'node:fs';
 import { GNeuroMoE, SemanticAttentionLayer } from "./neuro-lib.js";
 
@@ -18,9 +19,23 @@ const attention = new SemanticAttentionLayer();
 moe.loadSharedState(`${EXPERTS_DIR}shared_state.gnr`);
 console.log(`\x1b[2m[MoE] Vocabulaire partagé initialisé avec ${moe.sharedState.vocabulary.size} tokens.\x1b[0m`);
 
-// --- NOUVEAU : Pré-chargement de l'expert grammatical de base ---
-const coreBrain = moe.getCoreExpert();
-coreBrain.attachAttention(attention);
+// --- CORRECTIF : Pré-chargement de tous les experts au démarrage ---
+console.log("\x1b[2m[MoE] Pré-chargement des chunks d'experts existants...\x1b[0m");
+const expertFiles = fs.readdirSync(EXPERTS_DIR).filter(f => f.startsWith('expert_') && f.endsWith('.gnr'));
+for (const file of expertFiles) {
+    const domain = file.replace('expert_', '').replace('.gnr', '');
+    const expert = moe.getExpert(domain); // Crée ou récupère l'instance
+    const expertPath = path.join(EXPERTS_DIR, file);
+    
+    console.log(`  > Chargement de la grammaire pour '${domain}'...`);
+    try {
+        expert.importBinary(fs.readFileSync(expertPath));
+        expert.hasBeenLoaded = true; // Marque comme chargé pour éviter une relecture
+    } catch (e) {
+        console.error(`\x1b[31m  > Échec du chargement pour '${domain}': ${e.message}\x1b[0m`);
+    }
+}
+console.log("\x1b[2m[MoE] Pré-chargement terminé.\x1b[0m");
 
 /**
  * Récupère un expert et charge son état binaire si nécessaire
@@ -31,13 +46,14 @@ async function getExpertForContent(text) {
     const brain = moe.getExpert(domain);
     const path = `${EXPERTS_DIR}expert_${domain}.gnr`;
 
+    // Le chargement se fait maintenant au démarrage, mais on garde cette vérification
+    // au cas où un nouvel expert serait créé pendant que le serveur tourne.
     if (!brain.hasBeenLoaded && fs.existsSync(path)) {
         console.log(`\x1b[2m[MoE] Chargement binaire de l'expert : ${domain}\x1b[0m`);
         const data = await fs.promises.readFile(path);
-        brain.importState(data);
+        brain.importBinary(data); // Utilisation de importBinary
         brain.hasBeenLoaded = true;
     }
-
     // Statistiques de mémorisation de l'expert
     const vocabSize = brain.vocabulary.size;
     const grammarSize = brain.grammarMap.size;
@@ -52,6 +68,9 @@ async function getExpertForContent(text) {
         const ratio = (known / tokens.length * 100).toFixed(0);
         console.log(`\x1b[2m[DEBUG] Compréhension du prompt: ${known}/${tokens.length} mots connus (${ratio}%)\x1b[0m`);
     }
+
+    // On attache l'attention ici, juste avant l'utilisation
+    brain.attachAttention(attention);
 
     return { brain, domain, path };
 }
@@ -72,7 +91,6 @@ app.post('/ingest', async (req, res) => {
 
     try {
         const { brain, domain, path } = await getExpertForContent(text);
-        brain.attachAttention(attention);
         
         const initialSize = brain.vocabulary.size;
 
@@ -113,7 +131,6 @@ app.post('/query', async (req, res) => {
 
     try {
         const { brain, domain } = await getExpertForContent(prompt);
-        brain.attachAttention(attention);
 
         console.log(`\x1b[36m[API QUERY]\x1b[0m Expert: ${domain.toUpperCase()}`);
         console.log(`\x1b[36m[API QUERY]\x1b[0m Amorce: "${prompt}" (probabilisme: topK=${topK}, créativité=${creativity})`);
@@ -122,8 +139,7 @@ app.post('/query', async (req, res) => {
         let prediction = brain.predictSense(prompt, depth, {
             creativity: creativity,
             topK: topK,
-            attention: attention,
-            coreBrain: coreBrain // On injecte l'expert grammatical de base
+            attention: attention
         });
 
         if (!prediction || prediction.trim().length === 0) {

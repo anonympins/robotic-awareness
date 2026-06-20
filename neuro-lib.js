@@ -1648,6 +1648,7 @@ export class SemanticRelationalMemory {
             this.wordCounts = new Map(); // ID -> Fréquence globale
 
             // Initialisation des jetons système pour la gestion des séquences
+            this.totalTokensProcessed = 0;
             this.vocabulary.set("<pad>", 0);
             this.vocabulary.set("<unk>", 1);
             this.vocabulary.set("<eos>", 2);
@@ -1666,6 +1667,9 @@ export class SemanticRelationalMemory {
         // --- OPTIMISATION PRÉDICTION ---
         this.topKCacheSize = 20; // Taille du cache pour les transitions les plus probables
         this.topTransitionsCache = new Map(); // Map<ID, Array<{token: ID, weight: number}>>
+
+        // --- OPTIMISATION FALLBACK ---
+        this.frequentWordsCache = []; // Cache des mots les plus fréquents
     }
 
 
@@ -1755,18 +1759,28 @@ export class SemanticRelationalMemory {
             const isString = typeof key === 'string';
             const isBigInt = typeof key === 'bigint';
             const type = isString ? 1 : (isBigInt ? 2 : 0); // 0: Number, 1: String, 2: BigInt
-
-            const kBuf = isString ? Buffer.from(key, 'utf8') : Buffer.alloc(0);
-            const b = Buffer.alloc(1 + 8 + 2 + kBuf.length + 4); // 8 bytes for ID/BigInt
             
-            b.writeUInt8(type, 0);
-            if (type === 0) b.writeUInt32LE(Number(key), 1);
-            else if (type === 2) b.writeBigUInt64LE(key, 1);
-            
-            b.writeUInt16LE(kBuf.length, 9);
-            kBuf.copy(b, 11);
-            b.writeUInt32LE(targets.size, 11 + kBuf.length);
-            buffers.push(b);
+            if (type === 0) { // Number
+                const b = Buffer.alloc(1 + 4 + 4); // type + key + target_count
+                b.writeUInt8(type, 0);
+                b.writeUInt32LE(Number(key), 1);
+                b.writeUInt32LE(targets.size, 5);
+                buffers.push(b);
+            } else if (type === 2) { // BigInt
+                const b = Buffer.alloc(1 + 8 + 4); // type + key + target_count
+                b.writeUInt8(type, 0);
+                b.writeBigUInt64LE(key, 1);
+                b.writeUInt32LE(targets.size, 9);
+                buffers.push(b);
+            } else { // String
+                const kBuf = Buffer.from(key, 'utf8');
+                const b = Buffer.alloc(1 + 2 + kBuf.length + 4); // type + len + str + target_count
+                b.writeUInt8(type, 0);
+                b.writeUInt16LE(kBuf.length, 1);
+                kBuf.copy(b, 3);
+                b.writeUInt32LE(targets.size, 3 + kBuf.length);
+                buffers.push(b);
+            }
 
             for (let [tId, w] of targets) {
                 const tb = Buffer.alloc(8);
@@ -1890,19 +1904,36 @@ export class SemanticRelationalMemory {
         const grammarSize = raw.readUInt32LE(offset); offset += 4;
         this.grammarMap.clear();
         for (let i = 0; i < grammarSize; i++) {
-            if (!safeRead(11)) break;
+            if (!safeRead(1)) {
+                break;
+            }
             const type = raw.readUInt8(offset);
+            offset += 1;
             let key;
-            if (type === 0) key = raw.readUInt32LE(offset + 1);
-            else if (type === 2) key = raw.readBigUInt64LE(offset + 1);
-            
-            const sLen = raw.readUInt16LE(offset + 9);
-            if (type === 1 && !safeRead(11 + sLen)) break;
-            if (type === 1) key = raw.toString('utf8', offset + 11, offset + 11 + sLen);
-            offset += 11 + sLen;
 
-            if (!safeRead(4)) break;
-            const tCount = raw.readUInt32LE(offset); offset += 4;
+            if (type === 0) { // Number
+                if (!safeRead(4)) {break; }
+                key = raw.readUInt32LE(offset);
+                offset += 4;
+            } else if (type === 2) { // BigInt
+                if (!safeRead(8)) { break; }
+                key = raw.readBigUInt64LE(offset);
+                offset += 8;
+            } else { // String
+                if (!safeRead(2)) { break; }
+                const sLen = raw.readUInt16LE(offset);
+                offset += 2;
+                if (!safeRead(sLen)) { break; }
+                key = raw.toString('utf8', offset, offset + sLen);
+                offset += sLen;
+            }
+
+            if (!safeRead(4)) {
+                break;
+            }
+            const tCount = raw.readUInt32LE(offset);
+            offset += 4;
+
             const targets = new Map();
             for (let j = 0; j < tCount; j++) {
                 if (!safeRead(8)) break;
@@ -1913,20 +1944,20 @@ export class SemanticRelationalMemory {
             this.grammarMap.set(key, targets);
         }
 
-        // 4. Top Transitions Cache
+        // 4. Top Transitions Cache (Correction de la lecture)
         if (!safeRead(4)) return;
         const cacheSize = raw.readUInt32LE(offset); offset += 4;
         this.topTransitionsCache.clear();
         for (let i = 0; i < cacheSize; i++) {
             if (!safeRead(8)) break;
             const key = raw.readUInt32LE(offset); offset += 4;
-            const entryCount = raw.readUInt32LE(offset); offset += 4;
+            const entryCount = raw.readUInt32LE(offset); offset += 4; // Correction ici
             const cacheEntries = [];
             for (let j = 0; j < entryCount; j++) {
                 if (!safeRead(8)) break;
                 const tokenId = raw.readUInt32LE(offset); offset += 4;
                 const weight = raw.readFloatLE(offset); offset += 4;
-                cacheEntries.push({ token: tokenId, weight });
+                cacheEntries.push({ token: tokenId, weight: weight });
             }
             this.topTransitionsCache.set(key, cacheEntries);
         }
@@ -2153,6 +2184,13 @@ export class SemanticRelationalMemory {
         if (Math.random() > 0.8) {
             this._applySynapticDecay(0.98);
         }
+
+        // Mise à jour du cache de mots fréquents
+        if (this.wordCounts.size > this.frequentWordsCache.length) {
+            const sorted = Array.from(this.wordCounts.entries()).sort((a, b) => b[1] - a[1]);
+            this.frequentWordsCache = sorted.slice(0, 200).map(entry => entry[0]);
+        }
+
     }
 
     /**
@@ -2386,6 +2424,76 @@ export class SemanticRelationalMemory {
         const topK = options.topK || 5;
 
         let lastId = activeIds[activeIds.length - 1] || 2; // <eos> par défaut si pas de contexte pour amorcer une ancre
+
+        // --- NOUVELLE STRATÉGIE : BEAM SEARCH BINAIRE (pour faible créativité) ---
+        // Si la créativité est très faible, on utilise une méthode de construction bit à bit,
+        // beaucoup plus rapide que l'évaluation de tous les candidats.
+        if (creativity < 0.1 && topK <= 3) {
+            const beamWidth = 3;
+            let beams = [{ id: 0, score: 1.0, context: this.bitEngine.context }];
+
+            const bitBias = attLayer ? attLayer.getBitBias(activeIds, identityIds, queryIds) : null;
+
+            for (let b = 11; b >= 0; b--) {
+                const allNextBeams = [];
+                for (const beam of beams) {
+                    const tempPredictor = new NeuralBitPredictor();
+                    tempPredictor.context = beam.context;
+
+                    // --- Calcul de la probabilité pour le bit '1' ---
+                    const prob1 = tempPredictor.table[tempPredictor._getHash()] / 255;
+                    
+                    // Application du biais d'attention
+                    let biasedProb1 = prob1;
+                    if (bitBias && bitBias.totalWeight > 0) {
+                        const biasForBit = bitBias.bias[b] / (bitBias.totalWeight * 0.3);
+                        // On transforme le biais en facteur multiplicatif via exp()
+                        const biasFactor = Math.exp(Math.max(-2.0, Math.min(2.0, biasForBit)));
+                        biasedProb1 *= biasFactor;
+                    }
+
+                    // --- Création des deux nouvelles branches (bit 0 et bit 1) ---
+                    // Branche pour le bit 0
+                    const nextContext0 = ((beam.context << 1n) | 0n) & this.bitEngine.mask;
+                    allNextBeams.push({
+                        id: beam.id, // L'ID n'est pas encore modifié
+                        score: beam.score * (1.0 - biasedProb1),
+                        context: nextContext0
+                    });
+
+                    // Branche pour le bit 1
+                    const nextContext1 = ((beam.context << 1n) | 1n) & this.bitEngine.mask;
+                    allNextBeams.push({
+                        id: beam.id | (1 << b), // On ajoute le bit à l'ID
+                        score: beam.score * biasedProb1,
+                        context: nextContext1
+                    });
+                }
+
+                // On ne garde que les 'beamWidth' meilleurs faisceaux
+                allNextBeams.sort((a, b) => b.score - a.score);
+                beams = allNextBeams.slice(0, beamWidth);
+            }
+
+            // À la fin, le premier faisceau contient l'ID le plus probable
+            const bestCandidate = beams[0];
+            const word = this.reverseVocab.get(bestCandidate.id);
+
+            // Si le mot trouvé est valide, on le retourne directement.
+            if (word && word !== "<eos>" && word !== "<unk>" && bestCandidate.score > 1e-9) {
+                // On met à jour le vrai bitEngine avec le contexte du chemin choisi
+                this.bitEngine.context = bestCandidate.context;
+                
+                // On reconstruit une prédiction simple pour la compatibilité de l'affichage
+                // (Cette partie est simplifiée car on ne génère qu'un seul mot avec cette méthode pour l'instant)
+                const nextWord = this.predictSense(seedSentence + " " + word, depth - 1, options);
+                return (word + " " + nextWord).trim();
+            }
+            // Si le résultat n'est pas concluant, on se rabat sur l'ancienne méthode.
+        }
+        // --- FIN DE LA NOUVELLE STRATÉGIE ---
+
+
         let lastWord = lastId ? this.reverseVocab.get(lastId) : "";
         let lastWasConnector = this.isStructural(lastId);
         let lastWasPunctuation = ['.', ',', ';', '!', '?'].includes(lastWord);
@@ -2396,6 +2504,7 @@ export class SemanticRelationalMemory {
         const subId = this._routeSubExpert(tokens);
         const subGrammar = this.subExperts.get(subId);
 
+        let trigramKey = null; // Déclaration en dehors du bloc if
         let trigramContext = null;
         let subTrigramContext = null;
 
@@ -2403,7 +2512,7 @@ export class SemanticRelationalMemory {
         if (activeIds.length >= 1) {
             const prevId = activeIds.length >= 2 ? activeIds[activeIds.length - 2] : 2;
             const currId = activeIds[activeIds.length - 1];
-            const trigramKey = (BigInt(prevId) << 32n) | BigInt(currId);
+            trigramKey = (BigInt(prevId) << 32n) | BigInt(currId);
             
             trigramContext = this.grammarMap.get(trigramKey);
             subTrigramContext = subGrammar ? subGrammar.get(trigramKey) : null;
@@ -2431,12 +2540,25 @@ export class SemanticRelationalMemory {
             const cachedBigramCandidates = this.topTransitionsCache.get(bigramKey) || [];
             cachedBigramCandidates.forEach(c => candidateIds.add(c.token));
 
-            // Si la grammaire est muette, on se rabat sur une exploration plus large
+            // --- FALLBACK LÉGER ---
+            // Si la grammaire de l'expert est muette, on se rabat sur des solutions intelligentes.
             if (candidateIds.size === 0) {
-                const vocabToUse = this.vocabulary.size > 3 ? this.vocabulary : (this.sharedState?.vocabulary || this.vocabulary);
-                vocabToUse.forEach((id, word) => { 
-                    if (id > 2) candidateIds.add(id);
-                });
+                // 1. On demande au coreBrain (si disponible)
+                if (options.coreBrain) {
+                    const coreTrigramContext = options.coreBrain.grammarMap.get(trigramKey);
+                    if (coreTrigramContext) coreTrigramContext.forEach((_, id) => candidateIds.add(id));
+                    
+                    const coreBigramCache = options.coreBrain.topTransitionsCache.get(bigramKey) || [];
+                    coreBigramCache.forEach(c => candidateIds.add(c.token));
+                }
+
+                // 2. Si toujours rien, on utilise les mots les plus fréquents comme base
+                if (candidateIds.size === 0) {
+                    const frequent = this.frequentWordsCache.length > 0 ? this.frequentWordsCache : options.coreBrain?.frequentWordsCache;
+                    if (frequent) {
+                        frequent.forEach(id => candidateIds.add(id));
+                    }
+                }
             }
 
             const candidates = [];
@@ -2522,26 +2644,14 @@ export class SemanticRelationalMemory {
                 const verbatimThreshold = 0.92 - (creativity * 0.1); // Plus de créativité = seuil plus bas
                 const isVerbatim = transitionProb > verbatimThreshold;
 
-                // --- LOGIQUE DE COHÉRENCE FLEXIBLE ---
-                // Au lieu de tuer le mot s'il n'est pas statistique, on vérifie s'il a du sens
-                let structuralPenalty = 1.0;
-
-                // 1. PRIORITÉ AU VERBATIM (Verrouillage de trajectoire)
-                if (structureReconnue && !isStructureHit) {
-                    structuralPenalty = 1e-15; // Pénalité forte mais pas un verrouillage absolu
-                } else if (!structureReconnue) {
-                    // 2. GESTIONNAIRE DE JUXTAPOSITION (Recherche de Pontage)
-                    // On cherche activement des connecteurs ou des ancres sémantiques
-                    if (isConnector) structuralPenalty *= 10.0;
-                    if (isStarter) structuralPenalty *= 5.0;
-                    
-                    // 3. RECHERCHE DE SÉQUENCE ANCRE : Si aucune structure, on exige un lien sémantique fort
-                    if (!isConnector && !isStarter && semanticResonance < 0.001) structuralPenalty = 1e-10;
-                }
+                // --- NOUVELLE LOGIQUE : BONUS GRAMMATICAL ---
+                // Au lieu d'une pénalité qui annule tout, on donne un bonus aux "bons élèves".
+                // Si la grammaire est reconnue, les mots qui la suivent sont fortement favorisés.
+                const grammarBoost = (structureReconnue && isStructureHit) ? 5.0 : 1.0;
 
                 // 2. Injecter un "Biais de Pontage" (Correctif 2)
                 let bridgingBias = 1.0;
-                if (!structureReconnue && isConnector) {
+                if (!structureReconnue && (isConnector || isStarter)) {
                     bridgingBias = 3.5; // Favorise les mots de liaison quand on est "hors-piste"
                 }
 
@@ -2587,8 +2697,7 @@ export class SemanticRelationalMemory {
                 // Le binaire devient le SEUL décideur.
                 const verbatimBoost = transitionProb > 0.8 ? 50.0 : 1.0; // Boost réduit
 
-                let score = (grammarScore + transitionProb * transitionWeight + meaningPower) * 
-                            contextBoost * verbatimBoost * structuralPenalty * flowBias * bridgingBias;
+                let score = (grammarScore + transitionProb * transitionWeight + meaningPower) * contextBoost * verbatimBoost * grammarBoost * flowBias * bridgingBias;
 
                 // Si c'est un hit structurel, c'est presque certainement la fin de phrase voulue
                 if (word === "<eos>") {

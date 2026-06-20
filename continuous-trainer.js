@@ -93,6 +93,20 @@ async function main() {
     console.log("[INFO] Chargement de l'index global et du vocabulaire...");
     moe.loadSharedState(path.join(EXPERTS_DIR, 'shared_state.gnr'));
 
+    // --- CORRECTIF : Pré-chargement des experts existants ---
+    // On parcourt le répertoire des experts pour charger l'état de chaque chunk.
+    // Cela garantit que l'entraînement continue sur la grammaire existante au lieu de la réinitialiser.
+    console.log("[INFO] Pré-chargement des chunks d'experts existants...");
+    const expertFiles = fs.readdirSync(EXPERTS_DIR).filter(f => f.startsWith('expert_') && f.endsWith('.gnr'));
+    for (const file of expertFiles) {
+        const domain = file.replace('expert_', '').replace('.gnr', '');
+        const expert = moe.getExpert(domain); // Crée ou récupère l'instance
+        const expertPath = path.join(EXPERTS_DIR, file);
+        console.log(`  > Chargement de la grammaire pour '${domain}'...`);
+        expert.importBinary(fs.readFileSync(expertPath));
+        expert.hasBeenLoaded = true; // Marque comme chargé pour éviter une relecture
+    }
+
     let cycleCount = 1;
 
     while (true) {
@@ -105,6 +119,13 @@ async function main() {
             console.log(`[INFO] Global Token Count: ${moe.sharedState.totalTokensProcessed}`);
             
             console.log(`\n\x1b[36m[SYNTAX] Analyse des structures émergentes...\x1b[0m`);
+
+            // On ne parcourt que les experts actuellement chargés en mémoire
+            const activeExperts = Array.from(moe.experts.entries()).filter(([_, expert]) => expert.grammarMap.size > 0);
+            if (activeExperts.length === 0) {
+                console.log("  > Aucun expert actif avec une grammaire à analyser pour ce cycle.");
+            }
+
             for (const [domain, expert] of moe.experts) {
                 const analyzer = new SyntaxAnalyzer(expert);
                 const allSigs = analyzer.extractGenerativeSignatures();
@@ -144,6 +165,12 @@ async function main() {
             // Sauvegarde de l'état des experts pour query-brain.js
             console.log(`[INFO] Sauvegarde des experts sur le disque...`);
             for (const [domain, expert] of moe.experts) {
+                // On ne sauvegarde que si l'expert a réellement appris quelque chose
+                if (expert.grammarMap.size === 0) {
+                    console.log(`\x1b[2m[INFO] L'expert '${domain}' est vide, pas de sauvegarde.\x1b[0m`);
+                    continue;
+                }
+
                 const buffer = expert.exportBinary();
                 fs.writeFileSync(path.join(EXPERTS_DIR, `expert_${domain}.gnr`), buffer);
             }
