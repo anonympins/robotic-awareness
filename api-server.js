@@ -142,31 +142,61 @@ app.post('/ingest', async (req, res) => {
  * @returns {string} La séquence de mots générée.
  */
 async function predictWithEnsemble(prompt, depth, options) {
-    const { creativity, topK, coreBrain } = options;
+    const { creativity, topK, coreBrain, mainDomain: initialDomain } = options;
     let currentText = prompt.trim();
     let generatedSequence = [];
 
     console.log(`\n\x1b[35m[ENSEMBLE PREDICTION]\x1b[0m Amorce: "${currentText}"`);
 
     for (let i = 0; i < depth; i++) {
+        const contextForPrediction = currentText.split(' ').slice(-5).join(' ');
+        console.log(`\n\x1b[36m--- Étape ${i + 1}: Prédiction pour "${contextForPrediction}..." ---\x1b[0m`);
+
+        // --- NOUVELLE LOGIQUE : ROUTAGE ACTIF À CHAQUE ÉTAPE ---
+        const mainDomain = i === 0 ? initialDomain : moe.route(contextForPrediction);
+        const mainExpert = moe.getExpert(mainDomain);
+        console.log(`\x1b[2m  > Domaine principal actif: [${mainDomain}]\x1b[0m`);
+
         const mergedCandidates = new Map();
-        
-        console.log(`\n\x1b[36m--- Étape ${i + 1}: Prédiction du mot suivant pour "${currentText.split(' ').slice(-5).join(' ')}..." ---\x1b[0m`);
+        let mainExpertConfidence = 0;
 
-        // 1. Chaque expert retourne une liste de ses meilleurs candidats.
+        // 1. L'expert principal prédit avec un poids renforcé.
+        const mainCandidates = mainExpert.predictNextCandidates(currentText, { topK, creativity, coreBrain });
+        if (mainCandidates.length > 0) {
+            console.log(`\x1b[32m  > Expert Principal [${mainDomain}] propose: ${mainCandidates.map(c => `${c.token}(${c.score.toFixed(3)})`).join(', ')}\x1b[0m`);
+            mainExpertConfidence = mainCandidates.reduce((sum, c) => sum + c.score, 0) / mainCandidates.length;
+
+            for (const { token, score } of mainCandidates) {
+                // On donne un poids de 2.0 à l'expert principal pour qu'il ait la priorité
+                mergedCandidates.set(token, (mergedCandidates.get(token) || 0) + score * 2.0);
+            }
+        }
+
+        // 2. Les autres experts contribuent seulement si l'expert principal est peu confiant.
+        // Leurs scores sont atténués pour agir comme support et non comme décideur.
+        const HELP_THRESHOLD = 0.1; // Seuil de confiance pour demander de l'aide en temps normal.
+        const mainExpertIsSilent = mainCandidates.length === 0;
+
+        // On demande de l'aide si l'expert principal est silencieux OU si sa confiance est faible.
+        if (mainExpertIsSilent) {
+            console.log(`\x1b[33m  > L'expert principal [${mainDomain}] est silencieux. Consultation générale...\x1b[0m`);
+        } else if (mainExpertConfidence < HELP_THRESHOLD) {
+            console.log(`\x1b[33m  > Confiance faible (${mainExpertConfidence.toFixed(2)}). Consultation des autres experts...\x1b[0m`);
+        }
+
         for (const [domain, expert] of moe.experts.entries()) {
-            if (!expert.hasBeenLoaded) continue;
+            // On ignore l'expert principal (déjà traité) et les experts non chargés
+            if (domain === mainDomain || !expert.hasBeenLoaded) continue;
 
-            // On demande à l'expert de prédire les prochains candidats possibles
+            // Si l'expert principal a parlé et est confiant, les autres ne s'expriment pas.
+            if (!mainExpertIsSilent && mainExpertConfidence >= HELP_THRESHOLD) continue;
+
             const candidates = expert.predictNextCandidates(currentText, { topK, creativity, coreBrain });
-
             if (candidates.length > 0) {
-                console.log(`\x1b[2m  > Expert [${domain}] propose: ${candidates.map(c => `${c.token}(${c.score.toFixed(3)})`).join(', ')}\x1b[0m`);
-                
-                // 2. Fusionne les listes en une seule.
-                // 3. Si plusieurs experts proposent le même mot, leurs scores sont additionnés.
+                console.log(`\x1b[2m  > Aide de [${domain}]: ${candidates.map(c => `${c.token}(${c.score.toFixed(3)})`).join(', ')}\x1b[0m`);
                 for (const { token, score } of candidates) {
-                    mergedCandidates.set(token, (mergedCandidates.get(token) || 0) + score);
+                    // Le poids des experts secondaires est réduit (0.5)
+                    mergedCandidates.set(token, (mergedCandidates.get(token) || 0) + score * 0.5);
                 }
             }
         }
@@ -178,9 +208,9 @@ async function predictWithEnsemble(prompt, depth, options) {
 
         // Affichage de la liste fusionnée pour le débogage
         const sortedMerged = [...mergedCandidates.entries()].sort((a, b) => b[1] - a[1]);
-        console.log(`\x1b[32m  > Fusion des prédictions: ${sortedMerged.slice(0, 10).map(([t, s]) => `${t}(${s.toFixed(3)})`).join(', ')} ...\x1b[0m`);
+        console.log(`\x1b[1;34m  > Fusion finale: ${sortedMerged.slice(0, 10).map(([t, s]) => `${t}(${s.toFixed(3)})`).join(', ')} ...\x1b[0m`);
 
-        // 4. Le mot final est choisi par un tirage au sort pondéré.
+        // 3. Le mot final est choisi par un tirage au sort pondéré parmi les candidats fusionnés.
         const totalScore = sortedMerged.reduce((sum, [, score]) => sum + score, 0);
         let randomChoice = Math.random() * totalScore;
         let chosenToken = null;
@@ -238,7 +268,8 @@ app.post('/query', async (req, res) => {
         const prediction = await predictWithEnsemble(prompt, depth, {
             creativity: creativity,
             topK: topK,
-            coreBrain: coreBrain
+            coreBrain: coreBrain,
+            mainDomain: domain // On passe le domaine initial pour la première étape
         });
 
         if (!prediction || prediction.trim().length === 0) {
