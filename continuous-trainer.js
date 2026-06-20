@@ -67,6 +67,12 @@ async function main() {
         const domain = moe.route(title + " " + content.slice(0, 500), highImpact);
         console.log(`[MoE] Domaine détecté : \x1b[33m${domain.toUpperCase()}\x1b[0m`);
 
+        // --- CORRECTIF : Vérifier que le contenu n'est pas vide après le découpage ---
+        if (content.trim().length < 10) {
+            console.log(`\x1b[33m[LOCAL] Segment de contenu trop court ou vide après nettoyage. Saut.\x1b[0m`);
+            return;
+        }
+
         const brain = moe.getExpert(domain);
 
         // Le pré-chargement des experts est déjà fait au démarrage du script,
