@@ -88,37 +88,143 @@ app.use(express.json({ limit: '10mb' }));
  * Utilise learnText de neuro-lib pour le découpage en phrases et le filtrage du bruit sémantique.
  */
 app.post('/ingest', async (req, res) => {
-    const { text, weight = 1 } = req.body;
+    const { text, weight = 1, highImpactTokens = [] } = req.body;
 
     if (!text || typeof text !== 'string' || text.trim().length < 5) {
         return res.status(400).json({ error: "Contenu textuel invalide ou trop court (min 5 chars)." });
     }
 
     try {
-        const { brain, domain, path } = await getExpertForContent(text);
-        
-        const initialSize = brain.vocabulary.size;
+        // --- NOUVELLE LOGIQUE : Multi-Ingestion par phrase ---
+        const sentences = text.split(/(?<=[.!?])(?:\s+|\n+|$)/).filter(s => s.trim().length > 3);
+        if (sentences.length === 0) {
+            return res.status(400).json({ error: "Aucune phrase valide à ingérer." });
+        }
 
-        // Apprentissage segmenté
-        brain.learnText(text.trim(), true, weight);
+        const ingestionReport = {};
+        const modifiedExperts = new Set();
 
-        // Persistance immédiate après ingestion
-        fs.writeFileSync(path, brain.exportBinary());
-        
-        const newWords = brain.vocabulary.size - initialSize;
-        console.log(`\x1b[32m[API]\x1b[0m Ingestion [${domain}] : +${newWords} tokens.`);
+        for (const sentence of sentences) {
+            // On route chaque phrase individuellement
+            const { brain, domain } = await getExpertForContent(sentence);
+            
+            if (!ingestionReport[domain]) {
+                ingestionReport[domain] = { sentences: 0, new_tokens: 0, initial_vocab: brain.vocabulary.size };
+            }
+
+            // On utilise learnSense pour un apprentissage direct de la phrase
+            brain.learnSense(sentence, true, weight);
+
+            ingestionReport[domain].sentences++;
+            modifiedExperts.add(domain);
+        }
+
+        // Persistance de tous les experts modifiés
+        for (const domain of modifiedExperts) {
+            const expert = moe.getExpert(domain);
+            const expertPath = path.join(EXPERTS_DIR, `expert_${domain}.gnr`);
+            fs.writeFileSync(expertPath, expert.exportBinary());
+            
+            const report = ingestionReport[domain];
+            report.new_tokens = expert.vocabulary.size - report.initial_vocab;
+            console.log(`\x1b[32m[API]\x1b[0m Ingestion [${domain}] : ${report.sentences} phrases, +${report.new_tokens} tokens.`);
+        }
 
         res.json({
             success: true,
-            domain: domain,
-            added_tokens: newWords,
-            total_vocabulary: brain.vocabulary.size
+            ingested_sentences: sentences.length,
+            report: ingestionReport,
+            total_vocabulary: moe.sharedState.vocabulary.size
         });
     } catch (err) {
         console.error("\x1b[31m[API ERROR]\x1b[0m", err.message);
         res.status(500).json({ error: "Erreur interne lors de l'apprentissage neuronal." });
     }
 });
+
+/**
+ * Nouvelle fonction de prédiction utilisant une approche d'ensemble.
+ * Interroge tous les experts pour chaque mot, fusionne leurs prédictions
+ * et choisit le mot suivant par tirage pondéré.
+ *
+ * @param {string} prompt - Le texte de départ.
+ * @param {number} depth - Le nombre maximum de mots à générer.
+ * @param {object} options - Options de créativité, topK, etc.
+ * @returns {string} La séquence de mots générée.
+ */
+async function predictWithEnsemble(prompt, depth, options) {
+    const { creativity, topK, coreBrain } = options;
+    let currentText = prompt.trim();
+    let generatedSequence = [];
+
+    console.log(`\n\x1b[35m[ENSEMBLE PREDICTION]\x1b[0m Amorce: "${currentText}"`);
+
+    for (let i = 0; i < depth; i++) {
+        const mergedCandidates = new Map();
+        
+        console.log(`\n\x1b[36m--- Étape ${i + 1}: Prédiction du mot suivant pour "${currentText.split(' ').slice(-5).join(' ')}..." ---\x1b[0m`);
+
+        // 1. Chaque expert retourne une liste de ses meilleurs candidats.
+        for (const [domain, expert] of moe.experts.entries()) {
+            if (!expert.hasBeenLoaded) continue;
+
+            // On demande à l'expert de prédire les prochains candidats possibles
+            const candidates = expert.predictNextCandidates(currentText, { topK, creativity, coreBrain });
+
+            if (candidates.length > 0) {
+                console.log(`\x1b[2m  > Expert [${domain}] propose: ${candidates.map(c => `${c.token}(${c.score.toFixed(3)})`).join(', ')}\x1b[0m`);
+                
+                // 2. Fusionne les listes en une seule.
+                // 3. Si plusieurs experts proposent le même mot, leurs scores sont additionnés.
+                for (const { token, score } of candidates) {
+                    mergedCandidates.set(token, (mergedCandidates.get(token) || 0) + score);
+                }
+            }
+        }
+
+        if (mergedCandidates.size === 0) {
+            console.log("\x1b[33m[!] Aucun expert n'a pu proposer de mot suivant. Fin de la génération.\x1b[0m");
+            break; // Arrête la génération si aucun mot n'est trouvé
+        }
+
+        // Affichage de la liste fusionnée pour le débogage
+        const sortedMerged = [...mergedCandidates.entries()].sort((a, b) => b[1] - a[1]);
+        console.log(`\x1b[32m  > Fusion des prédictions: ${sortedMerged.slice(0, 10).map(([t, s]) => `${t}(${s.toFixed(3)})`).join(', ')} ...\x1b[0m`);
+
+        // 4. Le mot final est choisi par un tirage au sort pondéré.
+        const totalScore = sortedMerged.reduce((sum, [, score]) => sum + score, 0);
+        let randomChoice = Math.random() * totalScore;
+        let chosenToken = null;
+
+        for (const [token, score] of sortedMerged) {
+            randomChoice -= score;
+            if (randomChoice <= 0) {
+                chosenToken = token;
+                break;
+            }
+        }
+        
+        // Fallback si quelque chose se passe mal avec le tirage
+        if (!chosenToken && sortedMerged.length > 0) {
+            chosenToken = sortedMerged[0][0];
+        }
+
+        if (!chosenToken) {
+             console.log("\x1b[33m[!] Impossible de choisir un token. Fin de la génération.\x1b[0m");
+             break;
+        }
+
+        console.log(`\x1b[1;32m  > Mot choisi: ${chosenToken}\x1b[0m`);
+
+        // --- CORRECTIF : Interpréter <eos> comme un signal d'arrêt ---
+        if (chosenToken === "<eos>") break;
+
+        generatedSequence.push(chosenToken);
+        currentText += ` ${chosenToken}`;
+    }
+
+    return generatedSequence.join(' ');
+}
 
 /**
  * Endpoint pour interroger le cerveau (similaire à query-brain.js).
@@ -135,21 +241,19 @@ app.post('/query', async (req, res) => {
     }
 
     try {
-        const { brain, domain } = await getExpertForContent(prompt);
-
-        console.log(`\x1b[36m[API QUERY]\x1b[0m Expert: ${domain.toUpperCase()}`);
-        console.log(`\x1b[36m[API QUERY]\x1b[0m Amorce: "${prompt}" (probabilisme: topK=${topK}, créativité=${creativity})`);
-
-        // On demande une profondeur généreuse pour permettre de finir la phrase
-        let prediction = brain.predictSense(prompt, depth, {
+        // Le routage initial sert principalement à l'analyse et aux logs, la prédiction est maintenant en mode "ensemble".
+        const { domain } = await getExpertForContent(prompt);
+        console.log(`\x1b[36m[API QUERY]\x1b[0m Domaine principal détecté: ${domain.toUpperCase()}`);
+        
+        // Utilisation de la nouvelle fonction de prédiction par ensemble
+        const prediction = await predictWithEnsemble(prompt, depth, {
             creativity: creativity,
             topK: topK,
-            attention: attention,
-            coreBrain: coreBrain // On passe l'expert de base en option
+            coreBrain: coreBrain
         });
 
         if (!prediction || prediction.trim().length === 0) {
-            console.log("\x1b[33m[!] Alerte : La réponse est vide. L'expert n'a trouvé aucun candidat viable pour ce contexte.\x1b[0m");
+            console.log("\x1b[33m[!] Alerte : La réponse générée est vide.\x1b[0m");
         }
 
         res.json({

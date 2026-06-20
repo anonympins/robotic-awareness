@@ -2822,6 +2822,174 @@ export class SemanticRelationalMemory {
         return result.join(' ').replace(/\s([,.;!])/g, '$1');
     }
 
+    /**
+     * Prédit une liste de prochains mots possibles avec leurs scores de confiance.
+     * C'est la version "unitaire" de predictSense, utilisée par l'ensemble.
+     * @param {string} text - Le contexte actuel.
+     * @param {object} options - Options comme topK, creativity, coreBrain.
+     * @returns {Array<{token: string, score: number}>} - Une liste de candidats.
+     */
+    predictNextCandidates(text, options = {}) {
+        const tokens = text.match(this.tokenizer) || [];
+        this.bitEngine.resetContext();
+
+        let activeIds = [];
+        const queryIds = tokens.map(t => this.vocabulary.get(t) || 0).filter(id => id > 0);
+        const identityIds = []; // Pourrait être passé en option si nécessaire
+
+        // Préchauffage avec le sens de l'amorce
+        for (const token of tokens) {
+            const id = this.vocabulary.get(token) || 1; // 1 = <unk>
+            if (id > 1) {
+                activeIds.push(id);
+                if (activeIds.length > 2) activeIds.shift();
+            }
+            this._shiftId(id);
+        }
+
+        const attLayer = options.attention || this.attention;
+        const creativity = (options.creativity !== undefined) ? options.creativity : 0.01;
+        const topK = options.topK || 10; // On utilise un topK plus grand pour l'ensemble
+        const coreBrain = options.coreBrain;
+
+        const subId = this._routeSubExpert(tokens);
+        const subGrammar = this.subExperts.get(subId);
+
+        let trigramKey = null;
+        if (activeIds.length >= 2) {
+            trigramKey = (BigInt(activeIds[activeIds.length - 2]) << 32n) | BigInt(activeIds[activeIds.length - 1]);
+        }
+        const bigramKey = activeIds.length > 0 ? activeIds[activeIds.length - 1] : 2;
+
+        const trigramContext = this.grammarMap.get(trigramKey);
+        const subTrigramContext = subGrammar ? subGrammar.get(trigramKey) : null;
+        const bigramContext = this.grammarMap.get(bigramKey);
+
+        const hasTrigramOptions = trigramContext && trigramContext.size > 0;
+        const hasBigramOptions = bigramContext && bigramContext.size > 0;
+        const structureReconnue = hasTrigramOptions || hasBigramOptions;
+
+        const candidateIds = new Set();
+        if (hasTrigramOptions) {
+            trigramContext.forEach((_, id) => candidateIds.add(id));
+        }
+        const cachedBigramCandidates = this.topTransitionsCache.get(bigramKey) || [];
+        cachedBigramCandidates.forEach(c => candidateIds.add(c.token));
+
+        if (candidateIds.size === 0) {
+            if (coreBrain && coreBrain !== this) { // Évite la récursion infinie
+                const coreTrigramContext = coreBrain.grammarMap.get(trigramKey);
+                if (coreTrigramContext) coreTrigramContext.forEach((_, id) => candidateIds.add(id));
+                
+                const coreBigramCache = coreBrain.topTransitionsCache.get(bigramKey) || [];
+                coreBigramCache.forEach(c => candidateIds.add(c.token));
+            }
+            if (candidateIds.size === 0) {
+                const frequent = this.frequentWordsCache.length > 0 ? this.frequentWordsCache : coreBrain?.frequentWordsCache;
+                if (frequent?.length > 0) {
+                    frequent.slice(0, 50).forEach(id => candidateIds.add(id));
+                }
+            }
+        }
+
+        const candidates = [];
+        const wordCounts = new Map(); // Pour la pénalité de répétition locale à la prédiction
+
+        for (const id of candidateIds) {
+            const word = this.reverseVocab.get(id);
+            if (id === 0 || !word) continue;
+
+            const isConnector = this.isStructural(id);
+            const isStarter = this.grammarMap.get(2)?.has(id);
+
+            let semanticResonance = 0;
+            if (attLayer) {
+                queryIds.forEach(qId => {
+                    const relations = attLayer.correlationMatrix.get(qId);
+                    if (relations && relations.has(id)) semanticResonance += relations.get(id);
+                });
+                activeIds.forEach(aId => {
+                    const relations = attLayer.correlationMatrix.get(aId);
+                    if (relations && relations.has(id)) semanticResonance += relations.get(id) * 3.5;
+                });
+                semanticResonance = semanticResonance / (queryIds.length + activeIds.length || 1);
+            }
+
+            const transitionProb = this.bitEngine.scoreId(id);
+            if (transitionProb < 0.0001 && creativity < 0.01 && !hasTrigramOptions) continue;
+
+            let transitionWeight = 4.0 + ((1.0 - creativity) * 6.0);
+            if (!structureReconnue) transitionWeight *= 2.5;
+
+            let grammarWeight = 0;
+            let totalStructuralWeight = 1;
+            let isStructureHit = false;
+
+            if (hasTrigramOptions && trigramContext.has(id)) {
+                let boost = 40.0;
+                if (subTrigramContext && subTrigramContext.has(id)) boost *= 3.0;
+                grammarWeight = trigramContext.get(id) * boost;
+                totalStructuralWeight = Array.from(trigramContext.values()).reduce((a, b) => a + b, 1);
+                isStructureHit = true;
+            } else if (hasBigramOptions && bigramContext.has(id)) {
+                grammarWeight = bigramContext.get(id) * 20.0;
+                totalStructuralWeight = Array.from(bigramContext.values()).reduce((a, b) => a + b, 1);
+                isStructureHit = true;
+            }
+
+            let grammarScore = grammarWeight / (totalStructuralWeight || 1);
+            const grammarBoost = (structureReconnue && isStructureHit) ? 5.0 : 1.0;
+
+            let bridgingBias = 1.0;
+            if (!structureReconnue && (isConnector || isStarter)) {
+                bridgingBias = 3.5;
+            }
+
+            let contextBoost = 1.0;
+            if (attLayer && (activeIds.length > 0 || identityIds.length > 0 || queryIds.length > 0)) {
+                const { bias, totalWeight } = attLayer.getBitBias(activeIds, identityIds, queryIds);
+                if (totalWeight > 0) {
+                    let bitMatch = 0;
+                    for (let b = 0; b < 12; b++) {
+                        bitMatch += ((id >> b) & 1) ? bias[b] : -bias[b];
+                    }
+                    contextBoost = Math.exp(Math.max(-4.0, Math.min(6.0, (bitMatch / (totalWeight * 0.3)))));
+                }
+            }
+
+            const semanticExplorationFactor = 1.0 + (creativity * 4.0);
+            const meaningPower = semanticResonance * 150.0 * semanticExplorationFactor;
+            const verbatimBoost = transitionProb > 0.8 ? 50.0 : 1.0;
+
+            let score = (grammarScore + transitionProb * transitionWeight + meaningPower) * contextBoost * verbatimBoost * grammarBoost * bridgingBias;
+
+            if (word === "<eos>") {
+                if (isStructureHit) score *= 20.0;
+                else if (!structureReconnue && transitionProb > 0.8) score *= 5.0;
+            }
+
+            if (['<unk>', 'div', 'span', 'class', 'id', 'href', 'width', 'height', 'style', 'mw', 'parser', 'output', 'ch', 'sc', 'sc2', 'sc3', 'en', 'http', 'www', 'oldid', 'news', 'title', 'index', 'php'].includes(word)) score *= 0.000001;
+            if (word === "<unk>") score *= 0.00001;
+            if (word.length > 20) score *= 0.1;
+            if (/[0-9]/.test(word)) score *= 0.0000001;
+
+            const repetitionCount = wordCounts.get(word) || 0;
+            if (repetitionCount > 0) score *= isConnector ? 0.5 : Math.pow(0.001, repetitionCount);
+
+            const lastWord = tokens[tokens.length - 1];
+            if (lastWord === word) score *= 0.0001;
+
+            candidates.push({ token: word, score });
+        }
+
+        if (candidates.length === 0) return [];
+
+        candidates.sort((a, b) => b.score - a.score);
+
+        // On ne retourne que le topK demandé par l'orchestrateur
+        return candidates.slice(0, topK);
+    }
+
     _updateId(id, weight = 1) {
         // On décompose l'ID (le sens) en 12 bits pour le moteur
         for (let i = 11; i >= 0; i--) {
