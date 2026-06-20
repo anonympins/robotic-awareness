@@ -29,17 +29,20 @@ async function main() {
 
         // Lecture asynchrone pour ne pas bloquer sur de gros fichiers
         const stats = await fs.promises.stat(CORPUS_PATH);
-        const chunkSize = 1024 * 256; // 256 KB par cycle
-        if (stats.size < chunkSize) {
-            // Si le corpus est plus petit que la taille du segment, on le lit en entier.
-            console.log(`\x1b[33m[LOCAL] Corpus plus petit que la taille du segment, lecture complète.\x1b[0m`);
-            localCorpusCursor = 0; // On s'assure de toujours le relire
-        } else if (localCorpusCursor + chunkSize > stats.size) {
+        let chunkSize = 1024 * 256; // 256 KB par cycle
+
+        // Si le curseur est à la fin ou au-delà, on le réinitialise pour le cycle actuel.
+        if (localCorpusCursor >= stats.size) {
             console.log(`\x1b[32m[LOCAL]\x1b[0m Fin du corpus atteinte. Reprise au début.`);
             localCorpusCursor = 0;
         }
 
         const startPos = localCorpusCursor;
+
+        // Ajuster la taille du chunk pour ne pas lire au-delà de la fin du fichier
+        const remainingBytes = stats.size - startPos;
+        chunkSize = Math.min(chunkSize, remainingBytes);
+
         const buffer = Buffer.alloc(chunkSize);
         const fileHandle = await fs.promises.open(CORPUS_PATH, 'r');
         const { bytesRead } = await fileHandle.read(buffer, 0, chunkSize, startPos);
