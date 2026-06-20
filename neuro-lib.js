@@ -1670,6 +1670,11 @@ export class SemanticRelationalMemory {
 
         // --- OPTIMISATION FALLBACK ---
         this.frequentWordsCache = []; // Cache des mots les plus fréquents
+
+        // --- OPTIMISATION : Compteurs pour déclenchements périodiques ---
+        this.updateCacheCounter = 0;
+        this.pruningCheckCounter = 0;
+        this.CACHE_UPDATE_THRESHOLD = 100; // Mettre à jour le cache tous les 100 mots
     }
 
 
@@ -2103,22 +2108,14 @@ export class SemanticRelationalMemory {
         for (const token of tokens) {
             let id = this.vocabulary.get(token);
             if (id === undefined) {
-                if (this.sharedState) {
-                    id = this.sharedState.nextId++;
-                } else {
-                    id = this.nextId++;
-                }
+                id = this.sharedState ? this.sharedState.nextId++ : this.nextId++;
                 this.vocabulary.set(token, id);
                 this.reverseVocab.set(id, token);
             }
-            
             ids.push(id);
 
-            // Mise à jour de la statistique de répétition (Deduction des connecteurs)
-            const currentCount = this.wordCounts.get(id) || 0;
-            this.wordCounts.set(id, currentCount + weight);
-            if (this.sharedState) this.sharedState.totalTokensProcessed += weight;
-            else this.totalTokensProcessed = (this.totalTokensProcessed || 0) + weight;
+            this.wordCounts.set(id, (this.wordCounts.get(id) || 0) + weight);
+            if (this.sharedState) this.sharedState.totalTokensProcessed += weight; else this.totalTokensProcessed += weight;
 
             // 1. Enregistrement Bigramme (A -> B)
             if (prevId !== null) {
@@ -2126,32 +2123,15 @@ export class SemanticRelationalMemory {
                 const bigramTransitions = this.grammarMap.get(prevId);
                 bigramTransitions.set(id, (bigramTransitions.get(id) || 0) + weight);
 
-                // --- MISE À JOUR DU CACHE DE PRÉDICTION (BIGRAMME) ---
-                if (!this.topTransitionsCache.has(prevId)) {
-                    this.topTransitionsCache.set(prevId, []);
-                }
-                let topCache = this.topTransitionsCache.get(prevId);
-                // Retire l'ancienne entrée si elle existe
-                topCache = topCache.filter(entry => entry.token !== id);
-                // Ajoute la nouvelle entrée avec son poids mis à jour
-                topCache.push({ token: id, weight: bigramTransitions.get(id) });
-                // Trie et garde seulement les meilleurs
-                topCache.sort((a, b) => b.weight - a.weight);
-                if (topCache.length > this.topKCacheSize) {
-                    topCache.length = this.topKCacheSize;
-                }
-                this.topTransitionsCache.set(prevId, topCache);
-                // --- FIN MISE À JOUR CACHE ---
-
-
-                // Pruning Proactif Bigramme
-                if (bigramTransitions.size > this.maxTargetsPerContext) { 
-                    this._intelligentPruning(bigramTransitions, this.maxTargetsPerContext);
+                // --- MISE À JOUR PÉRIODIQUE DU CACHE DE PRÉDICTION (BIGRAMME) ---
+                this.updateCacheCounter++;
+                if (this.updateCacheCounter > this.CACHE_UPDATE_THRESHOLD) {
+                    this._updateTopTransitionsCache(prevId);
+                    this.updateCacheCounter = 0; // Reset counter
                 }
 
                 // 2. Enregistrement Trigramme (A + B -> C)
                 if (prevPrevId !== null) {
-                    // Optimisation RAM : Packing BigInt au lieu d'une String template
                     const contextKey = (BigInt(prevPrevId) << 32n) | BigInt(prevId);
                     if (!this.grammarMap.has(contextKey)) this.grammarMap.set(contextKey, new Map());
                     const trigramTransitions = this.grammarMap.get(contextKey);
@@ -2161,11 +2141,6 @@ export class SemanticRelationalMemory {
                     if (!subGrammar.has(contextKey)) subGrammar.set(contextKey, new Map());
                     const subTransitions = subGrammar.get(contextKey);
                     subTransitions.set(id, (subTransitions.get(id) || 0) + weight * 2); // Boost de spécialité
-
-                    // Pruning Proactif Trigramme (plus strict sur les trigrammes)
-                    if (trigramTransitions.size > Math.floor(this.maxTargetsPerContext / 2)) {
-                        this._intelligentPruning(trigramTransitions, Math.floor(this.maxTargetsPerContext / 2));
-                    }
                 }
             }
 
@@ -2175,37 +2150,15 @@ export class SemanticRelationalMemory {
             prevId = id;         // Le mot actuel devient le mot précédent
         }
 
-        // Vérification de la limite globale de la grammaire
-        if (this.grammarMap.size > this.maxContexts) {
-            this._globalGrammarCleanup();
+        // --- NETTOYAGE OPPORTUNISTE (NON-BLOQUANT) ---
+        this.pruningCheckCounter++;
+        if (this.pruningCheckCounter > 50) { // Vérifie tous les 50 blocs de texte
+            if (this.grammarMap.size > this.maxContexts) {
+                // On lance le nettoyage en tâche de fond pour ne pas ralentir l'ingestion
+                setTimeout(() => this._globalGrammarCleanup(), 0);
+            }
+            this.pruningCheckCounter = 0;
         }
-
-        // Applique une légère érosion synaptique après chaque bloc d'apprentissage
-        if (Math.random() > 0.8) {
-            this._applySynapticDecay(0.98);
-        }
-
-        // Mise à jour du cache de mots fréquents
-        if (this.wordCounts.size > this.frequentWordsCache.length) {
-            const sorted = Array.from(this.wordCounts.entries()).sort((a, b) => b[1] - a[1]);
-            this.frequentWordsCache = sorted.slice(0, 200).map(entry => entry[0]);
-        }
-
-    }
-
-    /**
-     * Déduit si un mot appartient à la structure répétitive du langage (Connecteur)
-     * basé sur sa fréquence d'apparition globale.
-     */
-    isStructural(idOrWord) {
-        let id = typeof idOrWord === 'string' ? this.vocabulary.get(idOrWord) : idOrWord;
-        if (id === undefined) return false;
-
-        // Un mot est considéré comme structurel s'il représente plus de 0.5% du corpus
-        // ou s'il fait partie du socle de base si le corpus est trop petit.
-        const total = this.sharedState ? this.sharedState.totalTokensProcessed : (this.totalTokensProcessed || 0);
-        const count = this.wordCounts.get(id) || 0;
-        return (count / total) > 0.005;
     }
 
     /**
@@ -2213,6 +2166,7 @@ export class SemanticRelationalMemory {
      * Supprime le bruit et garde les relations les plus saillantes.
      */
     _intelligentPruning(targetMap, limit) {
+        // Cette fonction est maintenant appelée moins souvent, via _globalGrammarCleanup
         let totalEnergy = 0;
         for (let w of targetMap.values()) totalEnergy += w;
 
@@ -2304,6 +2258,44 @@ export class SemanticRelationalMemory {
             if (this.grammarMap.size < this.maxContexts * 0.8) break;
         }
         console.log(`\x1b[2m[Grammar] ${deleted} contextes faibles évincés.\x1b[0m`);
+    }
+
+    /**
+     * Met à jour le cache des transitions les plus probables pour un token donné.
+     * @param {number} contextId L'ID du token de contexte (le mot "A" dans A->B)
+     */
+    _updateTopTransitionsCache(contextId) {
+        const transitions = this.grammarMap.get(contextId);
+        if (!transitions || transitions.size === 0) return;
+
+        // On ne trie que si nécessaire, pas à chaque ingestion
+        const sorted = Array.from(transitions.entries()).sort((a, b) => b[1] - a[1]);
+
+        const topK = sorted.slice(0, this.topKCacheSize).map(([token, weight]) => ({ token, weight }));
+
+        this.topTransitionsCache.set(contextId, topK);
+
+        // Pruning proactif léger sur ce contexte spécifique
+        if (transitions.size > this.maxTargetsPerContext) {
+            this._intelligentPruning(transitions, this.maxTargetsPerContext);
+        }
+    }
+
+    /**
+     * Déduit si un mot appartient à la structure répétitive du langage (Connecteur)
+     * basé sur sa fréquence d'apparition globale.
+     */
+    isStructural(idOrWord) {
+        let id = typeof idOrWord === 'string' ? this.vocabulary.get(idOrWord) : idOrWord;
+        if (id === undefined) return false;
+
+        // Un mot est considéré comme structurel s'il représente plus de 0.5% du corpus
+        // ou s'il fait partie du socle de base si le corpus est trop petit.
+        const total = this.sharedState ? this.sharedState.totalTokensProcessed : (this.totalTokensProcessed || 0);
+        if (total === 0) return false;
+        const count = this.wordCounts.get(id) || 0;
+        // Seuil de 0.5% pour être considéré comme un mot structurel
+        return (count / total) > 0.005;
     }
 
     /**
