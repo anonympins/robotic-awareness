@@ -74,22 +74,30 @@ export async function scrapeRobertContent(path = '/guide') {
 }
 
 export async function getRandomRobertPage() {
-    const root = await scrapeRobertContent('/guide');
-    if (!root) {
-        // Already scraped, try a random link from the stored file
-        const scrapedPages = await getScrapedPages();
-        const links = Array.from(scrapedPages);
-        if (links.length > 0) {
-            const randomPath = links[Math.floor(Math.random() * links.length)];
+    // On scrape toujours la page racine pour avoir une liste de liens frais,
+    // mais on ne traite pas son contenu si elle a déjà été visitée.
+    const rootPage = await scrapeRobertContent('/guide');
+
+    // Si la page racine a déjà été scrapée, scrapeRobertContent renvoie null.
+    // On doit quand même récupérer les liens de cette page pour explorer plus loin.
+    if (!rootPage) {
+        console.log("Page racine déjà scrapée. Recherche d'un nouveau lien à explorer...");
+        // On force une re-lecture de la page racine juste pour ses liens.
+        const tempRoot = await scrapeRobertContent('/guide', true); // Le 'true' force le scraping
+        if (tempRoot && tempRoot.links.length > 0) {
+            // On choisit un lien au hasard parmi ceux de la page racine et on le scrape.
+            const randomPath = tempRoot.links[Math.floor(Math.random() * tempRoot.links.length)];
             return await scrapeRobertContent(randomPath);
         }
-        return null; // No pages to scrape
+        console.log("Impossible de trouver de nouveaux liens depuis la page racine.");
+        return null;
     }
 
-    if (root.links && root.links.length > 0) {
+    // Si la page racine n'avait jamais été scrapée, on choisit un lien au hasard.
+    if (rootPage.links && rootPage.links.length > 0) {
         let attempts = 0;
         while(attempts < 10) { // Limit attempts to avoid infinite loops
-            const randomPath = root.links[Math.floor(Math.random() * root.links.length)];
+            const randomPath = rootPage.links[Math.floor(Math.random() * rootPage.links.length)];
             const page = await scrapeRobertContent(randomPath);
             if (page) {
                 return page;
@@ -99,5 +107,21 @@ export async function getRandomRobertPage() {
         console.log("Could not find a new page to scrape after 10 attempts.");
         return null;
     }
-    return root;
+    return rootPage;
 }
+
+/**
+ * Récupère le contenu d'une page du Robert.
+ * @param {string} path Le chemin de la page à scraper.
+ * @param {boolean} force Si true, ignore la vérification des pages déjà scrapées (utile pour récupérer les liens).
+ * @returns {Promise<{title: string, content: string, links: string[]}|null>}
+ */
+export async function scrapeRobertContent(path = '/guide', force = false) {
+    if (!force) {
+        const scrapedPages = await getScrapedPages();
+        if (scrapedPages.has(path)) {
+            console.log(`Page ${path} already scraped. Skipping.`);
+            return null;
+        }
+    }
+    // ... le reste de la fonction scrapeRobertContent reste identique
