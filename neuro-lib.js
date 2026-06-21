@@ -1674,7 +1674,18 @@ export class SemanticRelationalMemory {
         // --- OPTIMISATION : Compteurs pour déclenchements périodiques ---
         this.updateCacheCounter = 0;
         this.pruningCheckCounter = 0;
-        this.CACHE_UPDATE_THRESHOLD = 100; // Mettre à jour le cache tous les 100 mots
+        this.CACHE_UPDATE_THRESHOLD = 100;
+
+        // =================================================================
+        // NOUVEAU : SYSTÈME DE CLUSTERISATION SYNTAXIQUE DYNAMIQUE (NON-SUPERVISÉ)
+        // =================================================================
+        this.syntacticFingerprints = new Map(); // Map<ID, { pre: Map<ID, count>, post: Map<ID, count> }>
+        this.wordToCluster = new Map();         // Map<WordID, ClusterID>
+        this.clusters = new Map();              // Map<ClusterID, Set<WordID>>
+        this.clusterGrammar = new Map();        // Map<`C1|C2`, Map<C3, count>> (Grammaire de clusters)
+        this.nextClusterId = 0;
+        this.clusteringCounter = 0;
+        this.CLUSTERING_THRESHOLD = 500; // Mettre à jour les clusters tous les 500 apprentissages
     }
 
     /**
@@ -2171,6 +2182,11 @@ export class SemanticRelationalMemory {
             if (prevId !== null) {
                 if (!this.grammarMap.has(prevId)) this.grammarMap.set(prevId, new Map());
                 const bigramTransitions = this.grammarMap.get(prevId);
+
+                // --- NOUVEAU : Apprentissage des empreintes syntaxiques (pré/post) ---
+                this._updateFingerprint(id, 'pre', prevId, weight);
+                this._updateFingerprint(prevId, 'post', id, weight);
+
                 bigramTransitions.set(id, (bigramTransitions.get(id) || 0) + weight);
 
                 // --- MISE À JOUR PÉRIODIQUE DU CACHE DE PRÉDICTION (BIGRAMME) ---
@@ -2197,7 +2213,7 @@ export class SemanticRelationalMemory {
             // On injecte l'ID du token (l'unité de sens) dans le moteur de bits
             prevPrevId = prevId; // Décale les IDs pour la prochaine itération
             this._updateId(id, weight);
-            prevId = id;         // Le mot actuel devient le mot précédent
+            prevId = id; // Le mot actuel devient le mot précédent
         }
 
         // --- NETTOYAGE OPPORTUNISTE (NON-BLOQUANT) ---
@@ -2209,9 +2225,113 @@ export class SemanticRelationalMemory {
             }
             this.pruningCheckCounter = 0;
         }
+
+        // --- CLUSTERISATION PÉRIODIQUE ---
+        this.clusteringCounter++;
+        if (this.clusteringCounter > this.CLUSTERING_THRESHOLD) {
+            this._updateSyntacticClusters();
+            this._learnClusterGrammar(ids); // Apprend la grammaire des clusters sur la phrase actuelle
+            this.clusteringCounter = 0;
+        }
     }
 
-    /**
+    /** NOUVEAU: Met à jour l'empreinte syntaxique d'un mot. */
+    _updateFingerprint(wordId, type, contextId, weight) {
+        if (!this.syntacticFingerprints.has(wordId)) {
+            this.syntacticFingerprints.set(wordId, { pre: new Map(), post: new Map() });
+        }
+        const fingerprint = this.syntacticFingerprints.get(wordId);
+        const map = fingerprint[type];
+        map.set(contextId, (map.get(contextId) || 0) + weight);
+    }
+
+    /** NOUVEAU: Calcule la similarité entre deux empreintes syntaxiques. */
+    _calculateFingerprintSimilarity(fp1, fp2) {
+        if (!fp1 || !fp2) return 0;
+
+        const similarity = (map1, map2) => {
+            let dotProduct = 0;
+            let mag1 = 0;
+            let mag2 = 0;
+            const allKeys = new Set([...map1.keys(), ...map2.keys()]);
+
+            for (const key of allKeys) {
+                const v1 = map1.get(key) || 0;
+                const v2 = map2.get(key) || 0;
+                dotProduct += v1 * v2;
+                mag1 += v1 * v1;
+                mag2 += v2 * v2;
+            }
+            if (mag1 === 0 || mag2 === 0) return 0;
+            return dotProduct / (Math.sqrt(mag1) * Math.sqrt(mag2));
+        };
+
+        const preSim = similarity(fp1.pre, fp2.pre);
+        const postSim = similarity(fp1.post, fp2.post);
+
+        // La similarité est la moyenne des similarités des contextes pré et post.
+        return (preSim + postSim) / 2;
+    }
+
+    _updateSyntacticClusters() {
+        const SIMILARITY_THRESHOLD = 0.75; // Seuil élevé pour garantir la cohérence des clusters
+        const wordIds = Array.from(this.syntacticFingerprints.keys());
+
+        for (const wordId of wordIds) {
+            // Si le mot est déjà dans un cluster, on passe.
+            if (this.wordToCluster.has(wordId)) continue;
+
+            const fp1 = this.syntacticFingerprints.get(wordId);
+            let bestCluster = null;
+            let maxSimilarity = -1;
+
+            // Cherche le cluster existant le plus similaire.
+            for (const [clusterId, wordSet] of this.clusters) {
+                // On prend un mot représentatif du cluster pour la comparaison.
+                const representativeId = wordSet.values().next().value;
+                const fp2 = this.syntacticFingerprints.get(representativeId);
+                const sim = this._calculateFingerprintSimilarity(fp1, fp2);
+
+                if (sim > maxSimilarity) {
+                    maxSimilarity = sim;
+                    bestCluster = clusterId;
+                }
+            }
+
+            if (maxSimilarity > SIMILARITY_THRESHOLD) {
+                // Ajoute le mot au cluster le plus proche.
+                this.clusters.get(bestCluster).add(wordId);
+                this.wordToCluster.set(wordId, bestCluster);
+            } else {
+                // Crée un nouveau cluster pour ce mot.
+                const newClusterId = this.nextClusterId++;
+                this.clusters.set(newClusterId, new Set([wordId]));
+                this.wordToCluster.set(wordId, newClusterId);
+            }
+        }
+    }
+
+    /** NOUVEAU: Apprend les transitions entre clusters. */
+    _learnClusterGrammar(wordIds) {
+        if (wordIds.length < 3) return;
+
+        for (let i = 2; i < wordIds.length; i++) {
+            const c1 = this.wordToCluster.get(wordIds[i - 2]);
+            const c2 = this.wordToCluster.get(wordIds[i - 1]);
+            const c3 = this.wordToCluster.get(wordIds[i]);
+
+            if (c1 === undefined || c2 === undefined || c3 === undefined) continue;
+
+            const key = `C${c1}|C${c2}`;
+            if (!this.clusterGrammar.has(key)) {
+                this.clusterGrammar.set(key, new Map());
+            }
+            const transitions = this.clusterGrammar.get(key);
+            transitions.set(c3, (transitions.get(c3) || 0) + 1);
+        }
+    }
+
+     /**
      * PRUNING INTELLIGENT (Local)
      * Supprime le bruit et garde les relations les plus saillantes.
      */
@@ -2682,6 +2802,23 @@ export class SemanticRelationalMemory {
                 let grammarScore = grammarWeight / (totalStructuralWeight || 1);
                 // Seuil de "Verbatim" dynamique basé sur la créativité
                 const verbatimThreshold = 0.92 - (creativity * 0.1); // Plus de créativité = seuil plus bas
+                
+                // --- NOUVEAU : SCORE DE COHÉRENCE DE CLUSTER (GRAMMAIRE AGNOSTIQUE) ---
+                let clusterScore = 0;
+                const c3 = this.wordToCluster.get(id);
+                if (c3 !== undefined && activeIds.length >= 2) {
+                    const c1 = this.wordToCluster.get(activeIds[activeIds.length - 2]);
+                    const c2 = this.wordToCluster.get(activeIds[activeIds.length - 1]);
+
+                    if (c1 !== undefined && c2 !== undefined) {
+                        const clusterKey = `C${c1}|C${c2}`;
+                        const transitions = this.clusterGrammar.get(clusterKey);
+                        if (transitions && transitions.has(c3)) {
+                            clusterScore = (transitions.get(c3) || 0) * 0.5; // Poids du score grammatical
+                        }
+                    }
+                }
+
                 const isVerbatim = transitionProb > verbatimThreshold;
 
                 // --- NOUVELLE LOGIQUE : BONUS GRAMMATICAL ---
@@ -2737,7 +2874,7 @@ export class SemanticRelationalMemory {
                 // Le binaire devient le SEUL décideur.
                 const verbatimBoost = transitionProb > 0.8 ? 50.0 : 1.0; // Boost réduit
 
-                let score = (grammarScore + transitionProb * transitionWeight + meaningPower) * contextBoost * verbatimBoost * grammarBoost * flowBias * bridgingBias;
+                let score = (grammarScore + clusterScore + transitionProb * transitionWeight + meaningPower) * contextBoost * verbatimBoost * grammarBoost * flowBias * bridgingBias;
 
                 // Si c'est un hit structurel, c'est presque certainement la fin de phrase voulue
                 if (word === "<eos>") {
@@ -3025,9 +3162,6 @@ export class SemanticRelationalMemory {
 
             const repetitionCount = wordCounts.get(word) || 0;
             if (repetitionCount > 0) score *= isConnector ? 0.5 : Math.pow(0.001, repetitionCount);
-
-            const lastWord = tokens[tokens.length - 1];
-            if (lastWord === word) score *= 0.0001;
 
             candidates.push({ token: word, score });
         }
@@ -6485,13 +6619,17 @@ export class GNeuroMoE {
 
     /**
      * Route le texte vers un expert.
+     * MODIFIÉ : Peut retourner une liste pondérée de tous les domaines pertinents.
      * @param {string} text Le texte à analyser
      * @param {string[]} highImpactTokens Liste de mots (ex: du titre) qui bypassent la maturité
+     * @param {boolean} [returnAll=false] Si vrai, retourne un tableau de {domain, score}.
      */
-    route(text, highImpactTokens = []) {
+    route(text, highImpactTokens = [], returnAll = false) {
         // Changement de {4,} à {2,} pour accepter les mots courts mais porteurs de sens (IA, ADN, EST, etc.)
         const tokens = text.toLowerCase().match(/[a-z0-9àâäéèêëïîôöùûüç]{2,}/g) || [];
-        if (tokens.length === 0) return "general";
+        if (tokens.length === 0) {
+            return returnAll ? [{ domain: "general", score: 1 }] : "general";
+        }
 
         const MATURITY_THRESHOLD = 3; // Réduit pour une spécialisation plus rapide
         const highImpactSet = new Set(highImpactTokens.map(t => t.toLowerCase()));
@@ -6502,7 +6640,7 @@ export class GNeuroMoE {
             localCounts.set(t, (localCounts.get(t) || 0) + 1);
         });
 
-        const candidates = [];
+        const conceptCandidates = [];
         const totalTokens = this.sharedState.totalTokensProcessed || 1;
 
         for (let [token, localCount] of localCounts) {
@@ -6517,48 +6655,66 @@ export class GNeuroMoE {
             // s'il apparaît trop souvent dans le corpus global (> 0.5%).
             // On ignore ces mots pour le routage des experts.
 // On pénalise lourdement les mots-outils (0.05) pour qu'ils ne soient
-            // jamais "le concept de base" si un mot plus rare existe, SAUF si c'est le seul mot du prompt.
-            const isStructural = globalFreq > 0.005;
+            // jamais "le concept de base" si un mot plus rare existe.
+            const isStructural = globalFreq > 0.005 || token.length < 3;
             const weightFactor = (isStructural && tokens.length > 1) ? 0.05 : 1.0;
 
             // Heuristique de Force Conceptuelle (Spécificité) :
             // On cherche le mot qui a la plus forte "densité d'information" :
             // - localCount : il est important dans ce texte précis.
             // - 1 / (globalFreq + epsilon) : il est rare dans la langue globale.
-            if (weightFactor < 1.0) continue; // On ignore les mots structurels si le prompt est plus long
+            if (weightFactor < 1.0 && !highImpactSet.has(token)) continue; // On ignore les mots structurels sauf s'ils sont à haut impact
             // - length / 4 : les mots longs sont souvent des noms propres ou techniques.
             
             // CORRECTIF : Utilisation du Logarithme pour éviter qu'un mot rare 
             // ne domine artificiellement le score de routage (Lissage de spécificité)
-            const specificity = Math.log10(1 / (globalFreq + 0.00001));
+            const specificity = Math.log1p(1 / (globalFreq + 1e-9)); // Utilise log1p pour une meilleure stabilité numérique
             
             // Heuristique de Force : on privilégie la rareté (spécificité) et la longueur
             // On ajoute un log sur la longueur pour ne pas sur-favoriser les mots trop longs
             const score = localCount * specificity * Math.log2(token.length) * impactBoost * weightFactor;
 
-            candidates.push({ token, score });
+            conceptCandidates.push({ token, score });
         }
 
-        if (candidates.length === 0) return "general";
+        if (conceptCandidates.length === 0) {
+            return returnAll ? [{ domain: "general", score: 1 }] : "general";
+        }
 
-        candidates.sort((a, b) => b.score - a.score);
-        
-        const top = candidates[0].token;
-        const id = this.sharedState.vocabulary.get(top);
-        const globalCount = id ? (this.sharedState.wordCounts.get(id) || 0) : 0;
- 
-        // 1. FILTRE DE MATURITÉ (Assoupli)
-        // Si le concept est trop "jeune", on ne l'utilise que s'il est à haut impact (ex: titre)
-        // OU si son score de pertinence pour ce prompt est très élevé (il devient le concept clé).
-        const isHighImpact = highImpactSet.has(top) || candidates[0].score > 5.0;
-        if (!isHighImpact && globalCount < MATURITY_THRESHOLD) return "general";
+        conceptCandidates.sort((a, b) => b.score - a.score);
 
-        // 2. CONSOLIDATION EN VORTEX :
-        // On hache le concept pour le placer dans un des experts disponibles.
-        // Les concepts qui survivent au 'pruning' finiront par dominer leur vortex.
-        let hash = 0;
-        for (let i = 0; i < top.length; i++) hash = ((hash << 5) - hash) + top.charCodeAt(i);
-        return `vortex_${Math.abs(hash) % this.maxVortex}`;
+        if (!returnAll) {
+            // --- COMPORTEMENT ORIGINAL : ROUTAGE UNIQUE ---
+            const top = conceptCandidates[0].token;
+            const id = this.sharedState.vocabulary.get(top);
+            const globalCount = id ? (this.sharedState.wordCounts.get(id) || 0) : 0;
+
+            const isHighImpact = highImpactSet.has(top) || conceptCandidates[0].score > 5.0;
+            if (!isHighImpact && globalCount < MATURITY_THRESHOLD) return "general";
+
+            let hash = 0;
+            for (let i = 0; i < top.length; i++) hash = ((hash << 5) - hash) + top.charCodeAt(i);
+            return `vortex_${Math.abs(hash) % this.maxVortex}`;
+        }
+
+        // --- NOUVEAU COMPORTEMENT : ROUTAGE PONDÉRÉ (ENSEMBLE) ---
+        const domainScores = new Map();
+        for (const { token, score } of conceptCandidates) {
+            let hash = 0;
+            for (let i = 0; i < token.length; i++) hash = ((hash << 5) - hash) + token.charCodeAt(i);
+            const domain = `vortex_${Math.abs(hash) % this.maxVortex}`;
+            domainScores.set(domain, (domainScores.get(domain) || 0) + score);
+        }
+
+        // Ajout d'un score de base pour l'expert 'general' pour qu'il participe toujours un peu
+        domainScores.set('general', (domainScores.get('general') || 0) + 1.0);
+
+        const totalScore = Array.from(domainScores.values()).reduce((a, b) => a + b, 0);
+        if (totalScore === 0) return [{ domain: "general", score: 1 }];
+
+        return Array.from(domainScores.entries())
+            .map(([domain, score]) => ({ domain, score: score / totalScore }))
+            .sort((a, b) => b.score - a.score);
     }
 
 
