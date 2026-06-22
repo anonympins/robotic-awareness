@@ -2677,6 +2677,11 @@ export class SemanticRelationalMemory {
         let lastWasConnector = this.isStructural(lastId);
         let lastWasPunctuation = ['.', ',', ';', '!', '?'].includes(lastWord);
         
+        // --- NOUVEAU : Vecteur de Discours Évolutif ---
+        // Représente le "sujet" de la conversation, mis à jour à chaque fin de phrase.
+        // C'est une Map<ID, Poids> qui accumule l'énergie sémantique.
+        let discourseVector = new Map(queryIds.map(id => [id, 1.0]));
+
         let sentencesGenerated = 0;
 
         // 'depth' devient maintenant une limite de sécurité (budget maximum).
@@ -2763,11 +2768,20 @@ export class SemanticRelationalMemory {
                             // On cumule l'énergie sémantique entre le concept posé et le candidat
                             semanticResonance += relations.get(id);
                         }
+                // --- NOUVEAU : Influence du Vecteur de Discours ---
+                // On vérifie si le mot candidat est lié au sujet de la phrase/paragraphe en cours.
+                const discourseWeight = discourseVector.get(qId) || 0;
+                if (discourseWeight > 0 && relations && relations.has(id)) {
+                    // Le poids est plus fort car il représente la cohérence à moyen terme.
+                    semanticResonance += relations.get(id) * discourseWeight * 2.0;
+                }
                     });
 
                     // Résonance de la fenêtre contextuelle (Auto-cohérence)
                     // Cela force le modèle à rester dans le même "article" Wikipedia
                     activeIds.forEach(aId => {
+                // On ajoute aussi les mots du contexte immédiat au vecteur de discours pour une transition douce.
+                discourseVector.set(aId, (discourseVector.get(aId) || 0) + 0.5);
                         const relations = attLayer.correlationMatrix.get(aId);
                         if (relations && relations.has(id)) {
                             // On donne un poids fort à la continuité immédiate
@@ -2776,7 +2790,7 @@ export class SemanticRelationalMemory {
                     });
 
                     // Normalisation pondérée
-                    semanticResonance = semanticResonance / (queryIds.length + activeIds.length || 1);
+            semanticResonance = semanticResonance / (queryIds.length + activeIds.length + discourseVector.size || 1);
                 }
 
                 // 1. Probabilité de Transition Bitwise (Mémoire Verbatim)
@@ -2994,6 +3008,17 @@ export class SemanticRelationalMemory {
             if (isTerminal) {
                 sentencesGenerated++;
                 if (sentencesGenerated >= targetSentences) break;
+
+                // --- NOUVEAU : Mise à jour du Vecteur de Discours ---
+                // On "oublie" un peu les anciens concepts (dégradation)
+                for (const [dId, dWeight] of discourseVector.entries()) {
+                    const newWeight = dWeight * 0.7; // Le sujet s'estompe de 30%
+                    if (newWeight < 0.1) discourseVector.delete(dId);
+                    else discourseVector.set(dId, newWeight);
+                }
+                // Et on injecte les concepts de la phrase qui vient de se terminer.
+                const sentenceConcepts = generatedIds.slice(-15).filter(id => !this.isStructural(id));
+                sentenceConcepts.forEach(cId => discourseVector.set(cId, (discourseVector.get(cId) || 0) + 1.0));
             }
 
             lastId = selected.id;
@@ -3034,19 +3059,19 @@ export class SemanticRelationalMemory {
      * @returns {Array<{token: string, score: number}>} - Une liste de candidats.
      */
     predictNextCandidates(text, options = {}) {
-        const tokens = text.match(this.tokenizer) || [];
+        const tokens = text.toLowerCase().match(this.tokenizer) || [];
         this.bitEngine.resetContext();
 
         let activeIds = [];
         const queryIds = tokens.map(t => this.vocabulary.get(t) || 0).filter(id => id > 0);
         const identityIds = []; // Pourrait être passé en option si nécessaire
 
-        // Préchauffage avec le sens de l'amorce
+        // Préchauffage du contexte binaire avec l'amorce
         for (const token of tokens) {
             const id = this.vocabulary.get(token) || 1; // 1 = <unk>
             if (id > 1) {
                 activeIds.push(id);
-                if (activeIds.length > 2) activeIds.shift();
+                if (activeIds.length > 2) activeIds.shift(); // On ne garde que les 2 derniers mots pour le contexte trigramme
             }
             this._shiftId(id);
         }
@@ -3056,6 +3081,9 @@ export class SemanticRelationalMemory {
         const topK = options.topK || 10; // On utilise un topK plus grand pour l'ensemble
         const coreBrain = options.coreBrain;
 
+        // --- NOUVELLE LOGIQUE DE VERROUILLAGE GRAMMATICAL EN 2 PASSES ---
+
+        // 1. Détermination du contexte grammatical (Trigramme > Bigramme)
         const subId = this._routeSubExpert(tokens);
         const subGrammar = this.subExperts.get(subId);
 
@@ -3067,9 +3095,26 @@ export class SemanticRelationalMemory {
 
         const trigramContext = this.grammarMap.get(trigramKey);
         const subTrigramContext = subGrammar ? subGrammar.get(trigramKey) : null;
-        const bigramContext = this.grammarMap.get(bigramKey);
 
         const hasTrigramOptions = trigramContext && trigramContext.size > 0;
+
+        // --- PASSE 1 : VERROUILLAGE TRIGRAMME (SI APPLICABLE) ---
+        // Si un trigramme existe, on ne considère QUE les candidats de ce trigramme.
+        if (hasTrigramOptions) {
+            const trigramCandidates = [];
+            for (const [id, weight] of trigramContext) {
+                const word = this.reverseVocab.get(id);
+                if (word) {
+                    // Le score est simplement le poids de la transition, pour le tri.
+                    trigramCandidates.push({ token: word, score: weight });
+                }
+            }
+            // On trie et on retourne directement, en ignorant toute autre logique.
+            return trigramCandidates.sort((a, b) => b.score - a.score).slice(0, topK);
+        }
+
+        // --- PASSE 2 : INFERENCE COMPLÈTE (SI AUCUN TRIGRAMME TROUVÉ) ---
+        const bigramContext = this.grammarMap.get(bigramKey);
         const hasBigramOptions = bigramContext && bigramContext.size > 0;
         const structureReconnue = hasTrigramOptions || hasBigramOptions;
 
@@ -3106,6 +3151,8 @@ export class SemanticRelationalMemory {
             const isConnector = this.isStructural(id);
             const isStarter = this.grammarMap.get(2)?.has(id);
 
+            // --- Note : La logique de score ci-dessous n'est exécutée que si aucun trigramme n'a été trouvé. ---
+
             let semanticResonance = 0;
             if (attLayer) {
                 queryIds.forEach(qId => {
@@ -3125,24 +3172,14 @@ export class SemanticRelationalMemory {
             let transitionWeight = 4.0 + ((1.0 - creativity) * 6.0);
             if (!structureReconnue) transitionWeight *= 2.5;
 
-            let grammarWeight = 0;
             let totalStructuralWeight = 1;
             let isStructureHit = false;
-
             // --- NOUVEAU : Bonus de cohérence structurelle ---
             // On utilise des scores additifs pour la stabilité.
             let structuralScore = 0;
 
-            if (hasTrigramOptions && trigramContext.has(id)) {
-                let weight = trigramContext.get(id);
-                let boost = 1.0;
-                if (subTrigramContext && subTrigramContext.has(id)) {
-                    boost = 3.0;
-                }
-                totalStructuralWeight = Array.from(trigramContext.values()).reduce((a, b) => a + b, 1);
-                structuralScore = (weight * boost / totalStructuralWeight) * 25.0; // Poids très fort pour les trigrammes
-                isStructureHit = true;
-            } else if (hasBigramOptions && bigramContext.has(id)) {
+            // Le cas du trigramme est géré au-dessus, ici on ne traite que le bigramme.
+            if (hasBigramOptions && bigramContext.has(id)) {
                 let weight = bigramContext.get(id);
                 totalStructuralWeight = Array.from(bigramContext.values()).reduce((a, b) => a + b, 1);
                 structuralScore = (weight / totalStructuralWeight) * 12.0; // Poids fort pour les bigrammes

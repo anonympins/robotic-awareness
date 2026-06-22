@@ -288,23 +288,48 @@ async function predictWithEnsemble(prompt, depth, options) {
         // --- CORRECTIF : Le tri et l'affichage se font APRÈS l'application des pénalités ---
         const sortedAndPenalized = [...mergedCandidates.entries()].sort((a, b) => b[1] - a[1]);
         console.log(`\x1b[1;34m  > Fusion finale (après pénalités): ${sortedAndPenalized.slice(0, 10).map(([t, s]) => `${t}(${s.toFixed(3)})`).join(', ')} ...\x1b[0m`);
-
-        // 3. Le mot final est choisi par un tirage au sort pondéré parmi les candidats fusionnés.
-        const totalScore = sortedAndPenalized.reduce((sum, [, score]) => sum + score, 0);
-        let randomChoice = Math.random() * totalScore;
         let chosenToken = null;
 
-        for (const [token, score] of sortedAndPenalized) {
-            randomChoice -= score;
-            if (randomChoice <= 0) {
-                chosenToken = token;
-                break;
-            }
-        }
-        
-        // Fallback si quelque chose se passe mal avec le tirage
-        if (!chosenToken && sortedAndPenalized.length > 0) {
+        // --- NOUVELLE LOGIQUE DE SÉLECTION : DÉTERMINISME vs CRÉATIVITÉ ---
+        if (creativity === 0 && sortedAndPenalized.length > 0) {
+            // En mode créativité zéro, on force la sélection du meilleur candidat.
+            // C'est la garantie de suivre l'expression apprise si elle est la plus probable.
+            console.log(`\x1b[2m  > Mode créativité 0: Sélection déterministe du top 1.\x1b[0m`);
             chosenToken = sortedAndPenalized[0][0];
+
+            // --- VÉRIFICATION DE COHÉRENCE FORTE ---
+            // Si le top 1 est un mot structurel faible et qu'un mot de contenu fort est juste derrière,
+            // on peut exceptionnellement prendre le second pour éviter une fin de phrase prématurée ou un connecteur faible.
+            if (sortedAndPenalized.length > 1) {
+                const top1Token = sortedAndPenalized[0][0];
+                const top2Token = sortedAndPenalized[1][0];
+                const top1IsWeak = coreBrain ? coreBrain.isStructural(top1Token) : false;
+                const top2IsStrong = coreBrain ? !coreBrain.isStructural(top2Token) : true;
+
+                // Si le top 1 est un connecteur et le top 2 un mot de contenu, et que leurs scores sont très proches,
+                // on privilégie le mot de contenu pour enrichir la phrase.
+                if (top1IsWeak && top2IsStrong && (sortedAndPenalized[0][1] / sortedAndPenalized[1][1] < 1.2)) {
+                    console.log(`\x1b[2m  > Correction déterministe: Le top 1 ('${top1Token}') est faible, sélection du top 2 ('${top2Token}') plus fort.\x1b[0m`);
+                    chosenToken = top2Token;
+                }
+            }
+
+        } else {
+            // 3. Le mot final est choisi par un tirage au sort pondéré (roulette) parmi les candidats fusionnés.
+            const totalScore = sortedAndPenalized.reduce((sum, [, score]) => sum + score, 0);
+            let randomChoice = Math.random() * totalScore;
+
+            for (const [token, score] of sortedAndPenalized) {
+                randomChoice -= score;
+                if (randomChoice <= 0) {
+                    chosenToken = token;
+                    break;
+                }
+            }
+            // Fallback si quelque chose se passe mal avec le tirage
+            if (!chosenToken && sortedAndPenalized.length > 0) {
+                chosenToken = sortedAndPenalized[0][0];
+            }
         }
 
         if (!chosenToken) {
