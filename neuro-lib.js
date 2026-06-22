@@ -1573,19 +1573,19 @@ export class SyntaxAnalyzer {
                 const wordC = this.brain.reverseVocab.get(bestTarget);
 
                 // --- FILTRAGE DE PERTINENCE ---
-                const isAStruct = this.brain.isStructural(idA);
-                const isBStruct = this.brain.isStructural(idB);
-                const isCStruct = this.brain.isStructural(bestTarget);
+                // CORRECTIF : On considère <eos> (id:2) comme structurel par définition.
+                const isAStruct = idA === 2 || this.brain.isStructural(idA);
+                const isBStruct = idB === 2 || this.brain.isStructural(idB);
+                const isCStruct = bestTarget === 2 || this.brain.isStructural(bestTarget);
 
                 // Si les 3 mots sont des "mots-outils" (le, de, et, ou...), 
                 // la règle est grammaticalement correcte mais conceptuellement pauvre.
                 if (isAStruct && isBStruct && isCStruct) continue;
 
-                // Catégorisation simplifiée
-                let type = "SEQUENCE";
+                // Catégorisation améliorée
+                let type = "CONCEPT_CHAIN"; // Par défaut, on suppose une chaîne de concepts
                 if (idA === 2) type = "PHRASE_START"; // <eos> est l'ID 2
                 else if (isAStruct && !isBStruct) type = "CONSTRUCT";
-                else if (!isAStruct && !isBStruct) type = "CONCEPT_CHAIN";
 
                 signatures.push({
                     pattern: [wordA, wordB, wordC],
@@ -2267,69 +2267,110 @@ export class SemanticRelationalMemory {
     }
 
     /** NOUVEAU: Met à jour l'empreinte syntaxique d'un mot. */
-    _updateFingerprint(wordId, type, contextId, weight) {
+    _updateFingerprint(wordId, type, contextId, weight, useClusterContext = false) {
         if (!this.syntacticFingerprints.has(wordId)) {
             this.syntacticFingerprints.set(wordId, { pre: new Map(), post: new Map() });
         }
         const fingerprint = this.syntacticFingerprints.get(wordId);
         const map = fingerprint[type];
-        map.set(contextId, (map.get(contextId) || 0) + weight);
+        const key = useClusterContext ? (this.wordToCluster.get(contextId) ?? contextId) : contextId;
+        map.set(key, (map.get(key) || 0) + weight);
     }
 
     /** NOUVEAU: Calcule la similarité entre deux empreintes syntaxiques. */
-    _calculateFingerprintSimilarity(fp1, fp2) {
-        if (!fp1 || !fp2) return 0;
+    _calculateFingerprintSimilarity(fp1, fp2, similarityCache) {
+        if (!fp1 || !fp2) return 0.0;
 
-        const similarity = (map1, map2) => {
-            let dotProduct = 0;
-            let mag1 = 0;
-            let mag2 = 0;
-            const allKeys = new Set([...map1.keys(), ...map2.keys()]);
+        // Fonction pour calculer la similarité des contextes (pre ou post) en utilisant le cache
+        const calculateContextSimilarity = (map1, map2) => {
+            if (map1.size === 0 || map2.size === 0) return 0.0;
 
-            for (const key of allKeys) {
-                const v1 = map1.get(key) || 0;
-                const v2 = map2.get(key) || 0;
-                dotProduct += v1 * v2;
-                mag1 += v1 * v1;
-                mag2 += v2 * v2;
+            let totalSimilarity = 0;
+            let totalWeight = 0;
+
+            // On compare chaque mot du contexte de fp1 avec chaque mot du contexte de fp2
+            for (const [id1, weight1] of map1.entries()) {
+                for (const [id2, weight2] of map2.entries()) {
+                    let sim;
+                    if (id1 === id2) {
+                        sim = 1.0;
+                    } else {
+                        // Sinon, on utilise la similarité déjà calculée (ou 0 si pas encore fait)
+                        const key = id1 < id2 ? `${id1}-${id2}` : `${id2}-${id1}`;
+                        sim = similarityCache.get(key) || 0.0;
+                    }
+                    totalSimilarity += sim * weight1 * weight2;
+                    totalWeight += weight1 * weight2;
+                }
             }
-            if (mag1 === 0 || mag2 === 0) return 0;
-            return dotProduct / (Math.sqrt(mag1) * Math.sqrt(mag2));
+            return totalWeight > 0 ? totalSimilarity / totalWeight : 0.0;
         };
 
-        const preSim = similarity(fp1.pre, fp2.pre);
-        const postSim = similarity(fp1.post, fp2.post);
+        const preSim = calculateContextSimilarity(fp1.pre, fp2.pre);
+        const postSim = calculateContextSimilarity(fp1.post, fp2.post);
 
-        // La similarité est la moyenne des similarités des contextes pré et post.
-        return (preSim + postSim) / 2;
+        // La similarité finale est la moyenne des similarités des contextes avant et après.
+        return (preSim + postSim) / 2.0;
     }
 
     _updateSyntacticClusters() {
-        const SIMILARITY_THRESHOLD = 0.75; // Seuil élevé pour garantir la cohérence des clusters
+        // On utilise un seuil plus bas pour permettre le regroupement sur un petit corpus.
+        // Le seuil est ajusté pour fusionner les clusters sémantiquement purs mais fragmentés.
+        this._performClustering(0.55);
+    }
+
+    /**
+     * NOUVEAU : Exécute une passe de l'algorithme de clustering.
+     * @param {number} similarityThreshold Le seuil de similarité pour regrouper les mots.
+     */
+    _performClustering(similarityThreshold) {
+        // --- NOUVELLE LOGIQUE : Calcul itératif de la similarité ---
         const wordIds = Array.from(this.syntacticFingerprints.keys());
+        const similarityCache = new Map();
+
+        // On itère plusieurs fois pour que la similarité se propage.
+        // Ex: (chat, chien) deviennent similaires, ce qui rend (mange, poursuit) similaires au tour d'après.
+        for (let iter = 0; iter < 3; iter++) {
+            for (let i = 0; i < wordIds.length; i++) {
+                for (let j = i + 1; j < wordIds.length; j++) {
+                    const id1 = wordIds[i];
+                    const id2 = wordIds[j];
+                    const fp1 = this.syntacticFingerprints.get(id1);
+                    const fp2 = this.syntacticFingerprints.get(id2);
+
+                    const sim = this._calculateFingerprintSimilarity(fp1, fp2, similarityCache);
+                    if (sim > 0.1) { // On ne stocke que les similarités non-triviales
+                        const key = id1 < id2 ? `${id1}-${id2}` : `${id2}-${id1}`;
+                        similarityCache.set(key, sim);
+                    }
+                }
+            }
+        }
+
+        this.wordToCluster.clear();
+        this.clusters.clear();
+        this.nextClusterId = 0;
 
         for (const wordId of wordIds) {
             // Si le mot est déjà dans un cluster, on passe.
-            if (this.wordToCluster.has(wordId)) continue;
+            if (this.wordToCluster.has(wordId)) continue; // Déjà clusterisé
 
-            const fp1 = this.syntacticFingerprints.get(wordId);
             let bestCluster = null;
             let maxSimilarity = -1;
 
             // Cherche le cluster existant le plus similaire.
             for (const [clusterId, wordSet] of this.clusters) {
-                // On prend un mot représentatif du cluster pour la comparaison.
                 const representativeId = wordSet.values().next().value;
-                const fp2 = this.syntacticFingerprints.get(representativeId);
-                const sim = this._calculateFingerprintSimilarity(fp1, fp2);
+                const key = wordId < representativeId ? `${wordId}-${representativeId}` : `${representativeId}-${wordId}`;
+                const sim = similarityCache.get(key) || 0;
 
-                if (sim > maxSimilarity) {
+                if (sim > maxSimilarity) { // On cherche le cluster le plus proche
                     maxSimilarity = sim;
                     bestCluster = clusterId;
                 }
             }
 
-            if (maxSimilarity > SIMILARITY_THRESHOLD) {
+            if (maxSimilarity > similarityThreshold) {
                 // Ajoute le mot au cluster le plus proche.
                 this.clusters.get(bestCluster).add(wordId);
                 this.wordToCluster.set(wordId, bestCluster);

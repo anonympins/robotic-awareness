@@ -518,3 +518,72 @@ testGrammaire("L' humain", 0.2); // Fidèle : "surveille le secteur ."
 testGrammaire("L' humain", 0.9); // Très créatif : "observe le maillage ." (mélange de concepts)
 
 console.log(`\nTaille du Vocabulaire : ${semanticBrain.vocabulary.size} concepts uniques.`);
+
+// ============================================================
+// TEST AVANCÉ : ANALYSE SYNTAXIQUE ET CLUSTERING SÉMANTIQUE
+// ============================================================
+
+console.log("\n\n=== Test Avancé : Analyse de la Compréhension Structurelle ===");
+
+// 1. Création d'un cerveau dédié à l'analyse
+const structuralBrain = new SemanticRelationalMemory(16);
+
+// 2. Corpus structuré avec des rôles grammaticaux clairs
+const structuralCorpus = [
+    "le chat mange la souris .",
+    "le chien poursuit le chat .",
+    "l' oiseau chante une chanson .",
+    "le programmeur code une application .",
+    "la machine apprend la grammaire .",
+    "un chien aboie ."
+];
+
+console.log("\n[1/3] Entraînement sur un corpus grammaticalement structuré...");
+// On entraîne plusieurs fois pour renforcer les liens
+for (let i = 0; i < 50; i++) {
+    structuralCorpus.forEach(phrase => structuralBrain.learnSense(phrase, true, 1));
+}
+console.log("Entraînement terminé.");
+
+// 3. Forcer l'analyse des clusters syntaxiques
+console.log("\n[2/3] Lancement du clustering syntaxique non-supervisé...");
+structuralBrain._updateSyntacticClusters(); // Appel manuel pour le test
+
+// Affichage des clusters formés
+if (structuralBrain.clusters.size > 0) {
+    console.log(`  > ${structuralBrain.clusters.size} clusters syntaxiques identifiés :`);
+    for (const [clusterId, wordSet] of structuralBrain.clusters.entries()) {
+        // On ne montre que les clusters avec plus d'un mot pour la pertinence
+        if (wordSet.size > 1) {
+            const words = Array.from(wordSet).map(id => structuralBrain.reverseVocab.get(id));
+            console.log(`    - Cluster ${clusterId}: { ${words.join(', ')} }`);
+        }
+    }
+} else {
+    console.log("  > Pas assez de données pour former des clusters significatifs.");
+}
+
+// 4. Extraire les "lois" apprises avec SyntaxAnalyzer
+console.log("\n[3/3] Extraction des signatures génératives (règles de grammaire apprises)...");
+
+import { SyntaxAnalyzer } from "./neuro-lib.js"; // Importation de l'analyseur
+const analyzer = new SyntaxAnalyzer(structuralBrain);
+
+const signatures = analyzer.extractGenerativeSignatures();
+
+if (signatures.length > 0) {
+    console.log(`  > Top 10 des règles les plus fortes apprises par le réseau :`);
+    signatures.slice(0, 10).forEach(sig => {
+        // On remplace l'ID de début de phrase par un tag plus lisible
+        const pattern = sig.pattern.map(p => p === '<eos>' ? '[DÉBUT]' : p).join(' ');
+        const certainty = (sig.certainty * 100).toFixed(0);
+        console.log(`    - [${sig.type.padEnd(13)}] "${pattern}" (Certitude: ${certainty}%, Force: ${sig.strength})`);
+    });
+} else {
+    console.log("  > Aucune signature grammaticale assez forte n'a pu être extraite.");
+}
+
+console.log("\n--- Interprétation des résultats ---");
+console.log("  - Les clusters devraient regrouper des mots de même nature (ex: 'mange', 'poursuit', 'chante'...).");
+console.log("  - Les signatures 'PHRASE_START' montrent comment le cerveau a appris à commencer une phrase.");
+console.log("  - Les signatures 'CONCEPT_CHAIN' révèlent des associations fortes entre concepts (ex: 'le chat mange').");
