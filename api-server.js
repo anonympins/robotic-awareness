@@ -289,7 +289,7 @@ async function predictWithEnsemble(prompt, depth, options) {
         }
 
         // --- CORRECTIF : Le tri et l'affichage se font APRÈS l'application des pénalités ---
-        const sortedAndPenalized = [...mergedCandidates.entries()].sort((a, b) => b[1] - a[1]);
+        let sortedAndPenalized = [...mergedCandidates.entries()].sort((a, b) => b[1] - a[1]);
         console.log(`\x1b[1;34m  > Fusion finale (après pénalités): ${sortedAndPenalized.slice(0, 10).map(([t, s]) => `${t}(${s.toFixed(3)})`).join(', ')} ...\x1b[0m`);
         let chosenToken = null;
 

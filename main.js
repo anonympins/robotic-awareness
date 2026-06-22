@@ -566,7 +566,7 @@ if (structuralBrain.clusters.size > 0) {
 // 4. Extraire les "lois" apprises avec SyntaxAnalyzer
 console.log("\n[3/3] Extraction des signatures génératives (règles de grammaire apprises)...");
 
-import { SyntaxAnalyzer } from "./neuro-lib.js"; // Importation de l'analyseur
+import { SyntaxAnalyzer } from "./neuro-lib.js";
 const analyzer = new SyntaxAnalyzer(structuralBrain);
 
 const signatures = analyzer.extractGenerativeSignatures();
@@ -587,3 +587,49 @@ console.log("\n--- Interprétation des résultats ---");
 console.log("  - Les clusters devraient regrouper des mots de même nature (ex: 'mange', 'poursuit', 'chante'...).");
 console.log("  - Les signatures 'PHRASE_START' montrent comment le cerveau a appris à commencer une phrase.");
 console.log("  - Les signatures 'CONCEPT_CHAIN' révèlent des associations fortes entre concepts (ex: 'le chat mange').");
+
+
+// ============================================================
+// TEST FINAL : APPRENTISSAGE DE SCHÉMA SYNTAXIQUE (ne...pas)
+// ============================================================
+
+console.log("\n\n=== Test Final : Apprentissage et Application de Schéma Grammatical ===");
+
+const grammarBrain = new SemanticRelationalMemory(16);
+
+// 1. Apprentissage de base (sujet, verbe, etc.)
+const baseGrammarCorpus = [
+    "le robot analyse",
+    "le système fonctionne",
+    "il observe",
+];
+console.log("\n[1/3] Apprentissage du vocabulaire de base (verbes, sujets)...");
+for (let i = 0; i < 50; i++) {
+    baseGrammarCorpus.forEach(phrase => grammarBrain.learnSense(phrase, true, 1));
+}
+
+// 2. Apprentissage explicite du schéma de négation
+console.log("\n[2/3] Apprentissage explicite du schéma de négation 'ne [VERBE] pas'...");
+// On définit "analyse", "fonctionne", "observe" comme des verbes en les clusterisant.
+grammarBrain._updateSyntacticClusters(); // Force le clustering
+
+// NOUVELLE FAÇON : On ne nomme plus la classe "VERB", on la désigne par un exemple.
+// Le système trouvera le cluster contenant "fonctionne" et l'utilisera.
+grammarBrain.learnSyntacticSchema.bind(grammarBrain)(["ne", { byExample: "fonctionne" }, "pas"]);
+
+// 3. Test de génération
+console.log("\n[3/3] Test de génération avec le schéma de négation...");
+
+const negationTest = (amorce, niveauCreativite) => {
+    const generation = grammarBrain.predictSense(amorce, 5, {
+        creativity: niveauCreativite,
+        topK: 5 // Ajout pour la robustesse de la sélection
+    });
+    console.log(`[Créativité: ${niveauCreativite}] Amorce: "${amorce}" -> Sortie: "${amorce} ${generation}"`);
+};
+
+// On donne "ne" comme amorce. Le cerveau devrait activer le schéma,
+// chercher un verbe, puis ajouter "pas".
+console.log("\n--- Test de génération avec 'ne' ---");
+negationTest("il ne", 0.01); // Devrait produire "il ne fonctionne pas" ou "il ne analyse pas"
+negationTest("le robot ne", 0.01);
