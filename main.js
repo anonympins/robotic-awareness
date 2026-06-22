@@ -615,7 +615,7 @@ grammarBrain._updateSyntacticClusters(); // Force le clustering
 
 // NOUVELLE FAÇON : On ne nomme plus la classe "VERB", on la désigne par un exemple.
 // Le système trouvera le cluster contenant "fonctionne" et l'utilisera.
-grammarBrain.learnSyntacticSchema.bind(grammarBrain)(["ne", { byExample: "fonctionne" }, "pas"]);
+grammarBrain.learnSyntacticSchema(["ne", { byExample: "fonctionne" }, "pas"]);
 
 // 3. Test de génération
 console.log("\n[3/3] Test de génération avec le schéma de négation...");
@@ -633,3 +633,44 @@ const negationTest = (amorce, niveauCreativite) => {
 console.log("\n--- Test de génération avec 'ne' ---");
 negationTest("il ne", 0.01); // Devrait produire "il ne fonctionne pas" ou "il ne analyse pas"
 negationTest("le robot ne", 0.01);
+
+
+// ============================================================
+// TEST AVANCÉ : SCHÉMA RÉCURSIF (PENSÉE IMBRIQUÉE)
+// ============================================================
+
+console.log("\n\n=== Test Final : Apprentissage et Application de Schéma Récursif ===");
+
+const recursiveBrain = new SemanticRelationalMemory(16);
+
+// 1. Apprentissage d'un vocabulaire de base pour la sous-phrase
+const recursiveCorpus = [
+    "le monde est complexe",
+    "le système apprend vite",
+    "la conscience émerge",
+];
+console.log("\n[1/3] Apprentissage du vocabulaire pour la génération interne...");
+for (let i = 0; i < 100; i++) { // Entraînement plus intensif
+    recursiveCorpus.forEach(phrase => recursiveBrain.learnSense(phrase, true, 1));
+}
+
+// 2. Apprentissage explicite du schéma récursif
+console.log("\n[2/3] Apprentissage du schéma récursif 'penser ( [générer] )'...");
+recursiveBrain.learnSyntacticSchema([
+    "penser",
+    {
+        WRAP: {
+            start: "(",
+            content: { generate_phrase: true }, // Instruction de récursivité
+            end: ")"
+        }
+    }
+]);
+
+// 3. Test de génération
+console.log("\n[3/3] Test de génération avec le schéma récursif...");
+const recursiveAmorce = "il faut penser";
+const recursiveGeneration = recursiveBrain.predictSense(recursiveAmorce, 10, { creativity: 0.2 });
+console.log(`Amorce: "${recursiveAmorce}" -> Sortie: "${recursiveAmorce} ${recursiveGeneration}"`);
+console.log("\n--- Interprétation ---");
+console.log("La sortie devrait être une phrase complète et cohérente entre parenthèses, démontrant que le cerveau a bien activé le schéma, lancé une sous-génération, puis fermé la structure.");
