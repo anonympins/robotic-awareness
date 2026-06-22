@@ -1836,9 +1836,10 @@ export class SemanticRelationalMemory {
         buffers.push(grammarHead);
 
         for (let [key, targets] of this.grammarMap) {
-            const isString = typeof key === 'string';
             const isBigInt = typeof key === 'bigint';
-            const type = isString ? 1 : (isBigInt ? 2 : 0); // 0: Number, 1: String, 2: BigInt
+            // NOUVEAU : On traite les BigInt comme des chaînes pour gérer les clés > 64 bits (quadgrammes)
+            const isString = typeof key === 'string' || isBigInt;
+            const type = isString ? 1 : 0; // 0: Number, 1: String
             
             if (type === 0) { // Number
                 const b = Buffer.alloc(1 + 4 + 4); // type + key + target_count
@@ -1846,14 +1847,10 @@ export class SemanticRelationalMemory {
                 b.writeUInt32LE(Number(key), 1);
                 b.writeUInt32LE(targets.size, 5);
                 buffers.push(b);
-            } else if (type === 2) { // BigInt
-                const b = Buffer.alloc(1 + 8 + 4); // type + key + target_count
-                b.writeUInt8(type, 0);
-                b.writeBigUInt64LE(key, 1);
-                b.writeUInt32LE(targets.size, 9);
-                buffers.push(b);
             } else { // String
-                const kBuf = Buffer.from(key, 'utf8');
+                // Si c'est un BigInt, on le convertit en chaîne de caractères.
+                const keyAsString = isBigInt ? key.toString() : key;
+                const kBuf = Buffer.from(keyAsString, 'utf8');
                 const b = Buffer.alloc(1 + 2 + kBuf.length + 4); // type + len + str + target_count
                 b.writeUInt8(type, 0);
                 b.writeUInt16LE(kBuf.length, 1);
@@ -1995,10 +1992,6 @@ export class SemanticRelationalMemory {
                 if (!safeRead(4)) {break; }
                 key = raw.readUInt32LE(offset);
                 offset += 4;
-            } else if (type === 2) { // BigInt
-                if (!safeRead(8)) { break; }
-                key = raw.readBigUInt64LE(offset);
-                offset += 8;
             } else { // String
                 if (!safeRead(2)) { break; }
                 const sLen = raw.readUInt16LE(offset);
@@ -2006,6 +1999,11 @@ export class SemanticRelationalMemory {
                 if (!safeRead(sLen)) { break; }
                 key = raw.toString('utf8', offset, offset + sLen);
                 offset += sLen;
+                // NOUVEAU : Si la chaîne est un nombre, on la reconvertit en BigInt
+                // pour restaurer les clés de trigrammes/quadgrammes.
+                if (!isNaN(key)) {
+                    key = BigInt(key);
+                }
             }
 
             if (!safeRead(4)) {
