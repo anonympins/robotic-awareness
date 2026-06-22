@@ -2941,49 +2941,45 @@ export class SemanticRelationalMemory {
 
             candidates.sort((a, b) => b.score - a.score);
 
-            // --- DÉTECTION DE FIN DE COHÉRENCE ---
-            // On calcule la confiance relative du meilleur candidat
-            const topScore = candidates.length > 0 ? candidates[0].score : 0;
-            rollingConfidence = (rollingConfidence * 0.9) + (Math.min(1.0, topScore) * 0.1);
+            let selected = null;
 
-            // Si la confiance chute trop bas ou si le score est dérisoire, on arrête
-            if (topScore < 1e-25 || (i > 5 && rollingConfidence < 0.001)) {
-                break; 
-            }
-            
-            // En mode déterministe (créativité basse), on force le Top 1
-            let selectionLimit = creativity < 0.05 ? 1 : topK;
-            let topKCandidates = candidates.slice(0, selectionLimit);
+            // --- NOUVEAU : CHOIX LUCIDE vs. CRÉATIF ---
+            // Si le meilleur candidat est beaucoup plus probable que le second, on le choisit directement.
+            // Cela renforce le déterminisme quand la grammaire ou la sémantique est très forte.
+            const topCandidate = candidates[0];
+            const secondCandidate = candidates.length > 1 ? candidates[1] : null;
+            const certaintyThreshold = 5.0; // Le top 1 doit être 5x plus probable que le top 2
 
-            if (generatedIds.length < 2) {
-                topKCandidates.forEach(c => {
-                    if (['.', '!', '?'].includes(c.word)) {
-                        c.score *= 0.0001;
-                    }
-                });
-            }
+            if (secondCandidate && (topCandidate.score / (secondCandidate.score + 1e-9)) > certaintyThreshold) {
+                selected = topCandidate;
+            } else {
+                // --- Phase de choix créatif (si incertitude) ---
+                let topKCandidates = candidates.slice(0, topK);
 
-            // Normalisation des Top-K avec la température (créativité)
-            // La température est maintenant un exposant qui aplatit la distribution.
-            // Une créativité de 0 donne une température de 1 (pas de changement).
-            // Une créativité de 1 donne une température de 0.1 (distribution très plate).
-            const temperature = 1.0 - (creativity * 0.9);
+                if (generatedIds.length < 2) {
+                    topKCandidates.forEach(c => {
+                        if (['.', '!', '?'].includes(c.word)) {
+                            c.score *= 0.0001;
+                        }
+                    });
+                }
 
-            let adjustedCandidates = topKCandidates.map(c => ({
-                ...c,
-                // On utilise Math.pow sur le score normalisé pour éviter les nombres astronomiques
-                prob: Math.pow(c.score, temperature)
-            }));
-            
-            // Recalcul de la somme des probabilités ajustées (Crucial pour la Roulette)
-            let totalScore = adjustedCandidates.reduce((acc, c) => acc + c.prob, 0);
-            if (totalScore <= 0 || isNaN(totalScore)) break;
+                // Normalisation des Top-K avec la température (créativité)
+                const temperature = 1.0 - (creativity * 0.9);
+                let adjustedCandidates = topKCandidates.map(c => ({
+                    ...c,
+                    prob: Math.pow(c.score, temperature)
+                }));
 
-            let pick = Math.random() * totalScore;
-            let selected = adjustedCandidates[0];
-            for (const cand of adjustedCandidates) {
-                pick -= cand.prob;
-                if (pick <= 0) { selected = cand; break; }
+                let totalScore = adjustedCandidates.reduce((acc, c) => acc + c.prob, 0);
+                if (totalScore <= 0 || isNaN(totalScore)) break;
+
+                let pick = Math.random() * totalScore;
+                selected = adjustedCandidates[0]; // Fallback
+                for (const cand of adjustedCandidates) {
+                    pick -= cand.prob;
+                    if (pick <= 0) { selected = cand; break; }
+                }
             }
 
             const word = selected.word;
@@ -3081,8 +3077,6 @@ export class SemanticRelationalMemory {
         const topK = options.topK || 10; // On utilise un topK plus grand pour l'ensemble
         const coreBrain = options.coreBrain;
 
-        // --- NOUVELLE LOGIQUE DE VERROUILLAGE GRAMMATICAL EN 2 PASSES ---
-
         // 1. Détermination du contexte grammatical (Trigramme > Bigramme)
         const subId = this._routeSubExpert(tokens);
         const subGrammar = this.subExperts.get(subId);
@@ -3091,29 +3085,13 @@ export class SemanticRelationalMemory {
         if (activeIds.length >= 2) {
             trigramKey = (BigInt(activeIds[activeIds.length - 2]) << 32n) | BigInt(activeIds[activeIds.length - 1]);
         }
+
         const bigramKey = activeIds.length > 0 ? activeIds[activeIds.length - 1] : 2;
 
         const trigramContext = this.grammarMap.get(trigramKey);
         const subTrigramContext = subGrammar ? subGrammar.get(trigramKey) : null;
-
         const hasTrigramOptions = trigramContext && trigramContext.size > 0;
 
-        // --- PASSE 1 : VERROUILLAGE TRIGRAMME (SI APPLICABLE) ---
-        // Si un trigramme existe, on ne considère QUE les candidats de ce trigramme.
-        if (hasTrigramOptions) {
-            const trigramCandidates = [];
-            for (const [id, weight] of trigramContext) {
-                const word = this.reverseVocab.get(id);
-                if (word) {
-                    // Le score est simplement le poids de la transition, pour le tri.
-                    trigramCandidates.push({ token: word, score: weight });
-                }
-            }
-            // On trie et on retourne directement, en ignorant toute autre logique.
-            return trigramCandidates.sort((a, b) => b.score - a.score).slice(0, topK);
-        }
-
-        // --- PASSE 2 : INFERENCE COMPLÈTE (SI AUCUN TRIGRAMME TROUVÉ) ---
         const bigramContext = this.grammarMap.get(bigramKey);
         const hasBigramOptions = bigramContext && bigramContext.size > 0;
         const structureReconnue = hasTrigramOptions || hasBigramOptions;
@@ -3141,6 +3119,26 @@ export class SemanticRelationalMemory {
             }
         }
 
+        // --- NOUVEAU : VERROUILLAGE VERBATIM (Restitution Parfaite) ---
+        // Si un ou plusieurs candidats ont une probabilité binaire extrêmement élevée,
+        // on considère que c'est une séquence apprise par cœur. On élimine alors
+        // tous les autres candidats pour forcer la restitution fidèle.
+        const VERBATIM_THRESHOLD = 0.98; // Seuil de certitude binaire
+        let verbatimCandidates = [];
+
+        for (const id of candidateIds) {
+            const prob = this.bitEngine.scoreId(id);
+            if (prob >= VERBATIM_THRESHOLD) {
+                verbatimCandidates.push(id);
+            }
+        }
+
+        // Si on a trouvé des candidats "verbatim", on ne garde que ceux-là.
+        if (verbatimCandidates.length > 0) {
+            candidateIds.clear();
+            verbatimCandidates.forEach(id => candidateIds.add(id));
+        }
+
         const candidates = [];
         const wordCounts = new Map(); // Pour la pénalité de répétition locale à la prédiction
 
@@ -3150,8 +3148,6 @@ export class SemanticRelationalMemory {
 
             const isConnector = this.isStructural(id);
             const isStarter = this.grammarMap.get(2)?.has(id);
-
-            // --- Note : La logique de score ci-dessous n'est exécutée que si aucun trigramme n'a été trouvé. ---
 
             let semanticResonance = 0;
             if (attLayer) {
@@ -3176,10 +3172,16 @@ export class SemanticRelationalMemory {
             let isStructureHit = false;
             // --- NOUVEAU : Bonus de cohérence structurelle ---
             // On utilise des scores additifs pour la stabilité.
-            let structuralScore = 0;
+            let structuralScore = 0.0;
 
-            // Le cas du trigramme est géré au-dessus, ici on ne traite que le bigramme.
-            if (hasBigramOptions && bigramContext.has(id)) {
+            // Priorité forte au trigramme
+            if (hasTrigramOptions && trigramContext.has(id)) {
+                let weight = trigramContext.get(id);
+                totalStructuralWeight = Array.from(trigramContext.values()).reduce((a, b) => a + b, 1);
+                // Bonus massif pour le trigramme
+                structuralScore = (weight / totalStructuralWeight) * 25.0;
+                isStructureHit = true;
+            } else if (hasBigramOptions && bigramContext.has(id)) {
                 let weight = bigramContext.get(id);
                 totalStructuralWeight = Array.from(bigramContext.values()).reduce((a, b) => a + b, 1);
                 structuralScore = (weight / totalStructuralWeight) * 12.0; // Poids fort pour les bigrammes

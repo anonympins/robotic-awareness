@@ -33,7 +33,7 @@ for (const file of expertFiles) {
         expert.importBinary(fs.readFileSync(expertPath));
         expert.hasBeenLoaded = true; // Marque comme chargé pour éviter une relecture
     } catch (e) {
-        console.error(`\x1b[31m  > Échec du chargement pour '${domain}': ${e.message}\x1b[0m`);
+            console.error(`\x1b[31m  > Échec du chargement pour '${domain}': ${e.message}\x1b[0m`);
     }
 }
 console.log("\x1b[2m[MoE] Pré-chargement terminé.\x1b[0m");
@@ -167,8 +167,11 @@ async function predictWithEnsemble(prompt, depth, options) {
         const contextForPrediction = currentText.split(' ').slice(-5).join(' ');
         console.log(`\n\x1b[36m--- Étape ${i + 1}: Prédiction pour "${contextForPrediction}..." ---\x1b[0m`);
 
-        // --- NOUVELLE LOGIQUE : ROUTAGE ACTIF À CHAQUE ÉTAPE ---
-        const mainDomain = i === 0 ? initialDomain : moe.route(contextForPrediction);
+        // --- CORRECTIF : VERROUILLAGE DU DOMAINE ---
+        // En mode de restitution fidèle (creativity: 0), on ne change pas d'expert en cours de route.
+        // On reste sur le domaine qui a compris le prompt initial.
+        // En mode créatif, on peut autoriser le changement pour des réponses plus dynamiques.
+        const mainDomain = creativity > 0.1 ? moe.route(contextForPrediction) : initialDomain;
         const mainExpert = moe.getExpert(mainDomain);
         console.log(`\x1b[2m  > Domaine principal actif: [${mainDomain}]\x1b[0m`);
 
