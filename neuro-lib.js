@@ -2177,6 +2177,7 @@ export class SemanticRelationalMemory {
 
     _ingestTokens(tokens, ids, weight = 1) {
         let prevPrevId = null;
+        let prevPrevPrevId = null; // NOUVEAU : Ajout pour le contexte du quadrigramme
         let prevId = 2; // Initialisation sur <eos> (id:2) pour capturer systématiquement les débuts de phrases
         
         const subId = this._routeSubExpert(tokens);
@@ -2220,6 +2221,18 @@ export class SemanticRelationalMemory {
                     const trigramTransitions = this.grammarMap.get(contextKey);
                     trigramTransitions.set(id, (trigramTransitions.get(id) || 0) + weight);
 
+                    // 3. Enregistrement Quadrigramme (A + B + C -> D)
+                    if (prevPrevPrevId !== null) {
+                        // On utilise un BigInt de 96 bits pour la clé
+                        const quadgramKey = (BigInt(prevPrevPrevId) << 64n) | (BigInt(prevPrevId) << 32n) | BigInt(prevId);
+                        if (!this.grammarMap.has(quadgramKey)) this.grammarMap.set(quadgramKey, new Map());
+                        const quadgramTransitions = this.grammarMap.get(quadgramKey);
+                        quadgramTransitions.set(id, (quadgramTransitions.get(id) || 0) + weight); // On pourrait donner un poids plus fort
+
+                        // NOUVEAU : Pruning dur et immédiat sur le contexte du quadrigramme
+                        this._pruneQuadgramContext(quadgramKey);
+                    }
+
                     // Enregistrement dans le sous-expert virtualisé
                     if (!subGrammar.has(contextKey)) subGrammar.set(contextKey, new Map());
                     const subTransitions = subGrammar.get(contextKey);
@@ -2228,6 +2241,7 @@ export class SemanticRelationalMemory {
             }
 
             // On injecte l'ID du token (l'unité de sens) dans le moteur de bits
+            prevPrevPrevId = prevPrevId; // Décale les IDs pour la prochaine itération
             prevPrevId = prevId; // Décale les IDs pour la prochaine itération
             this._updateId(id, weight);
             prevId = id; // Le mot actuel devient le mot précédent
@@ -2345,6 +2359,32 @@ export class SemanticRelationalMemory {
             }
             const transitions = this.clusterGrammar.get(key);
             transitions.set(c3, (transitions.get(c3) || 0) + 1);
+        }
+    }
+
+    /**
+     * NOUVEAU : Pruning dur et immédiat pour un contexte de quadrigramme.
+     * Ne conserve que les N transitions les plus fortes pour éviter l'explosion combinatoire.
+     * @param {bigint} quadgramKey La clé du contexte de quadrigramme.
+     */
+    _pruneQuadgramContext(quadgramKey) {
+        const QUADGRAM_TARGET_LIMIT = 5; // Limite très stricte : on ne garde que les 5 meilleures suites.
+
+        const transitions = this.grammarMap.get(quadgramKey);
+        if (!transitions || transitions.size <= QUADGRAM_TARGET_LIMIT) {
+            return; // Pas besoin de nettoyer si on est déjà sous la limite.
+        }
+
+        // 1. Trier les transitions par poids (les plus fortes d'abord)
+        const sorted = Array.from(transitions.entries()).sort((a, b) => b[1] - a[1]);
+
+        // 2. Ne garder que le "top N"
+        const topTransitions = sorted.slice(0, QUADGRAM_TARGET_LIMIT);
+
+        // 3. Reconstruire la Map avec uniquement les meilleures transitions
+        transitions.clear();
+        for (const [id, weight] of topTransitions) {
+            transitions.set(id, weight);
         }
     }
 
