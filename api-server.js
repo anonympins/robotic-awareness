@@ -239,10 +239,16 @@ async function predictWithEnsemble(prompt, depth, options) {
         // --- NOUVEAU : Application de la pénalité de répétition agressive ---
         const lastTwoWords = generatedSequence.slice(-2);
         for (const [token, score] of mergedCandidates) {
+            // --- CORRECTIF : Pénalité de répétition différenciée ---
+            // On vérifie si le mot est un "mot-outil" grammatical.
+            // La méthode `isStructural` est sur l'expert, on utilise le `coreBrain` comme référence.
+            const isStructural = coreBrain ? coreBrain.isStructural(token) : false;
+
             const count = repetitionCounts.get(token) || 0;
             if (count > 0) {
-                // Pénalité exponentielle : 0.1^1, 0.1^2, 0.1^3...
-                const penalty = Math.pow(PENALTY_BASE, count);
+                // Si c'est un mot structurel, la pénalité est plus faible (0.4) pour autoriser les répétitions naturelles.
+                // Sinon, la pénalité est très forte (0.05) pour éviter de répéter les mots de contenu.
+                const penalty = Math.pow(isStructural ? 0.4 : 0.05, count);
                 mergedCandidates.set(token, score * penalty);
             }
 

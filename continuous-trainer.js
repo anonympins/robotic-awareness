@@ -146,6 +146,11 @@ async function main() {
             console.log(`\x1b[36m[MAINTENANCE] Application de l'érosion synaptique (oubli)... \x1b[0m`);
             moe.experts.forEach(expert => expert._applySynapticDecay(0.98));
 
+            // --- NOUVEAU : TÂCHE DE FOND - RÉSONANCE SÉMANTIQUE ---
+            console.log(`\x1b[36m[MAINTENANCE] Lancement de la résonance sémantique (consolidation des concepts)... \x1b[0m`);
+            moe.sharedState.attention.propagateResonance(0.1, 0.2);
+            console.log(`  > Graphe de concepts consolidé. Liens actuels: ${moe.sharedState.attention.correlationMatrix.size}`);
+
             // On ne parcourt que les experts actuellement chargés en mémoire
             const activeExperts = Array.from(moe.experts.entries()).filter(([_, expert]) => expert.grammarMap.size > 0);
             if (activeExperts.length === 0) {

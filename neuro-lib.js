@@ -1344,9 +1344,9 @@ export class SemanticAttentionLayer {
 
         // On ne travaille que sur les liens déjà existants
         for (const [idA, targetsA] of this.correlationMatrix) {
-            // OPTIMISATION : On ignore les "Hubs" (mots de liaison comme "le", "de", "et") 
+            // OPTIMISATION : On ignore les "Hubs" (mots de liaison comme "le", "de", "et")
             // qui saturent le graphe sans apporter de sens unique.
-            if (targetsA.size > 80) continue; 
+            if (targetsA.size > 80) continue;
 
             for (const [idB, energyAB] of targetsA) {
                 if (energyAB < minThreshold) continue;
@@ -1358,7 +1358,7 @@ export class SemanticAttentionLayer {
                     if (idA === idC || energyBC < minThreshold) continue;
 
                     const indirectEnergy = energyAB * energyBC * factor;
-                    
+
                     // On ne retient que l'énergie significative
                     if (indirectEnergy < minThreshold) continue;
 
@@ -1377,7 +1377,7 @@ export class SemanticAttentionLayer {
                 targets.set(idC, (targets.get(idC) || 0) + energy);
             }
         }
-        
+
         // Nettoyage périodique pour éviter la saturation mémoire
         this.pruneMatrix(minThreshold);
     }
@@ -2100,7 +2100,7 @@ export class SemanticRelationalMemory {
      * @param {boolean} resetContext Si vrai, oublie le contexte précédent (défaut: true)
      * @param {number} weight Poids de l'apprentissage
      */
-    learnSense(sentence, resetContext = true, weight = 1) {
+    learnSense(sentence, resetContext = true, weight = 1, sharedAttention = null) {
         let tokens = sentence.match(this.tokenizer) || [];
 
         if (tokens.length === 0) return;
@@ -2114,7 +2114,8 @@ export class SemanticRelationalMemory {
         this._ingestTokens(tokens, ids, weight);
 
         // Automatisation : On corrèle tous les IDs de la phrase entre eux dans la matrice
-        if (this.attention) this.attention.correlate(ids, weight);
+        const attentionLayer = sharedAttention || this.attention;
+        if (attentionLayer) attentionLayer.correlate(ids, weight);
     }
 
     /**
@@ -3139,12 +3140,12 @@ export class SemanticRelationalMemory {
                     boost = 3.0;
                 }
                 totalStructuralWeight = Array.from(trigramContext.values()).reduce((a, b) => a + b, 1);
-                structuralScore = (weight * boost / totalStructuralWeight) * 10.0; // Poids fort pour les trigrammes
+                structuralScore = (weight * boost / totalStructuralWeight) * 25.0; // Poids très fort pour les trigrammes
                 isStructureHit = true;
             } else if (hasBigramOptions && bigramContext.has(id)) {
                 let weight = bigramContext.get(id);
                 totalStructuralWeight = Array.from(bigramContext.values()).reduce((a, b) => a + b, 1);
-                structuralScore = (weight / totalStructuralWeight) * 5.0; // Poids modéré pour les bigrammes
+                structuralScore = (weight / totalStructuralWeight) * 12.0; // Poids fort pour les bigrammes
                 isStructureHit = true;
             }
 
@@ -3168,12 +3169,21 @@ export class SemanticRelationalMemory {
                 }
             }
 
+            // --- NOUVEAU : Score de connectivité sémantique (Confiance) ---
+            // Un concept bien connecté est plus "fiable" et pertinent.
+            let connectivityScore = 0;
+            if (attLayer && attLayer.correlationMatrix.has(id)) {
+                const numConnections = attLayer.correlationMatrix.get(id).size;
+                // Le log évite qu'un mot "hub" n'écrase tout, tout en récompensant la connectivité.
+                connectivityScore = Math.log1p(numConnections) * 0.75; // Poids modéré mais significatif
+            }
+
             const semanticExplorationFactor = 1.0 + (creativity * 4.0);
             const semanticScore = semanticResonance * 20.0 * semanticExplorationFactor; // Poids de la sémantique
             const bitwiseScore = transitionProb * 8.0; // Poids de la mémoire binaire
 
             // --- FUSION FINALE PAR SOMME PONDÉRÉE ---
-            let score = structuralScore + bitwiseScore + semanticScore + attentionScore + bridgingScore;
+            let score = structuralScore + bitwiseScore + semanticScore + attentionScore + bridgingScore + connectivityScore;
 
             if (word === "<eos>") {
                 // On favorise fortement la fin de phrase si la structure grammaticale le suggère.
@@ -6499,7 +6509,8 @@ export class GNeuroMoE {
             reverseVocab: new Map(),
             wordCounts: new Map(),
             nextId: 3,
-            totalTokensProcessed: 0
+            totalTokensProcessed: 0,
+            attention: new SemanticAttentionLayer() // NOUVEAU : Couche d'attention partagée
         };
 
         // Jetons système partagés
@@ -6535,6 +6546,12 @@ export class GNeuroMoE {
         // On récupère la valeur calculée par importBinary sur l'instance temporaire
         this.sharedState.nextId = brain.sharedState ? brain.sharedState.nextId : brain.nextId;
         this.sharedState.totalTokensProcessed = brain.totalTokensProcessed;
+
+        // --- NOUVEAU : Chargement/Sauvegarde de la couche d'attention partagée ---
+        // On attache la couche d'attention au cerveau temporaire pour qu'il la peuple
+        brain.attachAttention(this.sharedState.attention);
+        brain.importBinary(fs.readFileSync(filePath)); // On relit pour charger la partie attention
+
         console.log(`\x1b[2m[MoE] État global chargé : ${this.sharedState.vocabulary.size} mots connus.\x1b[0m`);
     }
 
@@ -6635,7 +6652,7 @@ export class GNeuroMoE {
                 }
 
                 const learningWeight = (domain === bestDomain) ? weight : secondary_weight;
-                expert.learnSense(sentence, true, learningWeight);
+                expert.learnSense(sentence, true, learningWeight, this.sharedState.attention);
                 ingestionReport[domain].sentences++;
                 modifiedExperts.add(domain);
             }
