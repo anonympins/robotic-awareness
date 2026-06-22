@@ -45,6 +45,10 @@ console.log("\x1b[2m[MoE] Pré-chargement terminé.\x1b[0m");
 
 // On récupère l'expert 'core' une seule fois au démarrage pour le fallback
 coreBrain = moe.getCoreExpert();
+// --- CORRECTIF : S'assurer que le cache de fallback du coreBrain est peuplé ---
+if (coreBrain) {
+    coreBrain._updateFrequentWordsCache();
+}
 
 async function getExpertForContent(text) {
     const domain = moe.route(text);
@@ -148,6 +152,11 @@ async function predictWithEnsemble(prompt, depth, options) {
     let currentText = prompt.trim();
     let generatedSequence = [];
 
+    // --- NOUVEAU : Mécanisme anti-répétition ---
+    const repetitionCounts = new Map(); // Compte l'usage de chaque mot
+    const trigramHistory = new Set();   // Stocke les trigrammes déjà générés
+    const PENALTY_BASE = 0.1; // Pénalité de base, qui sera élevée à une puissance
+
     console.log(`\n\x1b[35m[ENSEMBLE PREDICTION]\x1b[0m Amorce: "${currentText}"`);
 
     for (let i = 0; i < depth; i++) {
@@ -198,26 +207,71 @@ async function predictWithEnsemble(prompt, depth, options) {
                 console.log(`\x1b[2m  > Aide de [${domain}]: ${candidates.map(c => `${c.token}(${c.score.toFixed(3)})`).join(', ')}\x1b[0m`);
                 for (const { token, score } of candidates) {
                     // Le poids des experts secondaires est réduit (0.5)
-                    mergedCandidates.set(token, (mergedCandidates.get(token) || 0) + score * 0.5);
+                    mergedCandidates.set(token, (mergedCandidates.get(token) || 0) + score * (options.secondaryWeight || 0.5));
                 }
             }
         }
 
         if (mergedCandidates.size === 0) {
-            console.log("\x1b[33m[!] Aucun expert n'a pu proposer de mot suivant. Fin de la génération.\x1b[0m");
-            break; // Arrête la génération si aucun mot n'est trouvé
+            // --- NOUVEAU : Stratégie de fallback si aucun expert ne répond ---
+            // Si c'est le premier mot à générer et que personne ne sait quoi dire,
+            // on demande au coreBrain les débuts de phrase les plus courants.
+            if (i === 0 && coreBrain) {
+                console.log("\x1b[33m[!] Aucun expert n'a de suggestion. Tentative de démarrage avec le 'coreBrain'...\x1b[0m");
+                // On demande au coreBrain les mots qui suivent le plus souvent une fin de phrase (ID 2 pour <eos>)
+                const sentenceStarters = coreBrain.predictNextCandidates("<eos>", { topK: 20, creativity: 0.2 });
+                if (sentenceStarters.length > 0) {
+                    console.log(`\x1b[2m  > Le coreBrain propose comme débuts possibles: ${sentenceStarters.slice(0,5).map(c => c.token).join(', ')}...\x1b[0m`);
+                    for (const { token, score } of sentenceStarters) {
+                        // On peuple les candidats fusionnés avec ces suggestions
+                        mergedCandidates.set(token, (mergedCandidates.get(token) || 0) + score);
+                    }
+                }
+            }
+
+            // Si même après le fallback, il n'y a rien, on arrête.
+            if (mergedCandidates.size === 0) {
+                console.log("\x1b[31m[!] Fallback échoué. Fin de la génération.\x1b[0m");
+                break;
+            }
         }
 
-        // Affichage de la liste fusionnée pour le débogage
-        const sortedMerged = [...mergedCandidates.entries()].sort((a, b) => b[1] - a[1]);
-        console.log(`\x1b[1;34m  > Fusion finale: ${sortedMerged.slice(0, 10).map(([t, s]) => `${t}(${s.toFixed(3)})`).join(', ')} ...\x1b[0m`);
+        // --- NOUVEAU : Application de la pénalité de répétition agressive ---
+        const lastTwoWords = generatedSequence.slice(-2);
+        for (const [token, score] of mergedCandidates) {
+            const count = repetitionCounts.get(token) || 0;
+            if (count > 0) {
+                // Pénalité exponentielle : 0.1^1, 0.1^2, 0.1^3...
+                const penalty = Math.pow(PENALTY_BASE, count);
+                mergedCandidates.set(token, score * penalty);
+            }
+
+            // Interdiction de répétition de trigramme
+            if (lastTwoWords.length === 2) {
+                const trigramKey = `${lastTwoWords[0]}|${lastTwoWords[1]}|${token}`;
+                if (trigramHistory.has(trigramKey)) {
+                    mergedCandidates.set(token, mergedCandidates.get(token) * 0.0001); // Quasi-interdiction
+                }
+            }
+
+            // --- NOUVEAU : Pénalité de diversité ---
+            // On pénalise les mots très courts qui ne sont pas des connecteurs grammaticaux forts
+            // pour éviter les boucles de type "la la la".
+            if (token.length < 3 && !['un', 'une', 'des', 'les', 'que', 'qui', 'est', 'sont'].includes(token)) {
+                 mergedCandidates.set(token, mergedCandidates.get(token) * 0.2);
+            }
+        }
+
+        // --- CORRECTIF : Le tri et l'affichage se font APRÈS l'application des pénalités ---
+        const sortedAndPenalized = [...mergedCandidates.entries()].sort((a, b) => b[1] - a[1]);
+        console.log(`\x1b[1;34m  > Fusion finale (après pénalités): ${sortedAndPenalized.slice(0, 10).map(([t, s]) => `${t}(${s.toFixed(3)})`).join(', ')} ...\x1b[0m`);
 
         // 3. Le mot final est choisi par un tirage au sort pondéré parmi les candidats fusionnés.
-        const totalScore = sortedMerged.reduce((sum, [, score]) => sum + score, 0);
+        const totalScore = sortedAndPenalized.reduce((sum, [, score]) => sum + score, 0);
         let randomChoice = Math.random() * totalScore;
         let chosenToken = null;
 
-        for (const [token, score] of sortedMerged) {
+        for (const [token, score] of sortedAndPenalized) {
             randomChoice -= score;
             if (randomChoice <= 0) {
                 chosenToken = token;
@@ -226,8 +280,8 @@ async function predictWithEnsemble(prompt, depth, options) {
         }
         
         // Fallback si quelque chose se passe mal avec le tirage
-        if (!chosenToken && sortedMerged.length > 0) {
-            chosenToken = sortedMerged[0][0];
+        if (!chosenToken && sortedAndPenalized.length > 0) {
+            chosenToken = sortedAndPenalized[0][0];
         }
 
         if (!chosenToken) {
@@ -241,6 +295,15 @@ async function predictWithEnsemble(prompt, depth, options) {
         if (chosenToken === "<eos>") break;
 
         generatedSequence.push(chosenToken);
+
+        // Mise à jour de l'historique pour l'anti-répétition
+        repetitionCounts.set(chosenToken, (repetitionCounts.get(chosenToken) || 0) + 1);
+        if (generatedSequence.length >= 3) {
+            const lastTrigram = generatedSequence.slice(-3);
+            const trigramKey = lastTrigram.join('|');
+            trigramHistory.add(trigramKey);
+        }
+
         currentText += ` ${chosenToken}`;
     }
 

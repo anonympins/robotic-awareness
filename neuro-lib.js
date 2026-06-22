@@ -1689,6 +1689,20 @@ export class SemanticRelationalMemory {
     }
 
     /**
+     * NOUVEAU : Met à jour le cache des mots les plus fréquents.
+     * Ce cache est crucial pour le fallback lorsque le modèle ne sait pas quoi générer.
+     */
+    _updateFrequentWordsCache() {
+        if (this.wordCounts.size === 0) return;
+
+        const sortedWords = Array.from(this.wordCounts.entries())
+            .filter(([id, _]) => !this.isStructural(id)) // On exclut les mots-outils pour des débuts plus intéressants
+            .sort((a, b) => b[1] - a[1]);
+
+        this.frequentWordsCache = sortedWords.slice(0, 100).map(([id, _]) => id);
+    }
+
+    /**
      * NOUVEAU : Évalue la pertinence d'un ensemble de tokens pour cet expert.
      * Calcule un score basé sur le besoin d'information (mots inconnus) et
      * le potentiel de connectivité (liens avec la grammaire existante).
@@ -2062,6 +2076,8 @@ export class SemanticRelationalMemory {
         const engineData = raw.subarray(offset, offset + engineLen);
         this.bitEngine.setState(new Uint8Array(engineData));
         offset += engineLen;
+        // --- CORRECTIF : Mettre à jour le cache des mots fréquents après chargement ---
+        this._updateFrequentWordsCache();
     }
 
     /**
@@ -3112,27 +3128,30 @@ export class SemanticRelationalMemory {
             let totalStructuralWeight = 1;
             let isStructureHit = false;
 
+            // --- NOUVEAU : Bonus de cohérence structurelle ---
+            // On utilise des scores additifs pour la stabilité.
+            let structuralScore = 0;
+
             if (hasTrigramOptions && trigramContext.has(id)) {
-                let boost = 40.0;
+                let weight = trigramContext.get(id);
                 if (subTrigramContext && subTrigramContext.has(id)) boost *= 3.0;
-                grammarWeight = trigramContext.get(id) * boost;
                 totalStructuralWeight = Array.from(trigramContext.values()).reduce((a, b) => a + b, 1);
+                structuralScore = (weight / totalStructuralWeight) * 10.0; // Poids fort pour les trigrammes
                 isStructureHit = true;
             } else if (hasBigramOptions && bigramContext.has(id)) {
-                grammarWeight = bigramContext.get(id) * 20.0;
+                let weight = bigramContext.get(id);
                 totalStructuralWeight = Array.from(bigramContext.values()).reduce((a, b) => a + b, 1);
+                structuralScore = (weight / totalStructuralWeight) * 5.0; // Poids modéré pour les bigrammes
                 isStructureHit = true;
             }
 
-            let grammarScore = grammarWeight / (totalStructuralWeight || 1);
-            const grammarBoost = (structureReconnue && isStructureHit) ? 5.0 : 1.0;
-
-            let bridgingBias = 1.0;
+            // Score de "pontage" si la grammaire est silencieuse
+            let bridgingScore = 0;
             if (!structureReconnue && (isConnector || isStarter)) {
-                bridgingBias = 3.5;
+                bridgingScore = 1.5;
             }
 
-            let contextBoost = 1.0;
+            let attentionScore = 0;
             if (attLayer && (activeIds.length > 0 || identityIds.length > 0 || queryIds.length > 0)) {
                 const { bias, totalWeight } = attLayer.getBitBias(activeIds, identityIds, queryIds);
                 if (totalWeight > 0) {
@@ -3140,17 +3159,22 @@ export class SemanticRelationalMemory {
                     for (let b = 0; b < 12; b++) {
                         bitMatch += ((id >> b) & 1) ? bias[b] : -bias[b];
                     }
-                    contextBoost = Math.exp(Math.max(-4.0, Math.min(6.0, (bitMatch / (totalWeight * 0.3)))));
+                    // On remplace l'exponentielle par une fonction linéaire bornée pour plus de stabilité.
+                    // Le score d'attention va maintenant de -5 à +5 environ.
+                    attentionScore = 5.0 * Math.tanh(bitMatch / (totalWeight * 0.5));
                 }
             }
 
             const semanticExplorationFactor = 1.0 + (creativity * 4.0);
-            const meaningPower = semanticResonance * 150.0 * semanticExplorationFactor;
-            const verbatimBoost = transitionProb > 0.8 ? 50.0 : 1.0;
+            const semanticScore = semanticResonance * 20.0 * semanticExplorationFactor; // Poids de la sémantique
+            const bitwiseScore = transitionProb * 8.0; // Poids de la mémoire binaire
 
-            let score = (grammarScore + transitionProb * transitionWeight + meaningPower) * contextBoost * verbatimBoost * grammarBoost * bridgingBias;
+            // --- FUSION FINALE PAR SOMME PONDÉRÉE ---
+            let score = structuralScore + bitwiseScore + semanticScore + attentionScore + bridgingScore;
 
             if (word === "<eos>") {
+                // On favorise fortement la fin de phrase si la structure grammaticale le suggère.
+                // Cela aide à produire des phrases complètes et bien formées.
                 if (isStructureHit) score *= 20.0;
                 else if (!structureReconnue && transitionProb > 0.8) score *= 5.0;
             }
