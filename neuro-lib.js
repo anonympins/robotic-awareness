@@ -3257,13 +3257,15 @@ export class SemanticRelationalMemory {
             if (hasTrigramOptions && trigramContext.has(id)) {
                 let weight = trigramContext.get(id);
                 totalStructuralWeight = Array.from(trigramContext.values()).reduce((a, b) => a + b, 1);
-                // Bonus massif pour le trigramme
-                structuralScore = (weight / totalStructuralWeight) * 25.0;
+                // NOUVELLE LOGIQUE DE SCORE : On combine le poids brut (force de la connexion)
+                // et le ratio (certitude relative). Le log1p lisse l'effet du poids brut.
+                // Cela garantit qu'une transition forte (même unique) a un score de base élevé.
+                structuralScore = (Math.log1p(weight) + (weight / totalStructuralWeight)) * 12.0;
                 isStructureHit = true;
             } else if (hasBigramOptions && bigramContext.has(id)) {
                 let weight = bigramContext.get(id);
                 totalStructuralWeight = Array.from(bigramContext.values()).reduce((a, b) => a + b, 1);
-                structuralScore = (weight / totalStructuralWeight) * 12.0; // Poids fort pour les bigrammes
+                structuralScore = (Math.log1p(weight) + (weight / totalStructuralWeight)) * 6.0;
                 isStructureHit = true;
             }
 
