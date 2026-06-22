@@ -3134,9 +3134,12 @@ export class SemanticRelationalMemory {
 
             if (hasTrigramOptions && trigramContext.has(id)) {
                 let weight = trigramContext.get(id);
-                if (subTrigramContext && subTrigramContext.has(id)) boost *= 3.0;
+                let boost = 1.0;
+                if (subTrigramContext && subTrigramContext.has(id)) {
+                    boost = 3.0;
+                }
                 totalStructuralWeight = Array.from(trigramContext.values()).reduce((a, b) => a + b, 1);
-                structuralScore = (weight / totalStructuralWeight) * 10.0; // Poids fort pour les trigrammes
+                structuralScore = (weight * boost / totalStructuralWeight) * 10.0; // Poids fort pour les trigrammes
                 isStructureHit = true;
             } else if (hasBigramOptions && bigramContext.has(id)) {
                 let weight = bigramContext.get(id);
