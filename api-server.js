@@ -157,6 +157,10 @@ async function predictWithEnsemble(prompt, depth, options) {
     const trigramHistory = new Set();   // Stocke les trigrammes déjà générés
     const PENALTY_BASE = 0.1; // Pénalité de base, qui sera élevée à une puissance
 
+    // --- NOUVEAU : Focus attentionnel à dégradation lente ---
+    // On garde en mémoire les concepts clés du prompt initial.
+    const attentionFocus = new Map(moe.sharedState.attention.correlationMatrix.get(initialDomain) || []);
+
     console.log(`\n\x1b[35m[ENSEMBLE PREDICTION]\x1b[0m Amorce: "${currentText}"`);
 
     for (let i = 0; i < depth; i++) {
@@ -208,6 +212,19 @@ async function predictWithEnsemble(prompt, depth, options) {
                 for (const { token, score } of candidates) {
                     // Le poids des experts secondaires est réduit (0.5)
                     mergedCandidates.set(token, (mergedCandidates.get(token) || 0) + score * (options.secondaryWeight || 0.5));
+                }
+            }
+        }
+
+        // --- NOUVEAU : Injection du focus attentionnel ---
+        // On booste légèrement les mots liés au concept initial pour maintenir la cohérence.
+        if (attentionFocus.size > 0) {
+            for (const [token, score] of mergedCandidates) {
+                const tokenId = moe.sharedState.vocabulary.get(token);
+                if (tokenId && attentionFocus.has(tokenId)) {
+                    const focusStrength = attentionFocus.get(tokenId);
+                    // Le boost est modéré pour ne pas écraser la grammaire, mais aide à rester sur le sujet.
+                    mergedCandidates.set(token, score * (1 + focusStrength * 0.2));
                 }
             }
         }
