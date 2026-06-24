@@ -583,6 +583,11 @@ if (signatures.length > 0) {
     console.log("  > Aucune signature grammaticale assez forte n'a pu être extraite.");
 }
 
+// 5. NOUVEAU : Lancement de la découverte de schémas
+console.log("\n[BONUS] Tentative de découverte automatique de schémas (concaténés/enveloppés)...");
+const learnedSchemas = analyzer.discoverAndLearnSchemas();
+console.log(`  > ${learnedSchemas.length} schémas ont été découverts et appris par le réseau.`);
+
 console.log("\n--- Interprétation des résultats ---");
 console.log("  - Les clusters devraient regrouper des mots de même nature (ex: 'mange', 'poursuit', 'chante'...).");
 console.log("  - Les signatures 'PHRASE_START' montrent comment le cerveau a appris à commencer une phrase.");
@@ -674,3 +679,109 @@ const recursiveGeneration = recursiveBrain.predictSense(recursiveAmorce, 10, { c
 console.log(`Amorce: "${recursiveAmorce}" -> Sortie: "${recursiveAmorce} ${recursiveGeneration}"`);
 console.log("\n--- Interprétation ---");
 console.log("La sortie devrait être une phrase complète et cohérente entre parenthèses, démontrant que le cerveau a bien activé le schéma, lancé une sous-génération, puis fermé la structure.");
+
+
+// ============================================================
+// TEST FINAL : DÉCOUVERTE ET APPLICATION DE SCHÉMAS DE LISTE
+// ============================================================
+
+console.log("\n\n=== Test Final : Découverte et Application de Schéma de Liste ===");
+
+const listingBrain = new SemanticRelationalMemory(16);
+
+// 1. Apprentissage d'un corpus contenant des listes
+const listingCorpus = [
+    "le robot scanne les secteurs alpha , beta , gamma et delta .",
+    "les capteurs principaux sont : thermique , optique , sismique .",
+    "priorités : survivre - apprendre - évoluer ."
+];
+console.log("\n[1/3] Apprentissage sur un corpus avec des listes...");
+for (let i = 0; i < 100; i++) {
+    listingCorpus.forEach(phrase => listingBrain.learnSense(phrase, true, 1));
+}
+
+// 2. Lancement de la découverte de schémas
+console.log("\n[2/3] Lancement de la découverte automatique de schémas...");
+const listingAnalyzer = new SyntaxAnalyzer(listingBrain);
+listingAnalyzer.discoverAndLearnSchemas();
+
+// 3. Test de génération
+console.log("\n[3/3] Test de génération avec une amorce de liste...");
+const listingAmorce = "le robot scanne les secteurs alpha";
+const listingGeneration = listingBrain.predictSense(listingAmorce, 5, { creativity: 0.1 });
+console.log(`Amorce: "${listingAmorce}" -> Sortie: "${listingAmorce} ${listingGeneration}"`);
+console.log("\n--- Interprétation ---");
+console.log("La sortie devrait continuer la liste avec ', beta , gamma' ou une variation, montrant que le schéma de liste a été appris et appliqué.");
+
+
+// ============================================================
+// TEST AVANCÉ : RESTITUTION DE SCHÉMAS IMPLICITES (SANS PRÉ-ENTRAÎNEMENT)
+// ============================================================
+
+console.log("\n\n=== Test Avancé : Restitution de Schémas Implicites (Zéro Pré-entraînement de Schéma) ===");
+
+// 1. On crée un cerveau unique qui va devoir apprendre plusieurs schémas concurrents
+const implicitSchemaBrain = new SemanticRelationalMemory(16);
+
+// 2. On lui donne un corpus varié contenant les structures à apprendre
+const implicitCorpus = [
+    "le robot analyse le secteur .",
+    "le robot ne scanne pas la zone .",
+    "le système observe les cibles alpha , beta , gamma et delta .",
+    "l'opérateur a dit : mission accomplie .",
+    "le système ne fonctionne pas ."
+];
+
+console.log("\n[1/3] Apprentissage intensif sur un corpus grammaticalement riche...");
+// On augmente les itérations pour forcer l'apprentissage des relations subtiles
+for (let i = 0; i < 150; i++) {
+    implicitCorpus.forEach(phrase => implicitSchemaBrain.learnSense(phrase, true, 1));
+}
+console.log("Apprentissage terminé.");
+
+// NOUVEAU : Forcer l'analyse des clusters et les afficher
+console.log("\n[2/3] Analyse des clusters syntaxiques appris implicitement...");
+implicitSchemaBrain._updateSyntacticClusters(); // Appel manuel pour le test
+
+if (implicitSchemaBrain.clusters.size > 0) {
+    console.log(`  > ${implicitSchemaBrain.clusters.size} clusters syntaxiques identifiés :`);
+    for (const [clusterId, wordSet] of implicitSchemaBrain.clusters.entries()) {
+        // On ne montre que les clusters avec plus d'un mot pour la pertinence
+        if (wordSet.size > 1) {
+            const words = Array.from(wordSet).map(id => implicitSchemaBrain.reverseVocab.get(id));
+            console.log(`    - Cluster ${clusterId}: { ${words.join(', ')} }`);
+        }
+    }
+} else {
+    console.log("  > Pas assez de données pour former des clusters significatifs.");
+}
+
+console.log("\n[3/3] Tests de restitution spontanée de schémas...");
+
+const implicitTests = [
+    { 
+        name: "Schéma de Négation",
+        amorce: "le robot ne",
+        attendu: "analyse pas" // Le cerveau doit appliquer la négation à un verbe appris dans un contexte affirmatif
+    },
+    {
+        name: "Schéma de Liste (Continuation)",
+        amorce: "le système observe les cibles alpha ,",
+        attendu: "beta , gamma"
+    },
+    {
+        name: "Schéma de Liste (Terminaison)",
+        amorce: "le système observe les cibles alpha , beta , gamma",
+        attendu: "et delta"
+    }
+];
+
+implicitTests.forEach(test => {
+    const generation = implicitSchemaBrain.predictSense(test.amorce, 5, { creativity: 0.05 });
+    console.log(`\n--- Test: ${test.name} ---`);
+    console.log(`  Amorce   : "${test.amorce}"`);
+    console.log(`  Généré   : "${generation}"`);
+    console.log(`  Attendu  : "...${test.attendu}..."`);
+    const success = generation.toLowerCase().includes(test.attendu.toLowerCase());
+    console.log(`  Statut   : ${success ? "✅ SCHÉMA APPLIQUÉ" : "⚠️ DÉRIVE"}`);
+});

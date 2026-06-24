@@ -1518,6 +1518,75 @@ export class SyntaxAnalyzer {
         this.brain = brain;
     }
 
+
+    /**
+     * NOUVEAU : Identifie les motifs de liste (ex: "A, B, C...")
+     * en cherchant des structures où un séparateur est utilisé entre des mots de même cluster.
+     */
+    detectListingPatterns() {
+        const listingScores = new Map(); // Map<"separatorId-clusterId", score>
+        const signatures = this.extractGenerativeSignatures().filter(s => s.strength > 3);
+        const endListingScores = new Map(); // NOUVEAU: Map<"sep-conj-cluster", score>
+
+        // Heuristique : un motif de liste est probable si on trouve "A , B" où A et B sont dans le même cluster.
+        for (const sig of signatures) {
+            const [wordA, separator, wordC] = sig.pattern;
+            // --- NOUVEAU : Détection de la fin de liste (ex: "beta , et") ---
+            if (wordA && separator && wordC && this.brain.vocabulary.get(separator) === this.brain.vocabulary.get(',')) {
+                const nextSigs = this.brain.grammarMap.get((BigInt(this.brain.vocabulary.get(wordA)) << 32n) | BigInt(this.brain.vocabulary.get(separator)));
+                if (nextSigs) {
+                    for (const [idConj, weightConj] of nextSigs) {
+                        const conjWord = this.brain.reverseVocab.get(idConj);
+                        if (conjWord === 'et' || conjWord === 'ou') {
+                            const key = `${this.brain.vocabulary.get(separator)}-${idConj}-${this.brain.wordToCluster.get(this.brain.vocabulary.get(wordA))}`;
+                            endListingScores.set(key, (endListingScores.get(key) || 0) + sig.strength);
+                        }
+                    }
+                }
+            }
+            if (!wordA || !separator || !wordC) continue;
+
+            const idA = this.brain.vocabulary.get(wordA);
+            const idSep = this.brain.vocabulary.get(separator);
+            const idC = this.brain.vocabulary.get(wordC);
+
+            if (idA === undefined || idSep === undefined || idC === undefined) continue;
+
+            // On cherche un séparateur court qui relie deux mots de contenu.
+            const isSeparator = [',', '-', '/'].includes(separator);
+            const clusterA = this.brain.wordToCluster.get(idA);
+            const clusterC = this.brain.wordToCluster.get(idC);
+
+            // La condition clé : le séparateur relie deux mots du même cluster syntaxique.
+            if (isSeparator && clusterA !== undefined && clusterA === clusterC) {
+                const key = `${idSep}-${clusterA}`;
+                const score = (listingScores.get(key) || 0) + sig.strength;
+                listingScores.set(key, score);
+            }
+        }
+
+        const sortedEndPatterns = Array.from(endListingScores.entries())
+            .sort((a, b) => b[1] - a[1])
+            .slice(0, 3);
+        const sortedPatterns = Array.from(listingScores.entries())
+            .sort((a, b) => b[1] - a[1])
+            .slice(0, 5); // On garde les 5 meilleurs motifs de liste
+
+        const continuationPatterns = sortedPatterns.map(([key, score]) => {
+            const [separatorId, clusterId] = key.split('-').map(Number);
+            return { type: 'CONTINUE', separator: this.brain.reverseVocab.get(separatorId), clusterId, score };
+        });
+
+        const terminationPatterns = sortedEndPatterns.map(([key, score]) => {
+            const [separatorId, conjunctionId, clusterId] = key.split('-').map(Number);
+            return { type: 'TERMINATE', separator: this.brain.reverseVocab.get(separatorId), conjunction: this.brain.reverseVocab.get(conjunctionId), clusterId, score };
+        });
+
+        // On retourne les deux types de schémas
+        return [...continuationPatterns, ...terminationPatterns];
+
+    }
+
     /**
      * Identifie les paires structurelles (parenthèses, guillemets, balises)
      * en cherchant les tokens qui créent une dépendance forte.
@@ -1525,6 +1594,7 @@ export class SyntaxAnalyzer {
     detectStructuralPairs() {
         const pairScores = new Map(); // Map<"openerId-closerId", score>
         const signatures = this.extractGenerativeSignatures().filter(s => s.strength > 5);
+        const pairContentClusters = new Map(); // Map<"openerId-closerId", Map<clusterId, count>>
 
         // Heuristique : une paire (A, C) est probable si la structure "A B C" est fréquente.
         // On cherche les paires où A et C sont des mots courts/structurels et B est un mot de contenu.
@@ -1544,16 +1614,33 @@ export class SyntaxAnalyzer {
             const isBContent = !this.brain.isStructural(idB);
 
             if (isAStructural && isCStructural && isBContent && idA !== idC) {
-                const key = `${idA}-${idC}`;
-                const score = (pairScores.get(key) || 0) + sig.strength;
-                pairScores.set(key, score);
+                const pairKey = `${idA}-${idC}`;
+                const score = (pairScores.get(pairKey) || 0) + sig.strength;
+                pairScores.set(pairKey, score);
+
+                // --- NOUVEAU : Analyse du contenu pour la spécialisation ---
+                const contentCluster = this.brain.wordToCluster.get(idB);
+                if (contentCluster !== undefined) {
+                    if (!pairContentClusters.has(pairKey)) {
+                        pairContentClusters.set(pairKey, new Map());
+                    }
+                    const clusterCounts = pairContentClusters.get(pairKey);
+                    clusterCounts.set(contentCluster, (clusterCounts.get(contentCluster) || 0) + 1);
+                }
             }
         }
 
         // Filtrage et tri des paires les plus probables
         const sortedPairs = Array.from(pairScores.entries())
-            .sort((a, b) => b[1] - a[1])
-            .slice(0, 10); // On ne garde que les 10 meilleures paires
+            .map(([key, score]) => {
+                const clusterCounts = pairContentClusters.get(key);
+                // Calcul du score de spécialisation : 1 / (nombre de clusters différents vus)
+                // Une paire qui n'encadre qu'un seul type de mot (ex: verbes) aura un score de 1.
+                const specializationScore = clusterCounts ? 1 / clusterCounts.size : 0.1;
+                return [key, score * (1 + specializationScore * 4)]; // Boost x5 pour une spécialisation parfaite
+            })
+            .sort((a, b) => b[1] - a[1]) // Tri sur le nouveau score combiné
+            .slice(0, 10);
 
         const finalPairs = sortedPairs.map(([key, score]) => {
             const [openerId, closerId] = key.split('-').map(Number);
@@ -1596,21 +1683,11 @@ export class SyntaxAnalyzer {
                 const wordB = this.brain.reverseVocab.get(idB);
                 const wordC = this.brain.reverseVocab.get(bestTarget);
 
-                // --- FILTRAGE DE PERTINENCE ---
-                // CORRECTIF : On considère <eos> (id:2) comme structurel par définition.
-                const isAStruct = idA === 2 || this.brain.isStructural(idA);
-                const isBStruct = idB === 2 || this.brain.isStructural(idB);
-                const isCStruct = bestTarget === 2 || this.brain.isStructural(bestTarget);
-
-                // Si les 3 mots sont des "mots-outils" (le, de, et, ou...), 
-                // la règle est grammaticalement correcte mais conceptuellement pauvre.
-                if (isAStruct && isBStruct && isCStruct) continue;
-
-                // Catégorisation améliorée
-                let type = "CONCEPT_CHAIN"; // Par défaut, on suppose une chaîne de concepts
-                if (idA === 2) type = "PHRASE_START"; // <eos> est l'ID 2
-                else if (isAStruct && !isBStruct) type = "CONSTRUCT";
-
+                // La catégorisation manuelle (CONCEPT_CHAIN, etc.) est supprimée.
+                // Le système se base maintenant uniquement sur le clustering non-supervisé
+                // pour comprendre la nature des mots, sans a priori.
+                // On garde un type générique pour la compatibilité de l'affichage.
+                const type = idA === 2 ? "PHRASE_START" : "TRANSITION";
                 signatures.push({
                     pattern: [wordA, wordB, wordC],
                     type: type,
@@ -1643,44 +1720,48 @@ export class SyntaxAnalyzer {
     }
 
     /**
-     * NOUVEAU : Analyse les signatures extraites pour découvrir et apprendre des schémas récurrents.
+     * NOUVEAU : Analyse les signatures extraites pour découvrir et apprendre des schémas récurrents (concaténés et enveloppés).
      * Par exemple, si "de" est souvent un pivot entre deux clusters de noms,
      * il peut créer un schéma `[NOM] -> de -> [NOM]`.
      * @returns {Array<Object>} Une liste des schémas qui ont été appris.
      */
     discoverAndLearnSchemas() {
         const learnedSchemas = [];
+        console.log(`\x1b[36m[SYNTAX]\x1b[0m Lancement de la découverte automatique de schémas...`);
 
-        // --- 1. Découverte des schémas de type PIVOT ---
+        // --- 1. Découverte des schémas de type PIVOT (concaténés) ---
         const signatures = this.extractGenerativeSignatures();
         const constructSigs = signatures.filter(s => s.type === 'CONSTRUCT' && s.certainty > 0.85 && s.strength > 10);
 
         for (const sig of constructSigs) {
             const [wordA, wordB, wordC] = sig.pattern;
             const idB = this.brain.vocabulary.get(wordB);
+            // On cherche un mot-outil court (comme 'de', 'à', 'pour') qui sert de pivot entre deux concepts.
             if (idB && wordB.length < 4 && this.brain.isStructural(idB)) {
                 const idA = this.brain.vocabulary.get(wordA);
                 const idC = this.brain.vocabulary.get(wordC);
+                // On s'assure que le pivot relie bien deux mots de "contenu" (non structurels).
                 if (idA && !this.brain.isStructural(idA) && idC && !this.brain.isStructural(idC)) {
-                    const schemaSequence = [wordA, wordB, { byExample: wordC }];
+                    // On apprend un schéma qui dit : "après [wordA], on peut utiliser le pivot [wordB] pour introduire un mot de la même catégorie que [wordC]".
+                    const schemaSequence = [{ value: wordA, saveAs: 'slot1' }, wordB, { byExample: wordC }];
                     this.brain.learnSyntacticSchema(schemaSequence);
-                    learnedSchemas.push({ type: 'PIVOT', trigger: wordA, sequence: schemaSequence.slice(1) });
+                    learnedSchemas.push({ type: 'PIVOT', trigger: wordA, pivot: wordB, example: wordC });
                 }
             }
         }
 
-        // --- 2. Découverte des schémas de type WRAP ---
+        // --- 2. Découverte des schémas de type WRAP (enveloppés) ---
         const structuralPairs = this.detectStructuralPairs();
         if (structuralPairs.length > 0) {
-            console.log(`\x1b[36m[SYNTAX]\x1b[0m Paires structurelles détectées : ${structuralPairs.map(p => `${p.opener}/${p.closer}`).join(', ')}`);
+            console.log(`\x1b[36m[SYNTAX]\x1b[0m Paires structurelles (wrappers) détectées : ${structuralPairs.map(p => `${p.opener}/${p.closer}`).join(', ')}`);
         }
 
         for (const pair of structuralPairs) {
             // On ne crée le schéma que si la paire est jugée assez forte
             if (pair.score < 20) continue;
 
+            // On apprend un schéma qui dit : "après [opener], génère une sous-phrase, puis termine par [closer]".
             const schemaSequence = [
-                pair.opener,
                 {
                     WRAP: {
                         start: pair.opener,
@@ -1689,10 +1770,32 @@ export class SyntaxAnalyzer {
                     }
                 }
             ];
-            this.brain.learnSyntacticSchema(schemaSequence);
-            learnedSchemas.push({ type: 'WRAP', trigger: pair.opener, sequence: schemaSequence.slice(1) });
+            this.brain.learnSyntacticSchema([pair.opener, ...schemaSequence]);
+            learnedSchemas.push({ type: 'WRAP', trigger: pair.opener, closer: pair.closer });
+        }
+        // --- 3. Découverte des schémas de type LISTING ---
+        const listingPatterns = this.detectListingPatterns();
+        if (listingPatterns.length > 0) {
+            console.log(`\x1b[36m[SYNTAX]\x1b[0m Motifs de liste détectés : ${listingPatterns.map(p => `CLUSTER ${p.clusterId} avec "${p.separator}"`).join(', ')}`);
         }
 
+        for (const pattern of listingPatterns) {
+            if (pattern.score < 8) continue; // Seuil abaissé pour plus de flexibilité
+
+            let schemaSequence;
+            if (pattern.type === 'CONTINUE') {
+                // Schéma de continuation: [ITEM] , [ITEM]
+                schemaSequence = [{ byCluster: pattern.clusterId, saveAs: 'item1' }, pattern.separator, { byCluster: pattern.clusterId }];
+            } else if (pattern.type === 'TERMINATE') {
+                // Schéma de terminaison: [ITEM] , et [ITEM]
+                schemaSequence = [{ byCluster: pattern.clusterId, saveAs: 'item1' }, pattern.separator, pattern.conjunction, { byCluster: pattern.clusterId }];
+            } else {
+                continue;
+            }
+
+            this.brain.learnSyntacticSchema(schemaSequence); // Note: le trigger est implicite (un mot du cluster)
+            learnedSchemas.push({ type: 'LISTING', separator: pattern.separator, cluster: pattern.clusterId });
+        }
         return learnedSchemas;
     }
 }
@@ -1761,6 +1864,7 @@ export class SemanticRelationalMemory {
         this.wordToCluster = new Map();         // Map<WordID, ClusterID>
         this.clusters = new Map();              // Map<ClusterID, Set<WordID>>
         this.clusterGrammar = new Map();        // Map<`C1|C2`, Map<C3, count>> (Grammaire de clusters)
+        this.wordCentrality = new Map();        // Map<WordID, CentralityScore (0-1)>
         this.nextClusterId = 0;
         this.clusteringCounter = 0;
         // =================================================================
@@ -2389,7 +2493,6 @@ export class SemanticRelationalMemory {
         const preSim = calculateContextSimilarity(fp1.pre, fp2.pre);
         const postSim = calculateContextSimilarity(fp1.post, fp2.post);
 
-        // La similarité finale est la moyenne des similarités des contextes avant et après.
         return (preSim + postSim) / 2.0;
     }
 
@@ -2459,6 +2562,29 @@ export class SemanticRelationalMemory {
                 const newClusterId = this.nextClusterId++;
                 this.clusters.set(newClusterId, new Set([wordId]));
                 this.wordToCluster.set(wordId, newClusterId);
+            }
+        }
+
+        // --- NOUVEAU : Calcul de la centralité de chaque mot dans son cluster ---
+        this.wordCentrality.clear();
+        for (const [clusterId, wordSet] of this.clusters) {
+            if (wordSet.size <= 1) {
+                if (wordSet.size === 1) this.wordCentrality.set(wordSet.values().next().value, 1.0);
+                continue;
+            }
+
+            const wordsInCluster = Array.from(wordSet);
+            for (let i = 0; i < wordsInCluster.length; i++) {
+                const currentWordId = wordsInCluster[i];
+                let totalSimilarity = 0;
+
+                for (let j = 0; j < wordsInCluster.length; j++) {
+                    if (i === j) continue;
+                    const otherWordId = wordsInCluster[j];
+                    const key = currentWordId < otherWordId ? `${currentWordId}-${otherWordId}` : `${otherWordId}-${currentWordId}`;
+                    totalSimilarity += similarityCache.get(key) || 0.0;
+                }
+                this.wordCentrality.set(currentWordId, totalSimilarity / (wordsInCluster.length - 1));
             }
         }
     }
@@ -2566,6 +2692,8 @@ export class SemanticRelationalMemory {
                             console.warn(`\x1b[33m[SCHEMA LEARN WARN]\x1b[0m Impossible de trouver un cluster pour l'exemple "${step.byExample}". Le schéma pourrait ne pas fonctionner.`);
                         }
                         parsed.push({ type: 'CATEGORY', value: clusterId });
+                    } else if (step.byCluster) {
+                        parsed.push({type: 'CATEGORY', value: step.byCluster});
                     } else if (step.WRAP) {
                         // Décomposition de l'instruction WRAP en 3 étapes distinctes
                         const { start, content, end } = step.WRAP;
@@ -2617,6 +2745,7 @@ export class SemanticRelationalMemory {
         const schemaStepsString = sequence.slice(1).map(s => {
             if (typeof s === 'object' && s.byExample) return `[byExample: ${s.byExample}]`;
             if (typeof s === 'object' && s.generate_phrase !== undefined) return `[GENERATE_PHRASE]`;
+            if (typeof s === 'object' && s.byCluster) return `[byCluster: ${s.byCluster}]`;
             if (typeof s === 'object' && s.WRAP) return `[WRAP: ${s.WRAP.start}...${s.WRAP.end}]`;
             if (typeof s === 'object' && s.WRAP) return `[WRAP: ${s.WRAP.start}...${s.WRAP.end}]`;
             if (typeof s === 'object' && s.fromSlot) return `[fromSlot: ${s.fromSlot}]`;
@@ -2826,17 +2955,52 @@ export class SemanticRelationalMemory {
     }
 
     /**
+     * NOUVEAU : Assemble les tokens de manière intelligente en gérant les espaces et la ponctuation.
+     * @param {string[]} tokens - Le tableau de tokens à joindre.
+     * @returns {string} - La chaîne de caractères finale.
+     */
+    _intelligentlyJoinTokens(tokens) {
+        if (!tokens || tokens.length === 0) {
+            return "";
+        }
+
+        let result = tokens[0];
+        for (let i = 1; i < tokens.length; i++) {
+            const currentToken = tokens[i];
+            const prevToken = tokens[i - 1];
+
+            // Si le token courant est une ponctuation simple, on ne met pas d'espace avant.
+            if ([',', '.', ';', ':', ')', ']'].includes(currentToken)) {
+                result += currentToken;
+            }
+            // Si le token précédent est une ponctuation ouvrante, on ne met pas d'espace après.
+            else if (['(', '['].includes(prevToken)) {
+                result += currentToken;
+            }
+            // Gère l'élision pour l'apostrophe (ex: l'arbre)
+            else if (currentToken.startsWith("'")) {
+                result += currentToken;
+            }
+            // Cas général : on ajoute un espace.
+            else {
+                result += ' ' + currentToken;
+            }
+        }
+        return result;
+    }
+    /**
      * Prédit la suite non pas par lettre, mais par concept
      * @param {Object} options { depth, focusBias: Map<ID, weight> }
      */
-    predictSense(seedSentence, depth = 10, options = {}) {
+    predictSense(seedSentence, depth = 10, options = {}) { // This is the main public method
         const tokens = seedSentence.match(this.tokenizer) || [];
         this.bitEngine.resetContext();
-        
+
         let activeIds = [];
         const queryIds = tokens.map(t => this.vocabulary.get(t) || 0).filter(id => id > 0);
         const identityIds = [];
         const isQuestion = seedSentence.includes('?');
+        let generatedIds = [];
 
         // DÉTERMINATION DE L'OBJECTIF : 
         // On alloue un quota de phrases basé sur la richesse conceptuelle (un concept par proposition).
@@ -2844,7 +3008,7 @@ export class SemanticRelationalMemory {
         const targetSentences = Math.max(1, Math.min(8, significantConcepts));
 
         if (options.identity) {
-            const roles = options.identity.split(/\s+/);
+            const roles = options.identity.toLowerCase().split(/\s+/);
             roles.forEach(role => {
                 let id = this.vocabulary.get(role);
                 // Fallback insensible à la casse pour le biais d'identité
@@ -2872,141 +3036,107 @@ export class SemanticRelationalMemory {
             this._shiftId(id);
         }
 
-        const attLayer = options.attention || this.attention;
-        let generatedIds = [];
-        const wordCounts = new Map();
-        const creativity = (options.creativity !== undefined) ? options.creativity : 0.01; 
-        let rollingConfidence = 1.0;
-        const topK = options.topK || 5;
-
+        // --- REFACTOR: The generation loop is now a self-contained function ---
+        // It returns `true` to continue or `false` to stop.
+        const generateNextToken = () => {
+            const attLayer = options.attention || this.attention;
+            const creativity = (options.creativity !== undefined) ? options.creativity : 0.01;
+            const topK = options.topK || 5;
         // --- NOUVEAU : Mémoire de travail pour les schémas syntaxiques ---
         // Une pile pour gérer les schémas imbriqués (ex: "ne [verbe] pas que...")
         const activeSchemas = [];
 
-        // --- CORRECTIF : Activation des schémas basés sur l'amorce ---
-        // On vérifie si le DERNIER mot de l'amorce déclenche un schéma.
-        const lastTokenId = activeIds.length > 0 ? activeIds[activeIds.length - 1] : null;
-        if (lastTokenId && this.syntacticSchemas.has(lastTokenId)) {
-            const newSchema = this.syntacticSchemas.get(lastTokenId);
-            activeSchemas.push({ schema: newSchema, stepIndex: 0, memory: new Map() });
-            // Log de débogage pour confirmer l'activation
-            console.log(`\x1b[36m[SCHEMA DETECT]\x1b[0m Schéma activé par l'amorce: "${this.reverseVocab.get(lastTokenId)}"`);
-        }
+            // --- CORRECTIF : Activation des schémas basés sur l'amorce ---
+            // On vérifie si le DERNIER mot de l'amorce déclenche un schéma.
+            const lastTokenId = activeIds.length > 0 ? activeIds[activeIds.length - 1] : null;
+            if (lastTokenId && this.syntacticSchemas.has(lastTokenId)) {
+                const newSchema = this.syntacticSchemas.get(lastTokenId);
+                activeSchemas.push({ schema: newSchema, stepIndex: 0, memory: new Map() });
+                // Log de débogage pour confirmer l'activation
+                console.log(`\x1b[36m[SCHEMA DETECT]\x1b[0m Schéma activé par l'amorce: "${this.reverseVocab.get(lastTokenId)}"`);
+            }
 
-        let lastId = activeIds[activeIds.length - 1] || 2; // <eos> par défaut si pas de contexte pour amorcer une ancre
+            let lastId = activeIds[activeIds.length - 1] || 2; // <eos> par défaut si pas de contexte pour amorcer une ancre
 
-        // --- NOUVELLE STRATÉGIE : BEAM SEARCH BINAIRE (pour faible créativité) ---
-        // Si la créativité est très faible, on utilise une méthode de construction bit à bit,
-        // beaucoup plus rapide que l'évaluation de tous les candidats.
-        if (creativity < 0.1 && topK <= 3) {
-            const beamWidth = 3;
-            let beams = [{ id: 0, score: 1.0, context: this.bitEngine.context }];
+            // --- NOUVELLE STRATÉGIE : BEAM SEARCH BINAIRE (pour faible créativité) ---
+            if (creativity < 0.1 && topK <= 3) {
+                const beamWidth = 3;
+                let beams = [{ id: 0, score: 1.0, context: this.bitEngine.context }];
 
-            const bitBias = attLayer ? attLayer.getBitBias(activeIds, identityIds, queryIds) : null;
+                const bitBias = attLayer ? attLayer.getBitBias(activeIds, identityIds, queryIds) : null;
 
-            for (let b = 11; b >= 0; b--) {
-                const allNextBeams = [];
-                for (const beam of beams) {
-                    const tempPredictor = new NeuralBitPredictor();
-                    tempPredictor.context = beam.context;
+                for (let b = 11; b >= 0; b--) {
+                    const allNextBeams = [];
+                    for (const beam of beams) {
+                        const tempPredictor = new NeuralBitPredictor();
+                        tempPredictor.context = beam.context;
 
-                    // --- Calcul de la probabilité pour le bit '1' ---
-                    const prob1 = tempPredictor.table[tempPredictor._getHash()] / 255;
-                    
-                    // Application du biais d'attention
-                    let biasedProb1 = prob1;
-                    if (bitBias && bitBias.totalWeight > 0) {
-                        const biasForBit = bitBias.bias[b] / (bitBias.totalWeight * 0.3);
-                        // On transforme le biais en facteur multiplicatif via exp()
-                        const biasFactor = Math.exp(Math.max(-2.0, Math.min(2.0, biasForBit)));
-                        biasedProb1 *= biasFactor;
+                        const prob1 = tempPredictor.table[tempPredictor._getHash()] / 255;
+                        let biasedProb1 = prob1;
+                        if (bitBias && bitBias.totalWeight > 0) {
+                            const biasForBit = bitBias.bias[b] / (bitBias.totalWeight * 0.3);
+                            const biasFactor = Math.exp(Math.max(-2.0, Math.min(2.0, biasForBit)));
+                            biasedProb1 *= biasFactor;
+                        }
+
+                        const nextContext0 = ((beam.context << 1n) | 0n) & this.bitEngine.mask;
+                        allNextBeams.push({ id: beam.id, score: beam.score * (1.0 - biasedProb1), context: nextContext0 });
+
+                        const nextContext1 = ((beam.context << 1n) | 1n) & this.bitEngine.mask;
+                        allNextBeams.push({ id: beam.id | (1 << b), score: beam.score * biasedProb1, context: nextContext1 });
                     }
 
-                    // --- Création des deux nouvelles branches (bit 0 et bit 1) ---
-                    // Branche pour le bit 0
-                    const nextContext0 = ((beam.context << 1n) | 0n) & this.bitEngine.mask;
-                    allNextBeams.push({
-                        id: beam.id, // L'ID n'est pas encore modifié
-                        score: beam.score * (1.0 - biasedProb1),
-                        context: nextContext0
-                    });
-
-                    // Branche pour le bit 1
-                    const nextContext1 = ((beam.context << 1n) | 1n) & this.bitEngine.mask;
-                    allNextBeams.push({
-                        id: beam.id | (1 << b), // On ajoute le bit à l'ID
-                        score: beam.score * biasedProb1,
-                        context: nextContext1
-                    });
+                    allNextBeams.sort((a, b) => b.score - a.score);
+                    beams = allNextBeams.slice(0, beamWidth);
                 }
 
-                // On ne garde que les 'beamWidth' meilleurs faisceaux
-                allNextBeams.sort((a, b) => b.score - a.score);
-                beams = allNextBeams.slice(0, beamWidth);
+                const bestCandidate = beams[0];
+                const word = this.reverseVocab.get(bestCandidate.id);
+
+                if (word && word !== "<eos>" && word !== "<unk>" && bestCandidate.score > 1e-9) {
+                    this.bitEngine.context = bestCandidate.context;
+                    generatedIds.push(bestCandidate.id);
+                    activeIds.push(bestCandidate.id);
+                    if (activeIds.length > 2) activeIds.shift();
+                    this._shiftId(bestCandidate.id);
+                    return true;
+                }
             }
+            // --- FIN DE LA NOUVELLE STRATÉGIE ---
 
-            // À la fin, le premier faisceau contient l'ID le plus probable
-            const bestCandidate = beams[0];
-            const word = this.reverseVocab.get(bestCandidate.id);
+            let lastWord = lastId ? this.reverseVocab.get(lastId) : "";
+            let lastWasConnector = this.isStructural(lastId);
+            let lastWasPunctuation = ['.', ',', ';', '!', '?'].includes(lastWord);
+            let discourseVector = new Map(queryIds.map(id => [id, 1.0]));
+            let sentencesGenerated = 0;
+            const wordCounts = new Map();
 
-            // Si le mot trouvé est valide, on le retourne directement.
-            if (word && word !== "<eos>" && word !== "<unk>" && bestCandidate.score > 1e-9) {
-                // On met à jour le vrai bitEngine avec le contexte du chemin choisi
-                this.bitEngine.context = bestCandidate.context;
-                
-                // On reconstruit une prédiction simple pour la compatibilité de l'affichage
-                // (Cette partie est simplifiée car on ne génère qu'un seul mot avec cette méthode pour l'instant)
-                const nextWord = this.predictSense(seedSentence + " " + word, depth - 1, options);
-                return (word + " " + nextWord).trim();
-            }
-            // Si le résultat n'est pas concluant, on se rabat sur l'ancienne méthode.
-        }
-        // --- FIN DE LA NOUVELLE STRATÉGIE ---
-
-
-        let lastWord = lastId ? this.reverseVocab.get(lastId) : "";
-        let lastWasConnector = this.isStructural(lastId);
-        let lastWasPunctuation = ['.', ',', ';', '!', '?'].includes(lastWord);
-        
-        // --- NOUVEAU : Vecteur de Discours Évolutif ---
-        // Représente le "sujet" de la conversation, mis à jour à chaque fin de phrase.
-        // C'est une Map<ID, Poids> qui accumule l'énergie sémantique.
-        let discourseVector = new Map(queryIds.map(id => [id, 1.0]));
-
-        let sentencesGenerated = 0;
-
-        // 'depth' devient maintenant une limite de sécurité (budget maximum).
-        // On s'assure qu'elle est suffisante pour le quota de phrases calculé.
-        const maxSafetyLimit = Math.max(depth, targetSentences * 25);
-
-        // On s'assure qu'elle est suffisante pour le quota de phrases calculé.
-        for (let i = 0; i < maxSafetyLimit; i++) {
             // --- NOUVEAU : Application des Schémas Syntaxiques Actifs ---
             let schemaCandidates = null; // Sera une Map si un schéma est actif
             if (activeSchemas.length > 0) {
-                // This block now prepares `schemaCandidates` but doesn't select a token directly.
                 const currentSchema = activeSchemas[activeSchemas.length - 1];
                 const currentStep = currentSchema.schema.steps[currentSchema.stepIndex];
-
+ 
+                // This block now prepares `schemaCandidates` but doesn't select a token directly.
                 console.log(`\x1b[36m  > Schéma actif: [${this.reverseVocab.get(currentSchema.schema.trigger)}] -> Étape ${currentSchema.stepIndex + 1}/${currentSchema.schema.steps.length}\x1b[0m`);
-
+ 
                 schemaCandidates = new Map();
-
+ 
                 // Les étapes WRAP_START et WRAP_END sont traitées comme des littéraux forcés.
                 if (currentStep.type === 'LITERAL' || currentStep.type === 'WRAP_START' || currentStep.type === 'WRAP_END') { // The schema dictates a specific word.
-
-                    // Le schéma impose un mot spécifique.
+ 
                     const forcedToken = this.reverseVocab.get(currentStep.value);
                     if (forcedToken) {
+                        // Le schéma impose un mot spécifique.
                         console.log(`\x1b[36m    > Le schéma impose le mot: "${forcedToken}"\x1b[0m`);
                         schemaCandidates.set(forcedToken, 100.0); // Score très élevé pour forcer la sélection
                     }
                 } else if (currentStep.type === 'CATEGORY' || currentStep.type === 'WRAP_CONTENT') { // WRAP_CONTENT est traité comme une catégorie
-                    // The schema dictates a category (cluster).
+                    
                     // NOUVEAU : Le schéma impose une catégorie (cluster)
                     const clusterId = currentStep.value;
                     console.log(`\x1b[36m    > Le schéma attend un mot du cluster ID: ${clusterId}\x1b[0m`);
-                    
+ 
                     // CORRECTIF : On vérifie que le clusterId n'est pas null et qu'il existe.
                     if (clusterId !== null && this.clusters.has(clusterId)) {
                         const wordSet = this.clusters.get(clusterId);
@@ -3022,35 +3152,31 @@ export class SemanticRelationalMemory {
                             // Si le schéma demande une catégorie, on fait confiance au schéma.
                             // Le filtrage se fera plus tard si nécessaire.
                             if (word) schemaCandidates.set(word, 50.0); // Score de base pour les candidats de la catégorie
+                            // NOUVEAU : Utilisation de la centralité pour pondérer le score
+                            const centrality = this.wordCentrality.get(wordId) || 0;
+                            schemaCandidates.set(word, 50.0 * (1.0 + centrality * 4.0));
                         }
                     }
-                } else if (currentStep.type === 'GENERATE_PHRASE' ) {
+                } else if (currentStep.type === 'GENERATE_PHRASE') {
                     // --- GESTION DE LA RÉCURSIVITÉ ---
                     // Le schéma demande de générer une sous-phrase.
                     console.log(`\x1b[36m    > Le schéma lance une sous-génération (récursivité)...\x1b[0m`);
-
+ 
                     // On met en pause le schéma actuel en n'avançant pas son index.
                     // On appelle `predictSense` de manière récursive pour générer la sous-phrase.
                     // On passe une copie des options, en réduisant la profondeur pour éviter les boucles infinies.
-                    const subPhraseOptions = { ...options, depth: Math.max(5, depth - 10) };
+                    const subPhraseOptions = { ...options,
+                        depth: Math.max(5, depth - 10)
+                    };
                     const subPhrase = this.predictSense("", subPhraseOptions.depth, subPhraseOptions);
-
+ 
                     // On ajoute les mots de la sous-phrase générée à la séquence principale.
                     const subPhraseTokens = subPhrase.split(' ').filter(t => t);
                     subPhraseTokens.forEach(token => generatedIds.push(this._getWordId(token)));
-
+ 
                     // On avance le schéma à l'étape suivante et on saute le reste de la boucle de prédiction actuelle.
                     currentSchema.stepIndex++;
-                    continue; // On passe directement à l'itération suivante de la boucle principale.
                 }
-            }
-
-            // --- CORRECTIF : Si un schéma est actif mais ne fournit aucun candidat, on le retire ---
-            // Cela évite que le générateur ne reste bloqué sur une étape de schéma impossible.
-            if (activeSchemas.length > 0 && schemaCandidates && schemaCandidates.size === 0) {
-                console.log(`\x1b[33m[SCHEMA WARN]\x1b[0m Le schéma actif n'a produit aucun candidat. Abandon du schéma.\x1b[0m`);
-                activeSchemas.pop();
-                schemaCandidates = null; // On annule les candidats du schéma pour passer à la grammaire normale.
             }
 
             const tossedId = this.bitEngine.tossId ? this.bitEngine.tossId() : null;
@@ -3107,19 +3233,19 @@ export class SemanticRelationalMemory {
                 }
             }
 
-            let candidates = [];
-
             // --- CANDIDATE GATHERING ---
             // Si un schéma est actif, il devient la source prioritaire de candidats.
             // Sinon, on utilise la grammaire habituelle.
+            let candidates = [];
             if (schemaCandidates && schemaCandidates.size > 0) {
                 candidates = Array.from(schemaCandidates.entries()).map(([word, score]) => ({ word, score, id: this.vocabulary.get(word), isStructureHit: true }));
             } else {
                 // On itère uniquement sur le set réduit de candidats pertinents
                 for (const id of candidateIds) {
 
-                const word = this.reverseVocab.get(id);
-                if (id === 0) continue;
+                    const word = this.reverseVocab.get(id);
+
+                    if (id === 0) continue;
 
                 const isConnector = this.isStructural(id) || [',', ';', 'et', 'mais', 'car', 'puis', 'donc', 'ou', 'si', 'or', 'ni'].includes(word);
                 // Est-ce un mot qui débute souvent une phrase ? (Suit <eos> id:2)
@@ -3306,26 +3432,37 @@ export class SemanticRelationalMemory {
                 if (lastWords.length > 0 && lastWords[lastWords.length - 1] === word) score *= 0.0001;
 
                 candidates.push({ id, word, score, isStructureHit });
+                }
             }
-            }
+            
+            let selected = null;
+            const processAndSelectToken = (candidateList, isSchemaDriven) => {
+                const sortedCandidates = candidateList.sort((a, b) => b.score - a.score);
 
-            const processAndSelectToken = (candidateMap) => {
-            // On doit recalculer les candidats triés à partir de la map fournie. `this` est maintenant lié correctement.
-            const sortedCandidates = [...candidateMap.entries()].map(([word, score]) => ({ word, score, id: this.vocabulary.get(word) })).sort((a, b) => b.score - a.score);
+                // --- CORRECTIF POUR SCHÉMA FORCÉ ---
+                // Si la liste ne contient qu'un seul candidat avec un score très élevé,
+                // cela signifie qu'un schéma a imposé ce token. On le sélectionne directement
+                // pour éviter les divisions par zéro ou les scores invalides dans la suite du traitement.
+                if (sortedCandidates.length === 1 && sortedCandidates[0].score > 50.0) {
+                    if (isSchemaDriven) console.log(`\x1b[2m  > Sélection directe du token imposé par le schéma: "${sortedCandidates[0].word}"\x1b[0m`);
+                    return sortedCandidates[0];
+                }
+                // --- FIN DU CORRECTIF ---
 
-            // CORRECTIF : On déclare topCandidate ICI, avant de l'utiliser.
-            const topCandidate = sortedCandidates[0];
-            const secondCandidate = sortedCandidates.length > 1 ? sortedCandidates[1] : null;
-            const certaintyThreshold = 5.0; // Le top 1 doit être 5x plus probable que le top 2
+                const topCandidate = sortedCandidates.length > 0 ? sortedCandidates[0] : null;
+                const secondCandidate = sortedCandidates.length > 1 ? sortedCandidates[1] : null;
+                const certaintyThreshold = 5.0; // Le top 1 doit être 5x plus probable que le top 2
+                
+                // The 'selected' variable was local to this function, causing the ReferenceError.
+                // It should be returned to be used in the outer scope.
+                let chosenCandidate = null;
 
-                let selected = null;
-            // Le choix lucide (déterministe) ne s'applique que si la créativité est quasi-nulle.
-            if (creativity < 0.1 && topCandidate && secondCandidate && (topCandidate.score / (secondCandidate.score + 1e-9)) > certaintyThreshold) {
-                selected = topCandidate;
-            } else {
-                // --- Phase de choix créatif (si incertitude) ---
-                let topKCandidates = sortedCandidates.slice(0, topK);
-
+                // Le choix lucide (déterministe) ne s'applique que si la créativité est quasi-nulle.
+                if (creativity < 0.1 && topCandidate && secondCandidate && (topCandidate.score / (secondCandidate.score + 1e-9)) > certaintyThreshold) {
+                    chosenCandidate = topCandidate;
+                } else {
+                    // --- Phase de choix créatif (si incertitude) ---
+                    let topKCandidates = sortedCandidates.slice(0, topK);
                 if (generatedIds.length < 2) {
                     topKCandidates.forEach(c => {
                         if (['.', '!', '?'].includes(c.word)) {
@@ -3333,36 +3470,38 @@ export class SemanticRelationalMemory {
                         }
                     });
                 }
+                    // Normalisation des Top-K avec la température (créativité)
+                    const temperature = 1.0 - (creativity * 0.9);
+                    let adjustedCandidates = topKCandidates.map(c => ({
+                        ...c,
+                        prob: Math.pow(c.score, temperature)
+                    }));
 
-                // Normalisation des Top-K avec la température (créativité)
-                const temperature = 1.0 - (creativity * 0.9);
-                let adjustedCandidates = topKCandidates.map(c => ({
-                    ...c,
-                    prob: Math.pow(c.score, temperature)
-                }));
+                    let totalScore = adjustedCandidates.reduce((acc, c) => acc + c.prob, 0);
+                    if (totalScore <= 0 || isNaN(totalScore)) {
+                        console.log("\x1b[33m[!] Score total invalide. Fin de la génération.\x1b[0m");
+                        return null; // Return null on failure
+                    }
 
-                let totalScore = adjustedCandidates.reduce((acc, c) => acc + c.prob, 0);
-                if (totalScore <= 0 || isNaN(totalScore)) {
-                    console.log("\x1b[33m[!] Score total invalide. Fin de la génération.\x1b[0m");
-                    return false; // On signale l'échec
+                    let pick = Math.random() * totalScore;
+                    chosenCandidate = adjustedCandidates[0]; // Fallback
+                    for (const cand of adjustedCandidates) {
+                        pick -= cand.prob;
+                        if (pick <= 0) { chosenCandidate = cand; break; }
+                    }
                 }
-
-                let pick = Math.random() * totalScore;
-                selected = adjustedCandidates[0]; // Fallback
-                for (const cand of adjustedCandidates) {
-                    pick -= cand.prob; // Note: 'selected' est défini ici, pas dans la portée externe
-                    if (pick <= 0) { selected = cand; break; }
-                }
+                return chosenCandidate;
             }
 
-            if (!selected) {
-                // This can happen if the schema provides candidates but the selection logic fails.
-                // We should break to avoid an infinite loop.
+            selected = processAndSelectToken(candidates, !!schemaCandidates);
+
+            // This can happen if the schema provides candidates but the selection logic fails.
+            if (!selected) { // We should break to avoid an infinite loop.
                 console.log("\x1b[33m[!] Impossible de choisir un token. Fin de la génération.\x1b[0m");
-                i = maxSafetyLimit; // Force la sortie de la boucle
                 return false; // On signale l'échec
             }
 
+            // --- GESTION DE LA FIN DE GÉNÉRATION ---
             const word = selected.word;
             const selectedId = selected.id;
             // Signal d'arrêt : si le mot sélectionné est le jeton de fin, on stoppe
@@ -3374,7 +3513,7 @@ export class SemanticRelationalMemory {
             // --- NOUVEAU : Gestion de l'état des schémas après la sélection ---
             // 1. Avancer ou terminer le schéma en cours
             if (activeSchemas.length > 0) {
-                const currentSchema = activeSchemas[activeSchemas.length - 1]; // On prend le schéma le plus récent
+                const currentSchema = activeSchemas[activeSchemas.length - 1];
                 currentSchema.stepIndex++;
                 if (currentSchema.stepIndex >= currentSchema.schema.steps.length) {
                     activeSchemas.pop(); // Le schéma est terminé
@@ -3382,21 +3521,15 @@ export class SemanticRelationalMemory {
                 }
             }
 
-            // AFFICHAGE LIVE :
-            if (selected.isStructureHit) {
-                // process.stdout.write(`\x1b[36m${word}\x1b[0m `); // Cyan pour structure reconnue
-            } else if (tossedId !== null && selectedId === tossedId) {
-                // process.stdout.write(`\x1b[35m${word}\x1b[0m `); // Magenta pour le jet réussi
-            } else {
-                // process.stdout.write(`${word} `);
-            }
-
-            generatedIds.push(selectedId);
-
             // 2. Vérifier si le mot choisi déclenche un nouveau schéma
             if (this.syntacticSchemas.has(selectedId)) {
-                const newSchema = { ...this.syntacticSchemas.get(selectedId) };
-                activeSchemas.push({ schema: newSchema, stepIndex: 0, memory: new Map() });
+                const newSchema = { ...this.syntacticSchemas.get(selectedId)
+                };
+                activeSchemas.push({
+                    schema: newSchema,
+                    stepIndex: 0,
+                    memory: new Map()
+                });
             }
 
             // ARRÊT INTELLIGENT :
@@ -3421,32 +3554,29 @@ export class SemanticRelationalMemory {
                 sentenceConcepts.forEach(cId => discourseVector.set(cId, (discourseVector.get(cId) || 0) + 1.0));
             }
 
-            lastId = selected.id;
-            const currentRepetitionCount = wordCounts.get(word) || 0;
-            wordCounts.set(word, currentRepetitionCount + 1);
+            // AFFICHAGE LIVE :
+            if (selected.isStructureHit) {
+                // process.stdout.write(`\x1b[36m${word}\x1b[0m `); // Cyan pour structure reconnue
+            } else if (tossedId !== null && selectedId === tossedId) {
+                // process.stdout.write(`\x1b[35m${word}\x1b[0m `); // Magenta pour le jet réussi
+            } else {
+                // process.stdout.write(`${word} `);
+            }
 
-            // Mise à jour de l'état du flux pour le mot suivant
-            lastWord = word;
-            lastWasConnector = this.isStructural(selectedId);
-            lastWasPunctuation = ['.', ',', ';', '!', '?'].includes(word);
-            
-            // Propagation de l'attention : On ajoute le mot généré au contexte actif
+            // --- MISE À JOUR DE L'ÉTAT ---
+            generatedIds.push(selectedId);
             activeIds.push(selectedId);
             if (activeIds.length > 2) activeIds.shift(); // Maintient la fenêtre de 2 IDs pour le trigramme
-
             this._shiftId(selectedId);
             return true; // On signale le succès
-            }
+        };
 
-            if (candidates.length === 0) break;
-            
-            // On appelle la fonction de sélection avec les candidats (qu'ils viennent du schéma ou de la grammaire).
-            // Si elle retourne false, cela signifie que la génération doit s'arrêter (ex: <eos> ou erreur).
-            const continueGeneration = processAndSelectToken(new Map(candidates.map(c => [c.word, c.score])));
-            if (!continueGeneration) {
+        // --- Main generation loop ---
+        for (let i = 0; i < depth; i++) {
+            const canContinue = generateNextToken();
+            if (!canContinue) {
                 break;
             }
-
         }
 
         // --- APPRENTISSAGE PAR L'ERREUR ---
@@ -3458,9 +3588,8 @@ export class SemanticRelationalMemory {
         }
 
         const result = generatedIds.map(id => this.reverseVocab.get(id) || '<unk>');
-
-        // Nettoyage des espaces avant la ponctuation pour un rendu propre
-        return result.join(' ').replace(/\s([,.;!])/g, '$1');
+// Utilisation de la nouvelle fonction de jointure intelligente
+        return this._intelligentlyJoinTokens(result);
     }
 
     /**
