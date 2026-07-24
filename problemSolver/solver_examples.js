@@ -5,7 +5,7 @@
  * à travers une série de problèmes concrets.
  */
 
-const { Dichotomy, Optimization } = require('./library.js');
+import { Dichotomy, Optimization } from './library.js';
 
 /**
  * @namespace Dichotomy

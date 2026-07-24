@@ -11,8 +11,8 @@
  *
  */
 
-const { Worker } = require('worker_threads');
-const os = require('os');
+import { Worker } from 'worker_threads';
+import os from 'os';
 /**
  * @namespace Dichotomy
  * @description Un ensemble d'outils de recherche puissants pour les tableaux triés.
@@ -1529,5 +1529,4 @@ Optimization.Operators.solveFacilityLocation = (customers, numFacilities, bounds
     return result;
 };
 
-
-module.exports = { Dichotomy, Optimization };
+export { Dichotomy, Optimization };
