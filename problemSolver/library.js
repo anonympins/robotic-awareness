@@ -327,6 +327,44 @@ const Dichotomy = {
         // low et high sont maintenant très proches. Le pic est entre les deux.
         // On retourne le milieu de l'intervalle final pour une meilleure approximation.
         return (low + high) / 2;
+    },
+
+    /**
+     * Trouve la valeur d'entrée qui maximise le résultat d'une fonction unimodale en utilisant une recherche par N-section.
+     * C'est une généralisation de la recherche ternaire (`findPeak`).
+     * @param {number} low - La borne inférieure de l'espace de recherche.
+     * @param {number} high - La borne supérieure de l'espace de recherche.
+     * @param {function(number): number} evaluator - Une fonction unimodale qui prend une valeur et retourne son "score".
+     * @param {object} [options={}] - Options pour la recherche.
+     * @param {number} [options.precision=1e-9] - La précision requise pour la réponse.
+     * @param {number} [options.sections=3] - Le nombre de sections à diviser (N). Doit être >= 3. 3 correspond à une recherche ternaire.
+     * @returns {number} La valeur (approximative) qui maximise le résultat de l'évaluateur.
+     */
+    findPeakN(low, high, evaluator, options = {}) {
+        const { precision = 1e-9, sections = 3 } = options;
+        if (sections < 3) throw new Error("Le nombre de sections doit être au moins 3.");
+
+        while (high - low > precision) {
+            const points = [];
+            const scores = [];
+            const step = (high - low) / sections;
+
+            // Générer N-1 points de test internes
+            for (let i = 1; i < sections; i++) {
+                const point = low + i * step;
+                points.push(point);
+                scores.push(evaluator(point));
+            }
+
+            // Trouver le point avec le score le plus élevé
+            const maxScoreIndex = scores.indexOf(Math.max(...scores));
+
+            // Réduire l'intervalle de recherche autour du meilleur point trouvé
+            low = points[maxScoreIndex] - step;
+            high = points[maxScoreIndex] + step;
+        }
+
+        return (low + high) / 2;
     }
 };
 
@@ -901,25 +939,42 @@ const Optimization = {
      */
     gradientDescent(initialSolution, gradientFunction, options = {}) {
         const { learningRate = 0.01, maxIterations = 1000, tolerance = 1e-6 } = options;
-
-        let currentSolution = Array.isArray(initialSolution) ? [...initialSolution] : initialSolution;
-
+    
+        // Détection si la solution est un objet avec des méthodes vectorielles/quaternion
+        const isObjectWithMethods = typeof initialSolution === 'object' && initialSolution !== null && 'sub' in initialSolution && 'scale' in initialSolution && 'copyFrom' in initialSolution;
+    
+        let currentSolution = isObjectWithMethods 
+            ? Object.create(Object.getPrototypeOf(initialSolution)).copyFrom(initialSolution)
+            : (Array.isArray(initialSolution) ? [...initialSolution] : initialSolution);
+    
         for (let i = 0; i < maxIterations; i++) {
             const gradient = gradientFunction(currentSolution);
-            
-            if (Array.isArray(currentSolution)) {
+    
+            if (isObjectWithMethods) {
+                // Cas pour Quaternion, Vector3, etc.
+                const step = gradient.scale(learningRate); // Calcule le pas de descente
+                currentSolution.sub(step, currentSolution); // Applique le pas : solution = solution - (lr * gradient)
+    
+                // La vérification de la tolérance est plus complexe pour les objets, on l'ignore pour l'instant
+                // pour se concentrer sur la correction du bug.
+    
+            } else if (Array.isArray(currentSolution)) {
+                // Cas pour les tableaux de nombres
                 const prevSolution = [...currentSolution];
                 for (let j = 0; j < currentSolution.length; j++) {
-                    currentSolution[j] -= learningRate * gradient[j];
+                    currentSolution[j] -= learningRate * (gradient[j] || 0);
                 }
                 const change = prevSolution.reduce((sum, val, idx) => sum + Math.abs(val - currentSolution[idx]), 0);
                 if (change < tolerance) break;
-            } else { // Cas d'une seule variable (nombre)
+    
+            } else {
+                // Cas pour un simple nombre
                 const prevSolution = currentSolution;
                 currentSolution -= learningRate * gradient;
                 if (Math.abs(prevSolution - currentSolution) < tolerance) break;
             }
         }
+    
         return currentSolution;
     },
 

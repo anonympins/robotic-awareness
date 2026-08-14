@@ -1,6 +1,7 @@
 // ============================================================
 // G-NEURO LIB : Library de Neurones Géométriques & Bitwise
 // "Lenient & Powerful" - Version Quaternions + Tête Chercheuse + FK
+// Intégration avec @/problemSolver/library.js pour l'optimisation avancée
 // ============================================================
 
 import zlib from 'node:zlib';
@@ -218,18 +219,133 @@ export class SeekerNeuron {
     update(inputQ, targetError, lr) {
         // --- Validation des entrées ---
         if (isNaN(targetError) || typeof targetError !== 'number' || isNaN(inputQ.w)) return;
-        if (!isFinite(targetError)) return;
 
         // 1. Calcul du gradient d'orientation (la direction vers laquelle pivoter)
         inputQ.scale(targetError, this._tempGrad);
 
         // 2. Condensation : On mélange l'erreur actuelle avec le momentum spatial
-        this.errorMomentum.scale(0.9, this.errorMomentum).add(this._tempGrad.scale(0.1, this._tempGrad), this.errorMomentum);
+        this.errorMomentum.scale(0.9, this.errorMomentum).add(this._tempGrad.scale(0.1, this._tempGrad), this.errorMomentum); // Le scale(0.1) est une forme de learning rate
 
         // 3. Correction : Le neurone "cherche" l'angle optimal
-        this.orientation.sub(this.errorMomentum.scale(lr, this._tempGrad), this.orientation).normalize();
+        // CORRECTION : On doit AJOUTER le gradient (corrigé par le momentum) pour se rapprocher de la cible.
+        this.orientation.add(this.errorMomentum.scale(lr, this._tempGrad), this.orientation).normalize();
     }
 }
+
+/**
+ * NOUVEAU : Discrimine un flux de bytes en analysant sa "personnalité" par rapport à un expert.
+ * Cette fonction détermine le caractère unique du flux, son concept dominant, et le cluster
+ * syntaxique auquel il appartient, réalisant ainsi une véritable caractérisation.
+ * @param {Uint8Array} byteStream - Le flux de données brutes à analyser.
+ * @param {SemanticRelationalMemory} expert - L'instance de l'expert (le "cerveau") qui a déjà appris d'autres flux.
+ * @param {object} [options={}] - Options pour la discrimination.
+ * @param {number} [options.minTokenLength=2] - Longueur minimale des tokens à considérer.
+ * @param {number} [options.discriminantThreshold=0.5] - Seuil relatif (0-1) pour inclure un concept comme discriminant (par rapport au score du meilleur).
+ * @param {number} [options.minDiscriminantScore=1.0] - Score absolu minimum pour qu'un concept soit considéré comme discriminant.
+ * @returns {{uniquenessScore: number, discriminantConcepts: Array<{token: string, score: number}>, primaryClusterId: number, clusterPeers: string[]}}
+ * - `uniquenessScore`: Score de 0 à 1. 1 signifie totalement inconnu, 0 signifie parfaitement connu.
+ * - `discriminantConcepts`: Un tableau des "mots" ou "tokens" les plus caractéristiques du flux. Chaque objet contient :
+ *   - `token`: Le mot discriminant.
+ *   - `score`: Son score de pertinence.
+ *   - `clusterId`: L'ID de son cluster syntaxique.
+ *   - `clusterPeers`: Des exemples d'autres mots du même cluster.
+ */
+export function discriminateStream(byteStream, expert, options = {}) {
+    if (!expert || !expert.route) {
+        throw new Error("Un expert (SemanticRelationalMemory) valide est requis.");
+    }
+    // CORRECTION : L'expert peut être un MoE. Dans ce cas, les données sémantiques
+    // sont dans le `sharedState`. On crée une référence vers la bonne source de données.
+    const semanticSource = expert.sharedState || expert;
+
+    const minTokenLength = options.minTokenLength || 2;
+    const discriminantThreshold = options.discriminantThreshold !== undefined ? options.discriminantThreshold : 0.5; // Par défaut, 50% du score du meilleur
+    const minDiscriminantScore = options.minDiscriminantScore !== undefined ? options.minDiscriminantScore : 1.0; // Score absolu minimum
+
+    // 1. Conversion du flux de bytes en une séquence de "mots" (tokens)
+    const text = new TextDecoder("utf-8", { fatal: false }).decode(byteStream);
+    const tokens = text.toLowerCase().match(/[a-z0-9àâäéèêëïîôöùûüç]{2,}/g) || [];
+
+    if (tokens.length === 0) {
+        return { uniquenessScore: 1, discriminantConcepts: [] };
+    }
+
+    // 2. Calcul du score d'unicité : quelle part du flux est inconnue de l'expert ?
+    let unknownTokens = 0;
+    tokens.forEach(token => {
+        if (!semanticSource.vocabulary.has(token)) {
+            unknownTokens++;
+        }
+    });
+    const uniquenessScore = unknownTokens / tokens.length;
+
+    // 3. Identification du concept dominant (sa "personnalité")
+    // On utilise la même logique que le routeur d'expert pour trouver le mot le plus saillant.
+    // CORRECTION : La méthode `route` n'existe pas. On réimplémente la logique de scoring ici.
+    const conceptCandidates = [];
+    const localCounts = new Map();
+    tokens.forEach(t => localCounts.set(t, (localCounts.get(t) || 0) + 1));
+
+    for (let [token, localCount] of localCounts) {
+        if (token.length < minTokenLength) continue;
+        const id = semanticSource.vocabulary.get(token);
+        const globalCount = id ? (semanticSource.wordCounts.get(id) || 0) : 0;
+        
+        const totalTokens = semanticSource.totalTokensProcessed || 1;
+        const globalFreq = globalCount / totalTokens;
+        const isStructural = globalFreq > 0.005;
+
+        // On ignore les mots structurels (le, la, un...) sauf s'ils sont le seul mot.
+        if (isStructural && tokens.length > 1) continue; 
+
+        // Le score de spécificité est basé sur la rareté du mot dans le corpus global.
+        const specificity = Math.log1p(1 / (globalFreq + 1e-9));
+
+        // NOUVEAU : Bonus de familiarité. Un mot connu mais rare est un meilleur
+        // "concept d'ancrage" qu'un mot totalement inconnu.
+        const familiarityBoost = (id !== undefined && globalCount > 0) ? 1.5 : 0.8;
+        
+        // CORRECTION : Le bonus de familiarité doit être plus discriminant. On pénalise plus fortement les mots inconnus.
+        const score = localCount * specificity * Math.log2(token.length + 1) * ((id !== undefined) ? 1.5 : 0.5);
+        conceptCandidates.push({ token, score });
+    }
+    conceptCandidates.sort((a, b) => b.score - a.score);
+
+    // NOUVEAU : Sélection de tous les concepts discriminants "certains"
+    const discriminantConcepts = [];
+    if (conceptCandidates.length > 0) {
+        const topScore = conceptCandidates[0].score;
+        for (const candidate of conceptCandidates) {
+            if (candidate.score >= topScore * discriminantThreshold && candidate.score >= minDiscriminantScore) {
+                // NOUVEAU : On cherche le cluster pour CHAQUE concept discriminant
+                const conceptId = semanticSource.vocabulary.get(candidate.token);
+                let clusterId = -1;
+                let clusterPeers = [];
+
+                if (conceptId !== undefined && semanticSource.wordToCluster.has(conceptId)) {
+                    clusterId = semanticSource.wordToCluster.get(conceptId);
+                    const peerIds = semanticSource.clusters.get(clusterId);
+                    if (peerIds) {
+                        clusterPeers = Array.from(peerIds)
+                            .filter(id => id !== conceptId)
+                            .slice(0, 5)
+                            .map(id => semanticSource.reverseVocab.get(id));
+                    }
+                }
+
+                discriminantConcepts.push({ ...candidate, clusterId, clusterPeers });
+            } else {
+                // Les candidats sont triés, donc on peut arrêter si le score descend trop bas
+                break;
+            }
+        }
+    }
+    return {
+        uniquenessScore,
+        discriminantConcepts // Renvoie un tableau de concepts discriminants, chacun avec son cluster
+    };
+}
+
 
 // ---------- Neurone Majoritaire Adaptatif (Apprentissage par Corrélation) ----------
 export class AdaptiveMajorityNeuron {
@@ -279,15 +395,13 @@ export class AdaptiveMajorityNeuron {
      * @param {number} pressure Force de l'ajustement (ex: 1)
      */
     train(inputs, targetBit, pressure = 1) {
-        // Mode "Mémorisation Forte" : on renforce la corrélation systématiquement.
-        // On utilise une pression plus forte pour graver l'information
+        // CORRECTION: The training loop must consider all inputs, not just active ones (inputs[i] === 1),
+        // to learn both positive and negative correlations effectively.
         for (let i = 0; i < this.inputSize; i++) {
-            if (inputs[i] === 1) {
-                // Apprentissage asymétrique avec CLAMPING (Saturation)
-                // On sature rapidement pour que les nouveaux apprentissages ne "noient" pas les anciens
-                let change = (targetBit === 1 ? (pressure * 2) : -(pressure * 20));
-                this.potentials[i] = Math.max(-127, Math.min(127, this.potentials[i] + change));
-            }
+            // If input bit matches target bit, it's a positive correlation. If not, it's negative.
+            const correlation = (inputs[i] === targetBit) ? 1 : -1;
+            const change = correlation * pressure;
+            this.potentials[i] = Math.max(-127, Math.min(127, this.potentials[i] + change * 5));
         }
         this.learningCounter++;
 
@@ -302,12 +416,15 @@ export class AdaptiveMajorityNeuron {
         for (let i = 0; i < this.inputSize; i++) {
             // Augmentation de la plage dynamique (0 à 63)
             // On ignore les signaux faibles (< 3) pour éliminer le "fantôme" de l'information
+            // CORRECTION: The hard cutoff at p > 2 was too aggressive and zeroed out learned weights.
+            // We now allow small positive potentials to become small weights.
             const p = this.potentials[i];
-            this.weights[i] = p > 2 ? Math.min(p, 63) : 0;
+            this.weights[i] = p > 0 ? Math.min(Math.floor(p / 2), 63) : 0;
             totalWeight += this.weights[i];
         }
         // Consensus optimal à 60% : assez souple pour la suite, assez strict pour l'exactitude
-        this.threshold = Math.max(1, Math.ceil(totalWeight * 0.6));
+        // CORRECTION: Un ratio fixe est trop rigide. On utilise une formule plus souple.
+        this.threshold = Math.max(1, Math.floor(totalWeight / 2) + 1);
     }
 
     exportState() {
@@ -325,6 +442,235 @@ export class AdaptiveMajorityNeuron {
         this.threshold = state.threshold;
         this.learningCounter = state.learningCounter;
     }
+}
+
+// ---------- NOUVEAU : Optimisation de Règles par Recuit Simulé ----------
+/**
+ * Utilise le Recuit Simulé pour découvrir la meilleure règle binaire (poids/seuil)
+ * pour un neurone majoritaire sur un jeu de données.
+ * @param {Array<Array<number>>} dataset - Tableau de couples [inputs, target]. Ex: [[[1,0,1], 0], [[0,1,1], 1]]
+ * @param {number} inputSize - La taille du vecteur d'entrée.
+ * @param {import('./problemSolver/library.js').Optimization} optimizationLib - L'instance de la bibliothèque d'optimisation.
+ * @param {object} [options] - Options pour le recuit simulé.
+ * @returns {{weights: number[], threshold: number, accuracy: number}} La meilleure règle trouvée.
+ */
+export function discoverOptimalRule(dataset, inputSize, optimizationLib, options = {}) {
+    if (!optimizationLib?.simulatedAnnealing) {
+        throw new Error("La bibliothèque d'optimisation (simulatedAnnealing) est requise.");
+    }
+
+    // 1. L'évaluateur : calcule l'erreur d'une règle donnée sur le dataset.
+    // L'objectif est de MINIMISER cette erreur.
+    const evaluator = (rule) => {
+        // CORRECTION: The MajorityNeuron constructor was updated to accept a config object.
+        // The evaluator was still using the old (weights, threshold) signature. This is now corrected.
+        // We pass the rule object directly.
+        const neuron = new MajorityNeuron(rule);
+        let errors = 0;
+        for (const [inputs, target] of dataset) {
+            const prediction = neuron.predict(inputs);
+            if (prediction !== target) {
+                errors++;
+            }
+        }
+        return errors; // Le score à minimiser est le nombre d'erreurs.
+    };
+
+    // 2. Le générateur de voisin : modifie légèrement une règle existante.
+    const neighbor = (rule) => {
+        const newRule = {
+            weights: [...rule.weights],
+            threshold: rule.threshold
+        };
+        // On modifie soit un poids, soit le seuil.
+        if (Math.random() < 0.8) { // 80% de chance de changer un poids
+            const i = Math.floor(Math.random() * inputSize);
+            newRule.weights[i] += (Math.random() < 0.5 ? -1 : 1);
+            // CORRECTION: The optimizer needs to be able to explore negative weights
+            // to correctly model inhibitory conditions (like NOT input[4]).
+            newRule.weights[i] = Math.max(-10, Math.min(10, newRule.weights[i])); // Poids entre -10 et 10
+        } else { // 20% de chance de changer le seuil
+            newRule.threshold += (Math.random() < 0.5 ? -1 : 1);
+            // CORRECTION: The threshold must be constrained correctly. It should not be less than 0
+            // and not greater than the total sum of weights to be meaningful.
+            // The constraint should be based on the sum of *absolute* weights, representing the maximum possible vote score.
+            const maxPossibleVote = newRule.weights.reduce((a, b) => a + Math.abs(b), 0);
+            newRule.threshold = Math.max(0, Math.min(maxPossibleVote, newRule.threshold));
+        }
+        return newRule;
+    };
+
+    // 3. Lancement du Recuit Simulé
+    const initialRule = {
+        weights: Array.from({ length: inputSize }, () => Math.floor(Math.random() * 3)),
+        threshold: Math.floor(inputSize / 2)
+    };
+
+    const saOptions = {
+        initialTemperature: options.initialTemperature || 100,
+        coolingRate: options.coolingRate || 0.99,
+        maxIterations: options.maxIterations || 5000
+    };
+
+    const { solution, energy } = optimizationLib.simulatedAnnealing(initialRule, evaluator, neighbor, saOptions.initialTemperature, saOptions.coolingRate, saOptions.maxIterations);
+
+    const accuracy = dataset.length > 0 ? 1 - (energy / dataset.length) : 1;
+    return { ...solution, accuracy };
+}
+
+/**
+ * NOUVEAU : Utilise un Algorithme Génétique pour découvrir la meilleure règle binaire.
+ * C'est une alternative plus puissante au Recuit Simulé pour les problèmes complexes.
+ * @param {Array<Array<number>>} dataset - Tableau de couples [inputs, target].
+ * @param {number} inputSize - La taille du vecteur d'entrée.
+ * @param {import('./problemSolver/library.js').Optimization} optimizationLib - L'instance de la bibliothèque d'optimisation.
+ * @param {object} [options] - Options pour l'algorithme génétique.
+ * @returns {{weights: number[], threshold: number, accuracy: number}} La meilleure règle trouvée.
+ */
+export function discoverOptimalRuleWithGA(dataset, inputSize, optimizationLib, options = {}) {
+    if (!optimizationLib?.geneticAlgorithm) {
+        throw new Error("La bibliothèque d'optimisation (geneticAlgorithm) est requise.");
+    }
+
+    // 1. La fonction de fitness : identique à l'évaluateur du recuit simulé.
+    // L'objectif est de MINIMISER le nombre d'erreurs.
+    const fitnessFunction = (rule) => {
+        const neuron = new MajorityNeuron(rule);
+        let errors = 0;
+        for (const [inputs, target] of dataset) {
+            if (neuron.predict(inputs) !== target) {
+                errors++;
+            }
+        }
+        return errors;
+    };
+
+    // 2. Création d'un individu (une règle aléatoire)
+    const createIndividual = () => {
+        const weights = Array.from({ length: inputSize }, () => Math.floor(Math.random() * 21) - 10); // Poids entre -10 et 10
+        const maxPossibleVote = weights.reduce((a, b) => a + Math.abs(b), 0);
+        const threshold = Math.floor(Math.random() * (maxPossibleVote + 1));
+        return { weights, threshold };
+    };
+
+    // 3. Croisement (Crossover) : on mélange les gènes (poids/seuil) des parents.
+    const crossover = (parent1, parent2) => {
+        const childWeights = parent1.weights.map((w, i) => (Math.random() < 0.5 ? w : parent2.weights[i]));
+        const childThreshold = Math.random() < 0.5 ? parent1.threshold : parent2.threshold;
+        return { weights: childWeights, threshold: childThreshold };
+    };
+
+    // 4. Mutation : on utilise la même logique que la fonction 'neighbor' du recuit simulé.
+    const mutate = (individual) => {
+        // NOUVELLE STRATÉGIE : "Catastrophe" Évolutive
+        // Il y a une petite chance (ex: 2%) de réinitialiser complètement l'individu.
+        // Cela réintroduit de la diversité brute et aide à s'échapper des optima locaux.
+        if (Math.random() < 0.02) {
+            return createIndividual();
+        }
+
+        const newRule = { ...individual, weights: [...individual.weights] };
+        if (Math.random() < 0.8) {
+            const i = Math.floor(Math.random() * inputSize);
+            newRule.weights[i] += (Math.random() < 0.5 ? -1 : 1);
+            newRule.weights[i] = Math.max(-10, Math.min(10, newRule.weights[i]));
+        } else {
+            newRule.threshold += (Math.random() < 0.5 ? -1 : 1);
+            const maxPossibleVote = newRule.weights.reduce((a, b) => a + Math.abs(b), 0);
+            newRule.threshold = Math.max(0, Math.min(maxPossibleVote, newRule.threshold));
+        }
+        return newRule;
+    };
+
+    // 5. Lancement de l'Algorithme Génétique
+    const gaOptions = {
+        generations: options.generations || 100,
+        populationSize: options.populationSize || 50,
+        ...options
+    };
+
+    const { solution, fitness } = optimizationLib.geneticAlgorithm(createIndividual, fitnessFunction, crossover, mutate, gaOptions);
+    const accuracy = 1 - (fitness / dataset.length);
+    return { ...solution, accuracy };
+}
+
+/**
+ * NOUVEAU : Utilise un Algorithme Génétique pour découvrir une architecture de réseau majoritaire.
+ * C'est une évolution de `discoverOptimalRuleWithGA` qui peut résoudre des problèmes non-linéaires.
+ * @param {Array<Array<number>>} dataset - Tableau de couples [inputs, target].
+ * @param {number} inputSize - La taille du vecteur d'entrée.
+ * @param {import('./problemSolver/library.js').Optimization} optimizationLib - L'instance de la bibliothèque d'optimisation.
+ * @param {object} [options] - Options pour l'algorithme génétique.
+ * @param {number} [options.hiddenNeurons=2] - Nombre de neurones dans la couche cachée.
+ * @returns {{network: MajorityNetwork, accuracy: number}} Le meilleur réseau trouvé.
+ */
+export function discoverOptimalNetworkWithGA(dataset, inputSize, optimizationLib, options = {}) {
+    if (!optimizationLib?.geneticAlgorithm) {
+        throw new Error("La bibliothèque d'optimisation (geneticAlgorithm) est requise.");
+    }
+
+    const hiddenNeurons = options.hiddenNeurons || 2;
+    const outputNeurons = 1; // Pour cet exemple, on se concentre sur une seule sortie.
+
+    // 1. La fonction de fitness : évalue la performance d'un réseau complet.
+    const fitnessFunction = (networkConfig) => {
+        const network = new MajorityNetwork(networkConfig);
+        let errors = 0;
+        for (const [inputs, target] of dataset) {
+            const prediction = network.predict(inputs);
+            if (prediction[0] !== target) {
+                errors++;
+            }
+        }
+        return errors;
+    };
+
+    // 2. Création d'un individu (une configuration de réseau aléatoire)
+    const createIndividual = () => {
+        const hiddenLayer = Array.from({ length: hiddenNeurons }, () => {
+            const weights = Array.from({ length: inputSize }, () => Math.floor(Math.random() * 5) - 2); // Poids -2 à 2
+            const threshold = Math.floor(Math.random() * 5);
+            return { weights, threshold };
+        });
+
+        const outputLayer = Array.from({ length: outputNeurons }, () => {
+            const weights = Array.from({ length: hiddenNeurons }, () => Math.floor(Math.random() * 5) - 2);
+            const threshold = Math.floor(Math.random() * 3);
+            return { weights, threshold };
+        });
+
+        return [hiddenLayer, outputLayer];
+    };
+
+    // 3. Croisement : on mélange les neurones des couches des parents.
+    const crossover = (parent1, parent2) => {
+        const childHidden = parent1[0].map((neuron, i) => (Math.random() < 0.5 ? neuron : parent2[0][i]));
+        const childOutput = parent1[1].map((neuron, i) => (Math.random() < 0.5 ? neuron : parent2[1][i]));
+        return [childHidden, childOutput];
+    };
+
+    // 4. Mutation : on modifie un poids ou un seuil dans une couche au hasard.
+    const mutate = (individual) => {
+        const newIndividual = JSON.parse(JSON.stringify(individual)); // Deep copy
+        const layerIndex = Math.random() < 0.7 ? 0 : 1; // 70% de chance de muter la couche cachée
+        const neuronIndex = Math.floor(Math.random() * newIndividual[layerIndex].length);
+        const neuron = newIndividual[layerIndex][neuronIndex];
+
+        if (Math.random() < 0.8) { // Muter un poids
+            const weightIndex = Math.floor(Math.random() * neuron.weights.length);
+            neuron.weights[weightIndex] += (Math.random() < 0.5 ? -1 : 1);
+        } else { // Muter le seuil
+            neuron.threshold += (Math.random() < 0.5 ? -1 : 1);
+        }
+        return newIndividual;
+    };
+
+    // 5. Lancement de l'Algorithme Génétique
+    const gaOptions = { generations: 200, populationSize: 150, ...options };
+
+    const { solution, fitness } = optimizationLib.geneticAlgorithm(createIndividual, fitnessFunction, crossover, mutate, gaOptions);
+    const accuracy = 1 - (fitness / dataset.length);
+    return { network: new MajorityNetwork(solution), accuracy };
 }
 
 // ---------- Générateur de Règles Probabilistes ----------
@@ -391,6 +737,100 @@ export class SeekerLayer {
     }
 }
 
+/**
+ * NOUVEAU : Entraîneur de couche Seeker par Algorithme Génétique (Neuroévolution).
+ * Fait évoluer une population de couches pour trouver la meilleure configuration d'orientations.
+ * @param {Array<Array<any>>} dataset - Tableau de couples [inputs, targets]. Ex: [[[vec1, vec2], [0.9, -0.5]], ...]
+ * @param {number} inputSize - Nombre de vecteurs en entrée.
+ * @param {number} outputSize - Nombre de neurones dans la couche.
+ * @param {import('./problemSolver/library.js').Optimization} optimizationLib - L'instance de la bibliothèque d'optimisation.
+ * @param {object} [options] - Options pour l'algorithme génétique.
+ * @returns {SeekerLayer} La meilleure couche entraînée.
+ */
+export function trainSeekerLayerWithGA(dataset, inputSize, outputSize, optimizationLib, options = {}) {
+    if (!optimizationLib || !optimizationLib.geneticAlgorithm) {
+        throw new Error("La bibliothèque d'optimisation (geneticAlgorithm) est requise.");
+    }
+
+    // Un "individu" est un tableau plat de quaternions [q1, q2, ..., qN]
+    const createIndividual = () => Array.from({ length: outputSize }, () => Quaternion.random());
+
+    // La fonction de fitness évalue la performance d'un individu (une couche)
+    const fitnessFunction = (individual) => {
+        const layer = new SeekerLayer(inputSize, outputSize);
+        layer.neurons.forEach((neuron, i) => neuron.orientation.copyFrom(individual[i]));
+
+        let totalError = 0;
+        for (const [inputs, targets] of dataset) {
+            const outputs = layer.forward(inputs);
+            for (let i = 0; i < outputs.length; i++) {
+                totalError += Math.pow(outputs[i] - (targets[i] || 0), 2);
+            }
+        }
+        return totalError / dataset.length; // MSE
+    };
+
+    // Croisement : on interpole les orientations des parents
+    const crossover = (parent1, parent2) => {
+        const child = [];
+        for (let i = 0; i < outputSize; i++) {
+            // Interpolation sphérique (Slerp) pour un mélange "naturel" des rotations
+            child.push(Quaternion.slerp(parent1[i], parent2[i], 0.5));
+        }
+        return child;
+    };
+
+    // --- AMÉLIORATION : Mutation Intelligente (Memetic Algorithm) ---
+    // Au lieu d'une simple rotation aléatoire, la mutation peut déclencher
+    // une micro-optimisation par descente de gradient sur un neurone.
+    const mutate = (individual) => {
+        const newIndividual = individual.map(q => new Quaternion(q.w, q.x, q.y, q.z)); // Copie profonde
+        const neuronToMutate = Math.floor(Math.random() * outputSize);
+
+        // 20% de chance d'une mutation "intelligente", 80% d'une mutation classique
+        if (Math.random() < 0.2 && optimizationLib.gradientDescent) {
+            // 1. Définir la fonction de gradient pour UN SEUL neurone
+            const gradientFunction = (orientation) => {
+                const tempIndividual = [...newIndividual];
+                tempIndividual[neuronToMutate] = orientation;
+                const layer = new SeekerLayer(inputSize, outputSize);
+                layer.neurons.forEach((neuron, i) => neuron.orientation.copyFrom(tempIndividual[i]));
+
+                const totalGradient = new Quaternion(0,0,0,0);
+                for (const [inputs, targets] of dataset) {
+                    const outputs = layer.forward(inputs);
+                    const error = outputs[neuronToMutate] - (targets[neuronToMutate] || 0);
+                    
+                    // Le gradient de l'erreur MSE est proportionnel à l'erreur * l'input
+                    for(const vec of inputs) {
+                        const inputQ = Quaternion.fromVec3(vec).normalize();
+                        totalGradient.add(inputQ.scale(error), totalGradient);
+                    }
+                }
+                return totalGradient.scale(2 / dataset.length); // Gradient de la MSE
+            };
+
+            // 2. Appliquer quelques pas de descente de gradient comme mutation
+            const optimizedOrientation = optimizationLib.gradientDescent(newIndividual[neuronToMutate], gradientFunction, { learningRate: 0.1, maxIterations: 5 });
+            newIndividual[neuronToMutate] = optimizedOrientation.normalize();
+
+        } else {
+            // Mutation classique : petite rotation aléatoire
+            const mutationStrength = 0.2; // Angle de mutation
+            const randomRotation = new Quaternion(1 - mutationStrength, (Math.random() - 0.5) * mutationStrength, (Math.random() - 0.5) * mutationStrength, (Math.random() - 0.5) * mutationStrength).normalize();
+            newIndividual[neuronToMutate].multiply(randomRotation, newIndividual[neuronToMutate]).normalize();
+        }
+        return newIndividual;
+    };
+
+    // Lancement de l'algorithme génétique
+    const { solution } = optimizationLib.geneticAlgorithm(createIndividual, fitnessFunction, crossover, mutate, { generations: 50, populationSize: 40, ...options });
+
+    // On retourne une nouvelle couche configurée avec la meilleure solution trouvée
+    const bestLayer = new SeekerLayer(inputSize, outputSize);
+    bestLayer.neurons.forEach((neuron, i) => neuron.orientation.copyFrom(solution[i]));
+    return bestLayer;
+}
 
 // ---------- Types de neurones ----------
 export const NeuronType = {
@@ -425,12 +865,23 @@ export class BitPerceptron {
 
 // ---------- Neurone à vote majoritaire avec pondération ----------
 export class MajorityNeuron {
-    constructor(weights, customThreshold = null) { // Added customThreshold
-        // weights: tableau d'entiers (nombre de voix pour chaque entrée)
-        this.weights = new Int32Array(weights);
+    constructor(configOrWeights, customThreshold = null) { // Added customThreshold
+        let weights;
+        let threshold;
+
+        if (typeof configOrWeights === 'object' && !Array.isArray(configOrWeights) && configOrWeights !== null) {
+            weights = configOrWeights.weights;
+            threshold = configOrWeights.threshold;
+        } else {
+            weights = configOrWeights;
+            threshold = customThreshold;
+        }
+
+        this.weights = new Int32Array(weights || []);
         this.totalVoices = 0;
         for (let i = 0; i < this.weights.length; i++) this.totalVoices += Math.abs(this.weights[i]);
-        this.majorityThreshold = (customThreshold !== null && customThreshold !== undefined) ? customThreshold : (this.totalVoices >> 1) + 1;
+        
+        this.majorityThreshold = (threshold !== null && threshold !== undefined) ? threshold : Math.floor(this.totalVoices / 2) + 1;
     }
 
     predict(inputs) {
@@ -667,6 +1118,73 @@ export class BitwiseRNNCell {
     }
 }
 
+/**
+ * NOUVEAU : Un réseau majoritaire qui apprend directement à partir des données.
+ * Utilise une cascade de neurones adaptatifs pour résoudre des problèmes non-linéaires
+ * par un apprentissage couche par couche.
+ */
+export class AdaptiveMajorityNetwork {
+    /**
+     * @param {number} inputSize Taille du vecteur d'entrée initial.
+     * @param {number[]} hiddenLayerSizes Tableau des tailles des couches cachées. Ex: [10, 5]
+     * @param {number} outputSize Taille de la couche de sortie.
+     */
+    constructor(inputSize, hiddenLayerSizes, outputSize) {
+        this.layers = [];
+        let currentInputSize = inputSize;
+
+        // Création des couches cachées
+        for (const size of hiddenLayerSizes) {
+            this.layers.push(
+                Array.from({ length: size }, () => new AdaptiveMajorityNeuron(currentInputSize))
+            );
+            currentInputSize = size; // La sortie de cette couche est l'entrée de la suivante
+        }
+
+        // Création de la couche de sortie
+        this.layers.push(
+            Array.from({ length: outputSize }, () => new AdaptiveMajorityNeuron(currentInputSize))
+        );
+    }
+
+    predict(inputs) {
+        let currentOutputs = inputs;
+        for (const layer of this.layers) {
+            const nextOutputs = new Uint8Array(layer.length);
+            for (let i = 0; i < layer.length; i++) {
+                nextOutputs[i] = layer[i].predict(currentOutputs);
+            }
+            currentOutputs = nextOutputs;
+        }
+        return currentOutputs;
+    }
+
+    /**
+     * Entraîne le réseau couche par couche de manière "gourmande".
+     * Chaque couche apprend à prédire la sortie finale à partir de la sortie de la couche précédente.
+     * @param {Array<[Uint8Array, Uint8Array]>} dataset 
+     * @param {number} epochs 
+     */
+    train(dataset, epochs = 1) {
+        for (let epoch = 0; epoch < epochs; epoch++) {
+            for (const [inputs, targets] of dataset) {
+                let currentLayerInputs = inputs;
+
+                for (const layer of this.layers) {
+                    const nextLayerInputs = new Uint8Array(layer.length);
+                    
+                    layer.forEach((neuron, i) => {
+                        // Chaque neurone de la couche apprend à prédire la cible finale
+                        // à partir des entrées de sa propre couche.
+                        neuron.train(currentLayerInputs, targets[i] || 0);
+                        nextLayerInputs[i] = neuron.predict(currentLayerInputs);
+                    });
+                    currentLayerInputs = nextLayerInputs;
+                }
+            }
+        }
+    }
+}
 // ---------- Réseau Majoritaire Récurrent (StatefulMajorityNetwork) ----------
 // Un réseau qui maintient un état interne (sa propre sortie précédente)
 // et l'utilise comme entrée pour la prédiction suivante.
@@ -2463,43 +2981,59 @@ export class SemanticRelationalMemory {
 
     /** NOUVEAU: Calcule la similarité entre deux empreintes syntaxiques. */
     _calculateFingerprintSimilarity(fp1, fp2, similarityCache) {
-        if (!fp1 || !fp2) return 0.0;
+        // CORRECTION MAJEURE : Remplacement de l'algorithme de similarité par une
+        // similarité cosinus pondérée, beaucoup plus standard et robuste pour ce cas d'usage.
+        // L'ancienne méthode (cosinus) diluait trop le signal sur de petits corpus.
+        // On passe à une similarité de Jaccard pondérée, plus indulgente.
+        const calculateJaccardSimilarity = (map1, map2) => {
+            if (!map1 || !map2 || map1.size === 0 || map2.size === 0) return 0.0;
 
-        // Fonction pour calculer la similarité des contextes (pre ou post) en utilisant le cache
-        const calculateContextSimilarity = (map1, map2) => {
-            if (map1.size === 0 || map2.size === 0) return 0.0;
+            const intersectionKeys = new Set();
+            const unionKeys = new Set([...map1.keys(), ...map2.keys()]);
 
-            let totalSimilarity = 0;
-            let totalWeight = 0;
-
-            // On compare chaque mot du contexte de fp1 avec chaque mot du contexte de fp2
-            for (const [id1, weight1] of map1.entries()) {
-                for (const [id2, weight2] of map2.entries()) {
-                    let sim;
-                    if (id1 === id2) {
-                        sim = 1.0;
-                    } else {
-                        // Sinon, on utilise la similarité déjà calculée (ou 0 si pas encore fait)
-                        const key = id1 < id2 ? `${id1}-${id2}` : `${id2}-${id1}`;
-                        sim = similarityCache.get(key) || 0.0;
-                    }
-                    totalSimilarity += sim * weight1 * weight2;
-                    totalWeight += weight1 * weight2;
+            for (const key of map1.keys()) {
+                if (map2.has(key)) {
+                    intersectionKeys.add(key);
                 }
             }
-            return totalWeight > 0 ? totalSimilarity / totalWeight : 0.0;
+
+            if (unionKeys.size === 0) return 0.0;
+
+            // Le score est le ratio de contextes partagés sur l'ensemble des contextes.
+            // C'est plus permissif que la similarité cosinus pour des données éparses.
+            const score = intersectionKeys.size / unionKeys.size;
+            return score;
         };
 
-        const preSim = calculateContextSimilarity(fp1.pre, fp2.pre);
-        const postSim = calculateContextSimilarity(fp1.post, fp2.post);
+        const preSim = calculateJaccardSimilarity(fp1.pre, fp2.pre);
+        const postSim = calculateJaccardSimilarity(fp1.post, fp2.post);
 
-        return (preSim + postSim) / 2.0;
+        // On donne plus de poids à la similarité si les deux contextes (pré et post) correspondent.
+        return (preSim > 0 && postSim > 0) ? (preSim + postSim) : (preSim + postSim) / 2.0;
     }
 
     _updateSyntacticClusters() {
         // On utilise un seuil plus bas pour permettre le regroupement sur un petit corpus.
         // Le seuil est ajusté pour fusionner les clusters sémantiquement purs mais fragmentés.
-        this._performClustering(0.55);
+        this._performClustering(0.4); // Seuil abaissé pour encourager plus de clustering
+
+        // NOUVEAU : Log pour la visibilité du clustering
+        console.log(`\n\x1b[36m[CLUSTERING]\x1b[0m Analyse syntaxique terminée. Clusters trouvés :`);
+        const sortedClusters = Array.from(this.clusters.entries())
+            .filter(([_, wordSet]) => wordSet.size > 1) // On ne montre que les clusters avec plus d'un mot
+            .sort((a, b) => b[1].size - a[1].size)
+            .slice(0, 10); // On limite aux 10 plus grands clusters
+
+        if (sortedClusters.length === 0) {
+            console.log("  \x1b[90mAucun cluster significatif (taille > 1) n'a été formé.\x1b[0m");
+        } else {
+            sortedClusters.forEach(([clusterId, wordSet]) => {
+                const words = Array.from(wordSet).map(id => this.reverseVocab.get(id) || `ID:${id}`);
+                // On affiche le mot le plus "central" (représentatif) en premier
+                words.sort((a, b) => (this.wordCentrality.get(this.vocabulary.get(b)) || 0) - (this.wordCentrality.get(this.vocabulary.get(a)) || 0));
+                console.log(`  - Cluster ${clusterId}: [ \x1b[1m${words[0]}\x1b[0m, ${words.slice(1).join(', ')} ]`);
+            });
+        }
     }
 
     /**
@@ -4844,19 +5378,29 @@ console.log(texteGenere);
 //benchmarkCompiledRules();
 
 console.log("\n=== Mode Optionnel : Seeker Quaternions ===");
-const seeker = new SeekerLayer(3, 2); // 3 entrées (x,y,z), 2 neurones de sortie
-const mockInput = [[1, 0.5, -0.2], [0.1, 1, 0.8]];
-const mockTarget = [0.9, -0.5];
 
-console.log("Démarrage de la tête chercheuse géométrique...");
-for(let i = 0; i < 50; i++) {
-    const loss = seeker.train(mockInput, mockTarget, 0.1);
-    if (i % 10 === 0) console.log(`  Cycle ${i} - Perte : ${loss.toFixed(6)}`);
-}
+// --- NOUVEL EXEMPLE AVEC OPTIMISATION ---
+// On a besoin de la bibliothèque d'optimisation pour les nouvelles fonctions
+import { Optimization } from './problemSolver/library.js';
 
-const finalRes = seeker.forward(mockInput);
-console.log("Cibles visées :", mockTarget);
-console.log("Positions finales :", finalRes.map(v => v.toFixed(4)));
+const seekerDataset = [
+    [[[1, 0, 0], [0, 1, 0]], [0.8, 0.2]],  // Entrée 1 -> Cible 1
+    [[[-1, 0, 0], [0, -1, 0]], [-0.8, -0.2]], // Entrée 2 -> Cible 2
+    [[[0, 0, 1], [1, 1, 0]], [0.5, 0.5]]     // Entrée 3 -> Cible 3
+];
+
+console.log("Démarrage de la neuroévolution de la couche Seeker...");
+const trainedSeekerLayer = trainSeekerLayerWithGA(seekerDataset, 2, 2, Optimization);
+console.log("Entraînement par algorithme génétique terminé.");
+
+const finalRes = trainedSeekerLayer.forward(seekerDataset[0][0]);
+console.log("Cibles visées pour l'entrée 1:", seekerDataset[0][1]);
+console.log("Positions finales après entraînement GA:", finalRes.map(v => v.toFixed(4)));
+
+console.log("\n=== Découverte de règle binaire optimale ===");
+const binaryDataset = [[[1,1,0], 1], [[1,0,1], 1], [[0,1,1], 1], [[1,0,0], 0], [[0,0,1], 0]];
+const bestRule = discoverOptimalRule(binaryDataset, 3, Optimization);
+console.log("La meilleure règle trouvée pour le dataset (MAJORITY) est :", bestRule);
 
 
 
@@ -6936,14 +7480,8 @@ export class BitwiseSequenceLearner {
             
             // Décision Analogique-Digital :
             // Un bit est à 1 si le consensus (thresholdRatio) est solide.
-            if (confidence.thresholdRatio > 0.9) {
-                outputBits[b] = 1;
-            } else if (confidence.thresholdRatio < 0.4) {
-                outputBits[b] = 0;
-            } else {
-                // En zone d'incertitude (bruit), on utilise le score pur
-                outputBits[b] = (confidence.score > 0.5) ? 1 : 0;
-            }
+            // CORRECTION: The logic was flawed. A ratio >= 1 means the threshold is met.
+            outputBits[b] = (confidence.thresholdRatio >= 1.0) ? 1 : 0;
         }
 
         // Moyenne de confiance sur les 8 neurones
@@ -7192,6 +7730,20 @@ export class GNeuroMoE {
         this.experts.set(domain, brain);
         return brain;
     }
+
+    /**
+     * NOUVEAU : Exécute la logique de clustering syntaxique sur l'état partagé.
+     * C'est la méthode à appeler pour s'assurer que tous les experts bénéficient du clustering.
+     */
+    _updateSyntacticClusters() {
+        // On crée une instance temporaire juste pour accéder à la logique de clustering.
+        // On lui passe l'état partagé pour qu'elle opère dessus.
+        const clusteringAgent = new SemanticRelationalMemory(this.contextSize, this.sharedState);
+        // On appelle la méthode de clustering de l'agent, qui va modifier `this.sharedState` par référence.
+        clusteringAgent._updateSyntacticClusters();
+        console.log(`\x1b[36m[MoE]\x1b[0m Clustering syntaxique de l'état partagé terminé. ${clusteringAgent.clusters.size} clusters trouvés.`);
+    }
+
 
     /**
      * Méthode d'apprentissage centralisée pour le Mixture of Experts.
