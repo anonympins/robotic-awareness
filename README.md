@@ -96,37 +96,6 @@ Queries the brain to generate a prediction or a "continuation of thought" based 
 
 ---
 
-## 🧩 Mixture of Experts (G-NEURO MoE)
-
-The MoE architecture is the core of the system's scalability. Instead of a single massive "brain," G-NEURO divides knowledge into specialized "experts" called **Vortexes**.
-
-### 1. Conceptual Routing (`GNeuroMoE.route`)
-When text is ingested, the orchestrator analyzes the **information density** of words:
-*   **Specificity**: Rare and long words are prioritized to determine the target expert.
-*   **Local Impact**: High-impact tokens (like Wikipedia titles) can force the selection of a specific vortex to ensure context purity.
-*   **The Vortex**: The routing result is a deterministic index pointing to a unique `SemanticRelationalMemory` instance.
-
-### 2. Expert Specialization
-Each vortex develops its own statistical "personality":
-*   **Local Grammar**: Transition probabilities (`grammarMap`) are unique to each expert.
-*   **Bitwise Sculpting**: The `NeuralBitPredictor` within each vortex refines its 256 KB probability table based on its specific domain.
-
-### 3. Fractal MoE (Sub-Experts)
-Each Vortex expert further subdivides its knowledge into **Virtualized Sub-Experts**:
-*   **Granular Specialization**: Within a single domain (e.g., "Robotics"), sub-experts focus on specific sub-contexts (e.g., "Navigation" vs "Hardware specs") based on local sentence seeds.
-*   **Boosted Specialty**: Sub-experts apply a weight boost (x3) to transitions learned within their specific micro-context, significantly increasing fidelity for complex sub-topics.
-*   **Resource Efficiency**: These sub-experts are virtualized within the expert's `grammarMap`, maintaining a low memory footprint while providing deep specialization.
-
-### 4. Dynamic RAM Management
-To allow the system to handle thousands of experts on low-memory hardware:
-*   **LRU System (Least Recently Used)**: Only the most active experts are kept in RAM.
-*   **Binary Persistence**: Inactive experts are serialized in `GNRZ` format (Zlib compressed) to the disk and reloaded instantly when their specific concept is triggered.
-
-### 5. Learning via "Sense"
-The `learnSense` method does not store raw text. It converts semantic units into **12-bit binary IDs** and uses the `bitEngine` to physically modify the probabilistic memory. This is a non-destructive, cumulative memorization process.
- 
----
-
 ## 📄 Example Configuration (`robot_config.json`)
 
 This file defines the physical structure, the bitwise logic for safety, and the predefined postures.
@@ -319,6 +288,31 @@ A neuron that fires based on a weighted vote of its inputs.
 *   **Logic**: Returns `1` if `sum(inputs[i] * weights[i]) >= threshold`, else `0`.
 
 #### `MajorityNetwork`
+
+#### `PolynomialMajorityNeuron`
+An extension of `MajorityNeuron` capable of learning non-linear decision boundaries by transforming raw inputs into polynomial features (e.g., `x1*x2`). This allows it to solve problems like XOR with a single neuron.
+
+```javascript
+import * as neuro from "./neuro-lib.js";
+
+// 1. Define the "feature mapper".
+// For [x1, x2], we transform it into [x1, x2, x1*x2].
+const xorFeatureMapper = (inputs) => {
+    const [x1, x2] = inputs;
+    return [x1, x2, x1 * x2]; // Extended features
+};
+
+// 2. Define weights and threshold for XOR logic on extended features.
+const xorWeights = [1, 1, -2]; // Example weights for XOR
+const xorThreshold = 1;
+
+const xorNeuron = new neuro.PolynomialMajorityNeuron(xorWeights, xorThreshold, xorFeatureMapper);
+console.log(`XOR(0, 1) -> ${xorNeuron.predict([0, 1])}`); // Expected: 1
+console.log(`XOR(1, 1) -> ${xorNeuron.predict([1, 1])}`); // Expected: 0
+```
+
+#### `MajorityNetwork`
+
 A multi-layer architecture composed of `MajorityNeurons`.
 *   **`predict(inputs)`**: Propagates boolean signals through all layers.
 *   **`export()`**: Returns the weights and thresholds in a portable JSON format.
@@ -379,6 +373,189 @@ A specialized model for verbatim text memorization.
  ---
 
 ### 5. Robotic Control (Cerebellum)
+
+#### `AnalogNeuralLayer`
+A continuous-value neuron layer for motor control.
+*   **Standardization**: Automatically tracks `runningMeans` and `runningVars` to normalize sensor data on the fly.
+*   **Momentum**: Uses EMA-based momentum to stabilize learning of physical constraints.
+
+#### `MeshController`
+The "Brain" for smart fabrics or complex sensor meshes.
+*   **`addAnchorsFromExamples(examples)`**: Sets master reference points for interpolation.
+*   **`compute(meshSensors)`**: Uses Inverse Distance Weighting (IDW) to find the optimal actuator response based on the current tactile "skin" deformation.
+
+ ---
+
+### 5. Optimization & Neuroevolution
+
+These algorithms leverage advanced optimization techniques from the `problemSolver/library.js` to automatically discover optimal configurations for neural networks and robotic behaviors.
+
+#### `discoverOptimalRule(dataset, inputSize, optimizationLib)`
+Utilizes Simulated Annealing to find optimal binary rules (weights and thresholds) for a `MajorityNeuron` given a dataset.
+
+```javascript
+import { Optimization } from "./problemSolver/library.js";
+import * as neuro from "./neuro-lib.js";
+
+const andDataset = [
+    [[0, 0], 0], [[0, 1], 0], [[1, 0], 0], [[1, 1], 1]
+];
+const andInputSize = 2;
+
+const bestAndRuleSA = neuro.discoverOptimalRule(andDataset, andInputSize, Optimization);
+console.log("Optimal AND rule found by Simulated Annealing:");
+console.log(`  Weights: [${bestAndRuleSA.weights}], Threshold: ${bestAndRuleSA.threshold}`);
+console.log(`  Accuracy: ${(bestAndRuleSA.accuracy * 100).toFixed(2)}%`);
+```
+
+#### `discoverOptimalRuleWithGA(dataset, inputSize, optimizationLib)`
+Employs a Genetic Algorithm to discover optimal binary rules, offering a more powerful alternative for complex rule-finding problems.
+
+```javascript
+import { Optimization } from "./problemSolver/library.js";
+import * as neuro from "./neuro-lib.js";
+
+const xorDataset = [
+    [[0, 0], 0], [[0, 1], 1], [[1, 0], 1], [[1, 1], 0]
+];
+const xorInputSizeGA = 2;
+
+const bestXorRuleGA = neuro.discoverOptimalRuleWithGA(xorDataset, xorInputSizeGA, Optimization);
+console.log("Optimal XOR rule found by Genetic Algorithm:");
+console.log(`  Weights: [${bestXorRuleGA.weights}], Threshold: ${bestXorRuleGA.threshold}`);
+console.log(`  Accuracy: ${(bestXorRuleGA.accuracy * 100).toFixed(2)}%`);
+```
+
+#### `discoverOptimalNetworkWithGA(dataset, inputSize, optimizationLib)`
+Evolves the topology of a multi-layer majority network using a Genetic Algorithm, allowing the network to grow or shrink to fit the problem's complexity.
+
+```javascript
+import { Optimization } from "./problemSolver/library.js";
+import * as neuro from "./neuro-lib.js";
+
+const parityDataset = [
+    [[0, 0, 0], 0], [[0, 0, 1], 1], [[0, 1, 0], 1], [[0, 1, 1], 0],
+    [[1, 0, 0], 1], [[1, 0, 1], 0], [[1, 1, 0], 0], [[1, 1, 1], 1]
+];
+const parityInputSize = 3;
+
+const { network: evolvedNetwork, accuracy: networkAccuracy } = neuro.discoverOptimalNetworkWithGA(parityDataset, parityInputSize, Optimization, { generations: 200, populationSize: 100, maxHiddenNeurons: 3 });
+console.log("Evolved majority network for parity. Accuracy:", (networkAccuracy * 100).toFixed(2) + "%");
+// console.log("Evolved network structure:", JSON.stringify(evolvedNetwork.export()));
+```
+
+#### `trainSeekerLayerWithGA(dataset, inputSize, outputSize, optimizationLib)`
+Applies Neuroevolution (Genetic Algorithm) to train a `SeekerLayer`, optimizing the spatial orientations of its neurons for fluid and precise movements. Features intelligent mutation with micro-optimization via gradient descent.
+
+```javascript
+import { Optimization } from "./problemSolver/library.js";
+import * as neuro from "./neuro-lib.js";
+
+const seekerDataset = [
+    [[[1, 0, 0], [0, 1, 0]], [0.8, 0.2]],  // Input 1 -> Target 1
+    [[[-1, 0, 0], [0, -1, 0]], [-0.8, -0.2]], // Input 2 -> Target 2
+    [[[0, 0, 1], [1, 1, 0]], [0.5, 0.5]]     // Input 3 -> Target 3
+];
+const seekerInputSize = 2; // Number of 3D vectors per sample
+const seekerOutputSize = 2; // Number of Seeker neurons
+
+const trainedSeekerLayer = neuro.trainSeekerLayerWithGA(seekerDataset, seekerInputSize, seekerOutputSize, Optimization, { generations: 100, populationSize: 50 });
+console.log("Seeker layer training by genetic algorithm completed.");
+
+const testSeekerInput = seekerDataset[0][0];
+const predictedSeekerOutput = trainedSeekerLayer.forward(testSeekerInput);
+console.log("Test Seeker layer with input 1:");
+console.log("  Input:", JSON.stringify(testSeekerInput));
+console.log("  Expected output:", JSON.stringify(seekerDataset[0][1]));
+console.log("  Predicted output:", predictedSeekerOutput.map(v => v.toFixed(4)));
+```
+
+#### `trainMeshControllerWithGA(dataset, sensorCount, actuatorCount, optimizationLib)`
+Uses a Memetic Algorithm (a Genetic Algorithm enhanced with local search/gradient descent) to train `MeshController` instances, finding optimal weight configurations for complex sensor-to-actuator mappings.
+
+#### `MotorSkillTrainer`
+A convenient wrapper class that simplifies the process of training `MeshController` instances for learning specific motor skills using genetic algorithms.
+
+```javascript
+import { Optimization } from "./problemSolver/library.js";
+import * as neuro from "./neuro-lib.js";
+import fs from 'fs';
+
+// Load robot configuration (assuming robot_config.json exists in the parent directory)
+const robotConfig = JSON.parse(fs.readFileSync('./robot_config.json', 'utf8'));
+
+const SENSOR_COUNT = robotConfig.sensors.maillage_main.mapping.length;
+const ACTUATOR_COUNT = robotConfig.actuators.length;
+
+// Create a training dataset from robot_config.json examples
+const motorDataset = robotConfig.training.examples.map(ex => {
+    const fullOutput = new Array(ACTUATOR_COUNT).fill(0);
+    ex.output.forEach((val, i) => {
+        if (i < ACTUATOR_COUNT) fullOutput[i] = val;
+    });
+    return [ex.input, fullOutput];
+});
+
+const skillTrainer = new neuro.MotorSkillTrainer(SENSOR_COUNT, ACTUATOR_COUNT, Optimization);
+
+console.log("Launching motor controller training with memetic algorithm...");
+const trainedController = skillTrainer.learn(motorDataset, { generations: 150, populationSize: 80 });
+console.log("Training completed. The 'cerebellum' has learned the skill.");
+
+const testInput = motorDataset[1][0]; // "PINCE_FINE" case
+const predictedOutput = trainedController.compute(testInput);
+console.log("\nTest 'pinch' skill:");
+console.log(" - Predicted motor command:", predictedOutput.map(v => v.toFixed(1)).join(', '));
+console.log(" - Expected motor command:", motorDataset[1][1].join(', '));
+```
+
+#### `discoverOptimalTrajectory(kinematicChain, actuators, targetPosition, optimizationLib)`
+Employs a Genetic Algorithm to find energy-efficient trajectories for robotic manipulators, minimizing energy consumption while accurately reaching a specified target position.
+
+#### `refineTrajectoryWithGradient(initialTrajectory, kinematicChain, actuators, targetPosition, optimizationLib)`
+Refines existing robotic trajectories using Gradient Descent, providing a faster and more precise local optimization for energy efficiency and task completion. This is often used after a global search (e.g., GA) to fine-tune the solution.
+
+```javascript
+import { Optimization } from "./problemSolver/library.js";
+import * as neuro from "./neuro-lib.js";
+import fs from 'fs';
+
+// Load robot configuration (assuming robot_config.json exists in the parent directory)
+const robotConfig = JSON.parse(fs.readFileSync('./robot_config.json', 'utf8'));
+
+const { kinematicChain, actuators } = neuro.RobotFactory.build(robotConfig);
+const targetPosition = new neuro.Vector3(0.05, 0.1, 0.08);
+const actuatorMap = new Map(actuators.map(a => [a.name, a]));
+
+// --- STEP 1: Fast global search with GA ---
+console.log("   (Step 1/2) Launching GA for fast global search...");
+const { trajectory: initialTraj, score: initialScore } = neuro.discoverOptimalTrajectory(
+    kinematicChain,
+    actuatorMap,
+    targetPosition,
+    Optimization,
+    { trajectorySteps: 20, generations: 30, populationSize: 30 } // Reduced parameters for speed
+);
+console.log(`   -> Initial trajectory found by GA. Score: ${initialScore.toFixed(2)}`);
+
+// --- STEP 2: Rapid refinement with Gradient Descent ---
+console.log("   (Step 2/2) Launching Gradient Descent for refinement...");
+const { trajectory: refinedTraj, score: refinedScore } = neuro.refineTrajectoryWithGradient(
+    initialTraj,
+    kinematicChain,
+    actuatorMap,
+    targetPosition,
+    Optimization,
+    { learningRate: 0.05, maxIterations: 50 } // GD converges in few iterations
+);
+
+console.log(`\n✅ Refinement completed. Final score: ${refinedScore.toFixed(2)} (Improvement of ${(initialScore - refinedScore).toFixed(2)})`);
+console.log("   This demonstrates a much more efficient hybrid approach for trajectory planning.");
+```
+
+ ---
+
+### 6. Robotic Control (Cerebellum)
 
 #### `AnalogNeuralLayer`
 A continuous-value neuron layer for motor control.
