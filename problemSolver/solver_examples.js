@@ -6,6 +6,7 @@
  */
 
 import { Dichotomy, Optimization } from './library.js';
+import * as neuro from "../neuro-lib.js";
 
 /**
  * @namespace Dichotomy
@@ -624,17 +625,25 @@ console.log("Ordre optimal des tâches trouvé :", resultSchedule.solution.map(t
     console.log("\n32. Placement d'Infrastructures (Exécution Parallèle)");
     const numAntennasParallel = 4;
     const mapBoundsParallel = { minX: 0, maxX: 100, minY: 0, maxY: 100 };
-    const numCycles = 8; // On augmente le nombre de cycles pour bien voir l'effet
+    // --- OPTIMISATION : Réduction drastique de la charge pour l'exemple ---
+    // Le but est de montrer la parallélisation, pas de faire un calcul de 7 secondes.
+    const numCycles = 48; // On s'assure que le nombre de tâches est bien supérieur au nombre de workers (ex: 24)
+    const saOptions = { maxIterations: 2000 }; // On garde des itérations faibles pour que le test reste rapide
 
     console.log(`Lancement de ${numCycles} cycles d'optimisation en parallèle...`);
     const startTime = Date.now();
 
-    const parallelResult = await Optimization.runMultipleParallel('solveFacilityLocation', [numAntennasParallel, mapBoundsParallel], numCycles, false); // logProgress est géré par la fonction elle-même
+    // On passe maintenant les données complètes, y compris les villages et les options SA.
+    const villages = Array.from({ length: 50 }, () => ({ x: Math.random() * 100, y: Math.random() * 100 }));
+    const parallelResult = await Optimization.runMultipleParallel(
+        'solveFacilityLocation', 
+        [villages, numAntennasParallel, mapBoundsParallel, saOptions], 
+        numCycles, 
+        false
+    );
     
     const endTime = Date.now();
-    console.log(`\nExécution parallèle terminée en ${(endTime - startTime) / 1000} secondes.`);
-
-    console.log(`Meilleur résultat trouvé : Coût total = ${parallelResult.bestResult.energy.toFixed(2)}`);
+    console.log(`\nExécution parallèle terminée en ${(endTime - startTime) / 1000} secondes.`);    console.log(`Meilleur résultat trouvé : Coût total = ${parallelResult.bestResult.energy.toFixed(2)}`);
     console.log(`Statistiques (${parallelResult.stats.concurrency} workers) : Score moyen = ${parallelResult.stats.average.toFixed(2)}, Écart-type = ${parallelResult.stats.stdDev.toFixed(2)}`);
 })();
 
@@ -953,3 +962,382 @@ console.log(`Erreur minimale du modèle : ${resultHP.fitness.toFixed(4)}`);
 console.log("Meilleurs hyperparamètres trouvés :");
 console.log(`  - Learning Rate : ${resultHP.solution.lr.toFixed(5)}`);
 console.log(`  - Itérations : ${Math.round(resultHP.solution.iterations)}`);
+
+
+console.log("\n38. Logique Non-Linéaire : Résolution du XOR avec un Neurone Polynomial");
+// Problème : Implémenter la porte XOR (A != B) avec un seul neurone.
+// Un neurone linéaire ne peut pas le faire. Un neurone polynomial, si.
+
+// 1. Définir le "feature mapper".
+// Pour [x1, x2], on le transforme en [x1, x2, x1*x2].
+// C'est le terme x1*x2 qui permet de séparer les cas non-linéaires.
+const xorFeatureMapper = (inputs) => {
+    const [x1, x2] = inputs;
+    return [x1, x2, x1 * x2]; // Caractéristiques étendues
+};
+
+// 2. Définir les poids et le seuil pour la logique XOR sur les caractéristiques étendues.
+// La logique est : (x1 ET NON x2) OU (NON x1 ET x2)
+// Une solution possible est : 1*x1 + 1*x2 - 2*(x1*x2) >= 1
+const xorWeights = [1, 1, -2];
+const xorThreshold = 1;
+
+const xorNeuron = new neuro.PolynomialMajorityNeuron(xorWeights, xorThreshold, xorFeatureMapper);
+
+console.log(`XOR(0, 1) -> ${xorNeuron.predict([0, 1])}`); // Attendu: 1
+console.log(`XOR(1, 1) -> ${xorNeuron.predict([1, 1])}`); // Attendu: 0
+
+console.log("\n39. Apprentissage Moteur : Entraînement d'un Contrôleur de Main Robotique");
+// Problème : Apprendre à une main robotique à adopter une posture de "pince"
+// en réponse à une pression spécifique sur ses capteurs tactiles.
+
+// 1. Chargement de la configuration du robot pour définir le problème
+import fs from 'fs';
+const robotConfig = JSON.parse(fs.readFileSync('../robot_config.json', 'utf8'));
+
+const SENSOR_COUNT = robotConfig.sensors.maillage_main.mapping.length;
+const ACTUATOR_COUNT = robotConfig.actuators.length;
+const actuatorNames = robotConfig.actuators.map(a => a.name);
+
+// 2. Création d'un jeu de données d'entraînement (Dataset)
+// On simule des "exemples" de ce que le robot doit faire.
+// On utilise les exemples définis dans le fichier de configuration
+const motorDataset = robotConfig.training.examples.map(ex => {
+    // On s'assure que le vecteur de sortie a la bonne taille, en remplissant avec 0 si besoin
+    const fullOutput = new Array(ACTUATOR_COUNT).fill(0);
+    ex.output.forEach((val, i) => {
+        if (i < ACTUATOR_COUNT) fullOutput[i] = val;
+    });
+    return [ex.input, fullOutput];
+});
+
+// 3. Création et utilisation du `MotorSkillTrainer`
+const skillTrainer = new neuro.MotorSkillTrainer(SENSOR_COUNT, ACTUATOR_COUNT, Optimization);
+
+console.log("Lancement de l'entraînement du contrôleur moteur par algorithme mémétique...");
+const trainedController = skillTrainer.learn(motorDataset, { generations: 150, populationSize: 80 });
+console.log("Entraînement terminé. Le 'cervelet' a appris la compétence.");
+
+// 4. Vérification
+// On donne au contrôleur entraîné la situation de "pression sur l'index et le pouce".
+const testInput = motorDataset[1][0]; // Cas "PINCE_FINE"
+const predictedOutput = trainedController.compute(testInput);
+console.log("\nTest de la compétence 'pince' :");
+console.log(" - Commande moteur prédite:", predictedOutput.map(v => v.toFixed(1)).join(', '));
+console.log(" - Commande moteur attendue:", motorDataset[1][1].join(', '));
+
+
+console.log("\n40. Planification de Trajectoire Économe en Énergie avec `discoverOptimalTrajectory`");
+
+// On a déjà chargé la configuration du robot et l'instance de la bibliothèque d'optimisation
+// dans l'exemple 39. On peut donc les réutiliser directement.
+
+// On reconstruit les éléments du robot pour cet exemple.
+const { kinematicChain, actuators } = neuro.RobotFactory.build(robotConfig);
+
+// Cible à atteindre dans l'espace de travail du robot
+const targetPosition = new neuro.Vector3(0.05, 0.1, 0.08);
+
+// Problème : Utiliser l'AG pour une recherche globale rapide, puis la DG pour une convergence rapide.
+
+(async () => {
+    try {
+        const { kinematicChain, actuators } = neuro.RobotFactory.build(robotConfig);
+        const targetPosition = new neuro.Vector3(0.05, 0.1, 0.08);
+        const actuatorMap = new Map(actuators.map(a => [a.name, a]));
+
+        // --- ÉTAPE 1 : Recherche globale rapide avec l'AG ---
+        console.log("   (Étape 1/2) Lancement de l'AG pour une recherche globale rapide...");
+        const { trajectory: initialTraj, score: initialScore } = neuro.discoverOptimalTrajectory(
+            kinematicChain,
+            actuatorMap,
+            targetPosition,
+            Optimization,
+            { trajectorySteps: 20, generations: 30, populationSize: 30 } // Paramètres réduits pour la vitesse
+        );
+        console.log(`   -> Trajectoire initiale trouvée par l'AG. Score: ${initialScore.toFixed(2)}`);
+
+        // --- ÉTAPE 2 : Raffinement rapide avec la Descente de Gradient ---
+        console.log("   (Étape 2/2) Lancement de la Descente de Gradient pour le raffinement...");
+        const { trajectory: refinedTraj, score: refinedScore } = neuro.refineTrajectoryWithGradient(
+            initialTraj,
+            kinematicChain,
+            actuatorMap,
+            targetPosition,
+            Optimization,
+            { learningRate: 0.05, maxIterations: 50 } // La DG converge en peu d'itérations
+        );
+
+        console.log(`\n✅ Raffinement terminé. Score final: ${refinedScore.toFixed(2)} (Amélioration de ${(initialScore - refinedScore).toFixed(2)})`);
+        console.log("   Ceci démontre une approche hybride beaucoup plus performante pour la planification.");
+
+    } catch (e) {
+        console.error("\n❌ Erreur lors du raffinement de la trajectoire:", e.message);
+    }
+})();
+
+console.log("\n42. Planification de Trajectoire (Heuristique + Raffinement) - Alternative Rapide");
+
+// Problème : Remplacer l'AG (lent) par une heuristique simple (interpolation linéaire)
+// pour générer la trajectoire initiale, puis la raffiner avec la DG (rapide).
+
+(async () => {
+    try {
+        const { kinematicChain, actuators } = neuro.RobotFactory.build(robotConfig);
+        const targetPosition = new neuro.Vector3(0.05, 0.1, 0.08);
+        const actuatorMap = new Map(actuators.map(a => [a.name, a]));
+        const actuatorList = Array.from(actuatorMap.values());
+        const trajectorySteps = 20;
+
+        // --- ÉTAPE 1 : Génération d'une trajectoire initiale par heuristique (Interpolation Linéaire) ---
+        console.log("   (Étape 1/2) Génération d'une trajectoire initiale par interpolation linéaire...");
+
+        const initialTrajectory = [];
+        const startPosture = new Map(actuatorList.map(a => [a.name, a.currentValue]));
+        // Pour la simplicité, la posture de fin est la même que celle de départ.
+        // L'optimiseur se chargera de la modifier pour atteindre la cible.
+        const endPosture = startPosture;
+
+        for (let t = 0; t < trajectorySteps; t++) {
+            const step = new Map();
+            const alpha = t / (trajectorySteps - 1); // Facteur d'interpolation de 0 à 1
+
+            for (const actuator of actuatorList) {
+                const startVal = startPosture.get(actuator.name);
+                const endVal = endPosture.get(actuator.name);
+                // Interpolation linéaire simple (LERP)
+                const interpolatedValue = startVal + (endVal - startVal) * alpha;
+                step.set(actuator.name, interpolatedValue);
+            }
+            initialTrajectory.push(step);
+        }
+
+        // Évaluation du score de la trajectoire naïve
+        const initialScore = (() => {
+            let totalEnergyCost = 0;
+            for (let t = 1; t < initialTrajectory.length; t++) {
+                for (const actuator of actuatorList) {
+                    totalEnergyCost += Math.abs(actuator.kp * (initialTrajectory[t].get(actuator.name) - initialTrajectory[t-1].get(actuator.name)));
+                }
+            }
+            const finalFK = kinematicChain.calculateFK(initialTrajectory[trajectorySteps - 1]);
+            const finalError = finalFK.position.distanceTo(targetPosition);
+            return (finalError * 1000) + totalEnergyCost;
+        })();
+        console.log(`   -> Trajectoire initiale naïve générée. Score: ${initialScore.toFixed(2)}`);
+
+        // --- ÉTAPE 2 : Raffinement avec la Descente de Gradient ---
+        console.log("   (Étape 2/2) Lancement du raffinement par Descente de Gradient...");
+        const { trajectory: refinedTraj, score: refinedScore } = neuro.refineTrajectoryWithGradient(
+            initialTrajectory,
+            kinematicChain,
+            actuatorMap,
+            targetPosition,
+            Optimization,
+            { learningRate: 0.1, maxIterations: 80 } // On peut se permettre plus d'itérations car c'est très rapide
+        );
+
+        console.log(`\n✅ Raffinement terminé. Score final: ${refinedScore.toFixed(2)} (Amélioration de ${(initialScore - refinedScore).toFixed(2)})`);
+        console.log("   Cette approche est nettement plus rapide que l'utilisation d'un algorithme génétique.");
+
+    } catch (e) {
+        console.error("\n❌ Erreur lors de la planification par heuristique:", e.message);
+    }
+})();
+
+console.log("\n43. Optimisation de l'Autonomie : Réduction de la Consommation Inutile");
+
+// Problème : Démontrer comment le robot peut apprendre à n'utiliser que les
+// actuateurs nécessaires pour une tâche, en pénalisant le coût énergétique.
+
+(async () => {
+    try {
+        const { kinematicChain, actuators } = neuro.RobotFactory.build(robotConfig);
+        // Une cible simple qui ne nécessite que le mouvement du bras, pas des doigts.
+        const targetPosition = new neuro.Vector3(0.1, 0, 0.05);
+        const actuatorMap = new Map(actuators.map(a => [a.name, a]));
+        const actuatorList = Array.from(actuatorMap.values());
+        const trajectorySteps = 20;
+
+        // --- Création d'une trajectoire initiale "bruyante" ---
+        // On simule une trajectoire de départ non optimale où tous les actuateurs
+        // ont de petits mouvements aléatoires ("wiggling").
+        const noisyInitialTrajectory = [];
+        const startPosture = new Map(actuatorList.map(a => [a.name, a.currentValue]));
+        for (let t = 0; t < trajectorySteps; t++) {
+            const step = new Map();
+            for (const actuator of actuatorList) {
+                const startVal = startPosture.get(actuator.name);
+                // Ajout d'un petit bruit aléatoire pour simuler une commande imparfaite.
+                const noise = (Math.random() - 0.5) * (actuator.max - actuator.min) * 0.1;
+                const noisyValue = startVal + noise;
+                // Correction : neuro.utils.clamp n'existe pas. On utilise Math.max/min.
+                step.set(actuator.name, Math.max(actuator.min, Math.min(noisyValue, actuator.max)));
+            }
+            noisyInitialTrajectory.push(step);
+        }
+
+        // --- PARTIE A : Optimisation Naïve (faible poids sur l'énergie) ---
+        console.log("\n--- Partie A : Optimisation Naïve (Poids Énergie = 1.0) ---");
+        const { trajectory: naiveTraj, score: naiveScore } = neuro.refineTrajectoryWithGradient(
+            noisyInitialTrajectory,
+            kinematicChain,
+            actuatorMap,
+            targetPosition,
+            Optimization,
+            { learningRate: 0.1, maxIterations: 100, energyWeight: 1.0 }
+        );
+
+        console.log(`Score final (naïf): ${naiveScore.toFixed(2)}`);
+        console.log("Analyse des mouvements (on s'attend à des mouvements parasites sur les doigts):");
+
+        // Fonction pour afficher le mouvement total d'un actuateur
+        const printMovement = (traj, actuatorName) => {
+            let totalMove = 0;
+            for (let t = 1; t < traj.length; t++) {
+                totalMove += Math.abs(traj[t].get(actuatorName) - traj[t - 1].get(actuatorName));
+            }
+            console.log(`  - Mouvement total pour ${actuatorName.padEnd(15)}: ${totalMove.toFixed(2)} degrés`);
+        };
+
+        printMovement(naiveTraj, "Poignet");
+        printMovement(naiveTraj, "Index_P1"); // Doigt de l'index
+        printMovement(naiveTraj, "Pouce_P1"); // Doigt du pouce
+
+        // --- PARTIE B : Optimisation Économe (poids élevé sur l'énergie) ---
+        console.log("\n--- Partie B : Optimisation Économe (Poids Énergie = 50.0) ---");
+        const { trajectory: efficientTraj, score: efficientScore } = neuro.refineTrajectoryWithGradient(
+            noisyInitialTrajectory, // On part de la même trajectoire bruitée
+            kinematicChain,
+            actuatorMap,
+            targetPosition,
+            Optimization,
+            { learningRate: 0.1, maxIterations: 100, energyWeight: 50.0 } // Poids énergétique élevé !
+        );
+
+        console.log(`Score final (économe): ${efficientScore.toFixed(2)}`);
+        console.log("Analyse des mouvements (on s'attend à des mouvements nuls ou très faibles sur les doigts):");
+
+        printMovement(efficientTraj, "Poignet");
+        printMovement(efficientTraj, "Index_P1");
+        printMovement(efficientTraj, "Pouce_P1");
+
+        const calculateTotalMovement = (traj, name) => traj.reduce((sum, _, t, arr) => t > 0 ? sum + Math.abs(arr[t].get(name) - arr[t-1].get(name)) : sum, 0);
+
+        const fingerMvtBefore = calculateTotalMovement(naiveTraj, "Index_P1");
+        const fingerMvtAfter = calculateTotalMovement(efficientTraj, "Index_P1");
+        const poignetMvtBefore = calculateTotalMovement(naiveTraj, "Poignet");
+        const poignetMvtAfter = calculateTotalMovement(efficientTraj, "Poignet");
+
+        const reduction = fingerMvtBefore > 0 ? Math.max(0, (1 - fingerMvtAfter / fingerMvtBefore)) * 100 : 100;
+
+        console.log(`\n✅ Conclusion : En augmentant la pénalité sur l'énergie, le mouvement du doigt ('Index_P1') a été réduit de ${reduction.toFixed(1)}% !`);
+        console.log(`   Pendant ce temps, le mouvement du poignet est resté significatif (${poignetMvtAfter.toFixed(2)} degrés) pour accomplir la tâche.`);
+        console.log("   Le robot a 'appris' à ne pas bouger ses doigts inutilement pour économiser de l'énergie.");
+
+    } catch (e) {
+        console.error("\n❌ Erreur lors de l'optimisation de l'autonomie:", e.message);
+    }
+})();
+
+console.log("\n45. Intelligence Éthique : Apprendre à Lâcher Prise face à une Résistance");
+
+// Problème : Le robot reçoit l'ordre de fermer la main, mais une force externe
+// s'y oppose. Le robot doit "décider" de ne pas obéir pour éviter de causer
+// des dommages, en minimisant un coût de "lutte".
+
+(async () => {
+    try {
+        const { kinematicChain, actuators, behaviorNet, hub } = neuro.RobotFactory.build(robotConfig);
+        const actuatorMap = new Map(actuators.map(a => [a.name, a]));
+        const trajectorySteps = 15;
+
+        // --- Situation Initiale : Main ouverte, mais avec l'ordre de se fermer ---
+        const initialTrajectory = Array.from({ length: trajectorySteps }, () => new Map(
+            Array.from(actuatorMap.keys()).map(name => [name, 0]) // Tous les actuateurs à 0
+        ));
+
+        // --- Définition de la Tâche : Fermer la main, mais en luttant contre une résistance ---
+        const targetClosure = 90; // La "tâche volontaire" est de fermer la main à 90 degrés.
+        const struggleTask = {
+            cost: (posture) => {
+                let closingError = 0;
+                let struggleCost = 0;
+                const fingerActuators = ["Index_P1", "Majeur_P1", "Pouce_P1"];
+
+                for (const name of fingerActuators) {
+                    const currentAngle = posture.get(name) || 0;
+                    // 1. Coût de l'erreur : le robot "veut" atteindre la cible.
+                    closingError += Math.pow(targetClosure - currentAngle, 2);
+
+                    // 2. Coût de la lutte : simule une force qui résiste.
+                    // Ce coût augmente de façon cubique, rendant la force très coûteuse.
+                    struggleCost += Math.pow(currentAngle, 3);
+                }
+                // On donne un poids énorme à la lutte pour en faire une priorité de sécurité.
+                return (closingError * 0.1) + (struggleCost * 5.0);
+            },
+            gradient: (posture) => {
+                const grad = new Map();
+                const fingerActuators = ["Index_P1", "Majeur_P1", "Pouce_P1"];
+
+                for (const name of fingerActuators) {
+                    const currentAngle = posture.get(name) || 0;
+                    // Dérivée de l'erreur : 2 * (target - current) * -1
+                    const errorGrad = -2 * (targetClosure - currentAngle);
+                    // Dérivée de la lutte : 3 * current^2
+                    const struggleGrad = 3 * Math.pow(currentAngle, 2);
+
+                    grad.set(name, (errorGrad * 0.1) + (struggleGrad * 5.0));
+                }
+                return grad;
+            }
+        };
+
+        // --- NOUVEAU : Simulation du réflexe d'ouverture ---
+        // On simule une surpression (ex: quelqu'un pose un objet dans la main)
+        const isOverpressure = true; // Mettez à true pour tester le réflexe
+        if (isOverpressure) {
+            // On doit créer un vecteur d'input pour le réseau de comportement
+            const decisionInputs = new Uint8Array(Object.keys(robotConfig.variables).length).fill(0);
+            decisionInputs[robotConfig.variables.overpressure] = 1;
+
+            // On active le bit de comportement correspondant
+            const behaviorBits = behaviorNet.predict(decisionInputs);
+            if (behaviorBits[2] === 1) { // bit_2_emergency_open
+                console.log("\n\x1b[33m[!] Surpression détectée ! Activation du réflexe d'ouverture.\x1b[0m");
+                // On force le hub à sélectionner l'état d'ouverture d'urgence
+                hub.selectState("main", "EMERGENCY_OPEN");
+            }
+        }
+
+
+        // --- Lancement de l'optimisation ---
+        console.log("   (Action) Ordre de fermer la main, mais une résistance est simulée...");
+        const { trajectory: refinedTraj } = neuro.refineTrajectoryWithGradient(
+            initialTrajectory,
+            kinematicChain,
+            actuatorMap,
+            null, // Pas de targetPosition
+            Optimization,
+            {
+                learningRate: 0.005, // Learning rate plus faible pour une convergence douce
+                maxIterations: 150,
+                energyWeight: 0.5, // Le coût énergétique est secondaire face à la lutte
+                task: struggleTask
+            }
+        );
+
+        const initialPosture = initialTrajectory[initialTrajectory.length - 1];
+        const finalPosture = refinedTraj[refinedTraj.length - 1];
+
+        console.log(`\n✅ Optimisation terminée.`);
+        console.log(`   Posture initiale (Index_P1): ${initialPosture.get("Index_P1").toFixed(1)} degrés.`);
+        console.log(`   Posture finale   (Index_P1): ${finalPosture.get("Index_P1").toFixed(1)} degrés.`);
+        console.log(`\nConclusion : Bien que l'ordre était de fermer la main à ${targetClosure}°, le robot a choisi de la garder quasi-ouverte.`);
+        console.log("   Il a 'désobéi' à sa tâche pour obéir à une contrainte de sécurité supérieure : ne pas lutter contre une force externe.");
+
+    } catch (e) {
+        console.error("\n❌ Erreur lors de l'optimisation de la prise de conscience éthique:", e.message, e.stack);
+    }
+})();

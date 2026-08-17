@@ -1004,12 +1004,7 @@ const Optimization = {
                 if (taskIndex === undefined) continue;
 
                 const workerData = {
-                    solverName,
-                    solverArgs: [
-                        // Chaque worker génère son propre jeu de données aléatoires pour garantir l'indépendance des cycles.
-                        Array.from({ length: 50 }, () => ({ x: Math.random() * 100, y: Math.random() * 100 })),
-                        ...baseSolverArgs
-                    ]
+                    solverName,                    solverArgs: baseSolverArgs // Les arguments sont maintenant passés directement
                 };
 
                 const result = await new Promise((resolve, reject) => {

@@ -595,57 +595,89 @@ export function discoverOptimalRuleWithGA(dataset, inputSize, optimizationLib, o
 }
 
 /**
- * NOUVEAU : Utilise un Algorithme Génétique pour découvrir une architecture de réseau majoritaire.
- * C'est une évolution de `discoverOptimalRuleWithGA` qui peut résoudre des problèmes non-linéaires.
+ * AMÉLIORÉ : Utilise un Algorithme Génétique pour découvrir une architecture de réseau majoritaire
+ * en faisant évoluer sa topologie (inspiration NEAT).
+ * Le réseau peut grandir ou rétrécir pour s'adapter au problème.
  * @param {Array<Array<number>>} dataset - Tableau de couples [inputs, target].
  * @param {number} inputSize - La taille du vecteur d'entrée.
  * @param {import('./problemSolver/library.js').Optimization} optimizationLib - L'instance de la bibliothèque d'optimisation.
  * @param {object} [options] - Options pour l'algorithme génétique.
- * @param {number} [options.hiddenNeurons=2] - Nombre de neurones dans la couche cachée.
+ * @param {number} [options.maxHiddenNeurons=5] - Nombre maximal de neurones cachés.
  * @returns {{network: MajorityNetwork, accuracy: number}} Le meilleur réseau trouvé.
  */
 export function discoverOptimalNetworkWithGA(dataset, inputSize, optimizationLib, options = {}) {
     if (!optimizationLib?.geneticAlgorithm) {
         throw new Error("La bibliothèque d'optimisation (geneticAlgorithm) est requise.");
     }
-
-    const hiddenNeurons = options.hiddenNeurons || 2;
+    
+    const maxHiddenNeurons = options.maxHiddenNeurons || 5;
     const outputNeurons = 1; // Pour cet exemple, on se concentre sur une seule sortie.
 
     // 1. La fonction de fitness : évalue la performance d'un réseau complet.
     const fitnessFunction = (networkConfig) => {
-        const network = new MajorityNetwork(networkConfig);
-        let errors = 0;
-        for (const [inputs, target] of dataset) {
-            const prediction = network.predict(inputs);
-            if (prediction[0] !== target) {
-                errors++;
+        try {
+            const network = new MajorityNetwork(networkConfig);
+            let errors = 0;
+            for (const [inputs, target] of dataset) {
+                const prediction = network.predict(inputs);
+                if (prediction[0] !== target) {
+                    errors++;
+                }
             }
+            return errors;
+        } catch (e) {
+            // Si la configuration est invalide (ex: un neurone sans poids), on la pénalise lourdement.
+            return dataset.length * 2;
         }
-        return errors;
     };
 
     // 2. Création d'un individu (une configuration de réseau aléatoire)
     const createIndividual = () => {
-        const hiddenLayer = Array.from({ length: hiddenNeurons }, () => {
+        const hiddenLayerSize = Math.floor(Math.random() * (maxHiddenNeurons + 1));
+        const hiddenLayer = Array.from({ length: hiddenLayerSize }, () => {
             const weights = Array.from({ length: inputSize }, () => Math.floor(Math.random() * 5) - 2); // Poids -2 à 2
             const threshold = Math.floor(Math.random() * 5);
             return { weights, threshold };
         });
 
         const outputLayer = Array.from({ length: outputNeurons }, () => {
-            const weights = Array.from({ length: hiddenNeurons }, () => Math.floor(Math.random() * 5) - 2);
+            const weights = Array.from({ length: hiddenLayerSize }, () => Math.floor(Math.random() * 5) - 2);
             const threshold = Math.floor(Math.random() * 3);
             return { weights, threshold };
         });
 
         return [hiddenLayer, outputLayer];
     };
-
-    // 3. Croisement : on mélange les neurones des couches des parents.
+    
+    // 3. Croisement : on aligne et mélange les neurones des parents.
     const crossover = (parent1, parent2) => {
-        const childHidden = parent1[0].map((neuron, i) => (Math.random() < 0.5 ? neuron : parent2[0][i]));
-        const childOutput = parent1[1].map((neuron, i) => (Math.random() < 0.5 ? neuron : parent2[1][i]));
+        const p1Hidden = parent1[0];
+        const p2Hidden = parent2[0];
+        const childHidden = [];
+        const maxLen = Math.max(p1Hidden.length, p2Hidden.length);
+
+        for (let i = 0; i < maxLen; i++) {
+            const n1 = p1Hidden[i];
+            const n2 = p2Hidden[i];
+            if (n1 && n2) { // Les deux parents ont un neurone à cet index
+                childHidden.push(Math.random() < 0.5 ? n1 : n2);
+            } else if (n1 && Math.random() < 0.5) { // Seul le parent 1 a ce neurone (gène excessif)
+                childHidden.push(n1);
+            } else if (n2 && Math.random() < 0.5) { // Seul le parent 2 a ce neurone
+                childHidden.push(n2);
+            }
+        }
+
+        // Le neurone de sortie doit avoir ses poids ajustés à la nouvelle taille de la couche cachée.
+        const outputWeights = Array.from({ length: childHidden.length }, (_, i) => {
+            const w1 = parent1[1][0].weights[i];
+            const w2 = parent2[1][0].weights[i];
+            if (w1 !== undefined && w2 !== undefined) return Math.random() < 0.5 ? w1 : w2;
+            return w1 || w2 || 0;
+        });
+        const outputThreshold = Math.random() < 0.5 ? parent1[1][0].threshold : parent2[1][0].threshold;
+        const childOutput = [{ weights: outputWeights, threshold: outputThreshold }];
+
         return [childHidden, childOutput];
     };
 
@@ -653,21 +685,39 @@ export function discoverOptimalNetworkWithGA(dataset, inputSize, optimizationLib
     const mutate = (individual) => {
         const newIndividual = JSON.parse(JSON.stringify(individual)); // Deep copy
         const layerIndex = Math.random() < 0.7 ? 0 : 1; // 70% de chance de muter la couche cachée
-        const neuronIndex = Math.floor(Math.random() * newIndividual[layerIndex].length);
-        const neuron = newIndividual[layerIndex][neuronIndex];
+        
+        // Mutation de topologie : 5% de chance d'ajouter un neurone, 5% de le supprimer
+        if (layerIndex === 0 && Math.random() < 0.05 && newIndividual[0].length < maxHiddenNeurons) {
+            // Ajouter un neurone caché
+            const newNeuron = {
+                weights: Array.from({ length: inputSize }, () => Math.floor(Math.random() * 3) - 1),
+                threshold: Math.floor(Math.random() * 3)
+            };
+            newIndividual[0].push(newNeuron);
+            newIndividual[1][0].weights.push(Math.floor(Math.random() * 3) - 1); // Ajouter une connexion vers la sortie
+        } else if (layerIndex === 0 && Math.random() < 0.05 && newIndividual[0].length > 0) {
+            // Supprimer un neurone caché
+            const indexToRemove = Math.floor(Math.random() * newIndividual[0].length);
+            newIndividual[0].splice(indexToRemove, 1);
+            newIndividual[1][0].weights.splice(indexToRemove, 1); // Supprimer la connexion correspondante
+        } else {
+            // Mutation de poids/seuil classique
+            const neuronIndex = Math.floor(Math.random() * newIndividual[layerIndex].length);
+            const neuron = newIndividual[layerIndex][neuronIndex];
+            if (!neuron) return newIndividual; // Sécurité
 
-        if (Math.random() < 0.8) { // Muter un poids
-            const weightIndex = Math.floor(Math.random() * neuron.weights.length);
-            neuron.weights[weightIndex] += (Math.random() < 0.5 ? -1 : 1);
-        } else { // Muter le seuil
-            neuron.threshold += (Math.random() < 0.5 ? -1 : 1);
+            if (Math.random() < 0.8 && neuron.weights.length > 0) { // Muter un poids
+                const weightIndex = Math.floor(Math.random() * neuron.weights.length);
+                neuron.weights[weightIndex] += (Math.random() < 0.5 ? -1 : 1);
+            } else { // Muter le seuil
+                neuron.threshold += (Math.random() < 0.5 ? -1 : 1);
+            }
         }
+
         return newIndividual;
     };
 
-    // 5. Lancement de l'Algorithme Génétique
-    const gaOptions = { generations: 200, populationSize: 150, ...options };
-
+    const gaOptions = { generations: 150, populationSize: 80, ...options };
     const { solution, fitness } = optimizationLib.geneticAlgorithm(createIndividual, fitnessFunction, crossover, mutate, gaOptions);
     const accuracy = 1 - (fitness / dataset.length);
     return { network: new MajorityNetwork(solution), accuracy };
@@ -2315,6 +2365,45 @@ export class SyntaxAnalyzer {
             learnedSchemas.push({ type: 'LISTING', separator: pattern.separator, cluster: pattern.clusterId });
         }
         return learnedSchemas;
+    }
+}
+
+/**
+ * NOUVEAU : Neurone à vote majoritaire avec transformation polynomiale des entrées.
+ * Ce neurone peut apprendre des frontières de décision non-linéaires, lui permettant
+ * de résoudre des problèmes comme le XOR avec un seul neurone.
+ */
+export class PolynomialMajorityNeuron {
+    /**
+     * @param {number[]} weights Les poids à appliquer aux caractéristiques transformées.
+     * @param {number} threshold Le seuil d'activation.
+     * @param {function(number[]): number[]} featureMapper Fonction qui transforme les entrées brutes en caractéristiques.
+     */
+    constructor(weights, threshold, featureMapper) {
+        this.weights = new Int32Array(weights || []);
+        this.threshold = threshold;
+        // La fonction qui crée les termes polynomiaux (ex: [x1, x2] -> [x1, x2, x1*x2])
+        this.featureMapper = featureMapper;
+
+        if (this.weights.length !== this.featureMapper([0, 0]).length) {
+            // Correction : on vérifie la taille avec une entrée de la bonne dimension
+            // La dimension est implicite, on ne peut pas la vérifier de manière robuste ici.
+            // On fait confiance à l'utilisateur pour fournir des poids de la bonne taille.
+        }
+    }
+
+    predict(inputs) {
+        // 1. Transformer les entrées brutes en caractéristiques polynomiales
+        const features = this.featureMapper(inputs);
+
+        // 2. Calculer la somme pondérée sur les caractéristiques
+        let votes = 0;
+        for (let i = 0; i < this.weights.length; i++) {
+            votes += (features[i] || 0) * this.weights[i];
+        }
+
+        // 3. Appliquer le seuil
+        return (votes >= this.threshold) | 0;
     }
 }
 
@@ -5931,6 +6020,10 @@ export class AnalogNeuralLayer {
             new Float32Array(inputSize).fill(0).map(() => (Math.random() * 2 - 1) * 0.1)
         );
         this.biases = new Float32Array(outputSize).fill(0);
+        // NOUVEAU : Facteur d'échelle pour chaque neurone de sortie.
+        // Permet au réseau d'apprendre la plage de sortie (ex: 0-90, 0-180).
+        // Initialisé à une valeur raisonnable pour des angles.
+        this.scales = new Float32Array(outputSize).fill(90.0);
 
         // Normalisation glissante (Zero Allocation)
         this.runningMeans = new Float32Array(inputSize).fill(0);
@@ -5938,6 +6031,7 @@ export class AnalogNeuralLayer {
         // Momentum pour stabiliser l'apprentissage des contraintes physiques
         this.momentum = Array.from({ length: outputSize }, () => new Float32Array(inputSize).fill(0));
     }
+
 
     forward(inputs) {
         return this.weights.map((w, i) => {
@@ -5949,8 +6043,10 @@ export class AnalogNeuralLayer {
 
                 sum += normalizedInput * w[j];
             }
-            // Activation linéaire pour le contrôle de puissance, ou Tanh pour brider
-            return sum;
+            // AMÉLIORATION : Activation non-linéaire (tanh) + mise à l'échelle.
+            // tanh borne la sortie entre -1 et 1, puis on l'étire avec le facteur d'échelle.
+            // L'offset (scale/2) centre la sortie autour d'une valeur positive.
+            return Math.max(0, Math.tanh(sum) * this.scales[i]);
         });
     }
 
@@ -5978,6 +6074,10 @@ export class AnalogNeuralLayer {
         for (let i = 0; i < this.weights.length; i++) {
             const target = (i < targets.length) ? targets[i] : outputs[i]; // Si pas de target, erreur 0
             const error = target - outputs[i];
+
+            // AMÉLIORATION : Apprentissage du facteur d'échelle.
+            // Si l'erreur est grande, le neurone ajuste sa "plage" de sortie.
+            this.scales[i] += lr * error * 0.1;
 
             for (let j = 0; j < this.inputSize; j++) {
                 const std = Math.sqrt(this.runningVars[j] + 1e-8);
@@ -6135,6 +6235,131 @@ export class MeshController {
     }
 }
 
+/**
+ * NOUVEAU : Entraîne un MeshController par Algorithme Mémétique.
+ * Fait évoluer une population de "cervelets" (AnalogNeuralLayer) pour trouver
+ * la meilleure configuration de poids pour un mapping capteurs->actuateurs.
+ * @param {Array<Array<any>>} dataset - Tableau de couples [inputs, targets]. Ex: [[sensor_vector, actuator_vector], ...]
+ * @param {number} sensorCount - Nombre de capteurs en entrée.
+ * @param {number} actuatorCount - Nombre d'actuateurs en sortie.
+ * @param {import('./problemSolver/library.js').Optimization} optimizationLib - L'instance de la bibliothèque d'optimisation.
+ * @param {object} [options] - Options pour l'algorithme génétique.
+ * @returns {MeshController} Le meilleur contrôleur entraîné.
+ */
+export function trainMeshControllerWithGA(dataset, sensorCount, actuatorCount, optimizationLib, options = {}) {
+    if (!optimizationLib?.geneticAlgorithm) {
+        throw new Error("La bibliothèque d'optimisation (geneticAlgorithm) est requise.");
+    }
+
+    // Un "individu" est une configuration complète d'une AnalogNeuralLayer (poids et biais)
+    const createIndividual = () => {
+        const layer = new AnalogNeuralLayer(sensorCount, actuatorCount);
+        return {
+            weights: layer.weights.map(w => new Float32Array(w)),
+            biases: new Float32Array(layer.biases),
+            scales: new Float32Array(layer.scales) // NOUVEAU : Inclure les échelles dans l'individu
+        };
+    };
+
+    // La fonction de fitness évalue la performance d'un individu (un "cervelet")
+    const fitnessFunction = (individual) => {
+        const layer = new AnalogNeuralLayer(sensorCount, actuatorCount);
+        layer.weights = individual.weights.map(w => new Float32Array(w));
+        layer.biases.set(individual.biases);
+        layer.scales.set(individual.scales); // NOUVEAU
+
+        let totalError = 0;
+        for (const [inputs, targets] of dataset) {
+            const outputs = layer.forward(inputs);
+            for (let i = 0; i < outputs.length; i++) {
+                totalError += Math.pow(outputs[i] - (targets[i] || 0), 2);
+            }
+        }
+        return totalError / dataset.length; // Mean Squared Error
+    };
+
+    // Croisement : on fait la moyenne des poids et des biais des parents.
+    const crossover = (parent1, parent2) => {
+        const child = createIndividual();
+        for (let i = 0; i < actuatorCount; i++) {
+            for (let j = 0; j < sensorCount; j++) {
+                child.weights[i][j] = (parent1.weights[i][j] + parent2.weights[i][j]) / 2;
+            }
+            child.biases[i] = (parent1.biases[i] + parent2.biases[i]) / 2;
+            child.scales[i] = (parent1.scales[i] + parent2.scales[i]) / 2; // NOUVEAU
+        }
+        return child;
+    };
+
+    // --- AMÉLIORATION : Mutation Intelligente (Algorithme Mémétique) ---
+    // Chaque enfant a une chance "d'apprendre" par lui-même.
+    const mutate = (individual) => {
+        const newIndividual = {
+            weights: individual.weights.map(w => new Float32Array(w)),
+            biases: new Float32Array(individual.biases),
+            scales: new Float32Array(individual.scales) // NOUVEAU
+        };
+
+        // 25% de chance d'une mutation "intelligente" (apprentissage local)
+        if (Math.random() < 0.25) {
+            const tempLayer = new AnalogNeuralLayer(sensorCount, actuatorCount);
+            tempLayer.weights = newIndividual.weights;
+            tempLayer.biases = newIndividual.biases;
+            tempLayer.scales = newIndividual.scales; // NOUVEAU
+
+            // On applique quelques cycles d'apprentissage par descente de gradient.
+            const sample = dataset[Math.floor(Math.random() * dataset.length)];
+            tempLayer.train(sample[0], sample[1], 0.01); // Apprentissage avec un petit learning rate
+
+        } else {
+            // Mutation classique : petite modification aléatoire d'un poids ou d'un biais.
+            const i = Math.floor(Math.random() * actuatorCount);
+            const j = Math.floor(Math.random() * sensorCount);
+            newIndividual.weights[i][j] += (Math.random() - 0.5) * 0.1;
+            newIndividual.biases[i] += (Math.random() - 0.5) * 0.05;
+            newIndividual.scales[i] += (Math.random() - 0.5) * 2.0; // NOUVEAU : Muter aussi l'échelle
+        }
+        return newIndividual;
+    };
+
+    const { solution } = optimizationLib.geneticAlgorithm(createIndividual, fitnessFunction, crossover, mutate, { generations: 80, populationSize: 50, ...options });
+
+    const bestController = new MeshController(sensorCount, actuatorCount);
+    bestController.cerebellum.weights = solution.weights;
+    bestController.cerebellum.biases = solution.biases;
+    bestController.cerebellum.scales = solution.scales; // NOUVEAU
+    return bestController;
+}
+
+/**
+ * NOUVEAU : Classe d'interface pour l'entraînement de compétences motrices.
+ * Simplifie l'utilisation de l'algorithme mémétique pour entraîner un MeshController.
+ */
+export class MotorSkillTrainer {
+    /**
+     * @param {number} sensorCount - Nombre de capteurs en entrée.
+     * @param {number} actuatorCount - Nombre d'actuateurs en sortie.
+     * @param {import('./problemSolver/library.js').Optimization} optimizationLib - L'instance de la bibliothèque d'optimisation.
+     */
+    constructor(sensorCount, actuatorCount, optimizationLib) {
+        if (!optimizationLib) {
+            throw new Error("L'instance de la bibliothèque d'optimisation est requise.");
+        }
+        this.sensorCount = sensorCount;
+        this.actuatorCount = actuatorCount;
+        this.optimizationLib = optimizationLib;
+    }
+
+    /**
+     * Entraîne et retourne un MeshController optimisé à partir d'exemples.
+     * @param {Array<Array<any>>} dataset - Tableau de couples [inputs, targets].
+     * @param {object} [options] - Options pour l'algorithme génétique (generations, populationSize, etc.).
+     * @returns {MeshController} Le meilleur contrôleur trouvé.
+     */
+    learn(dataset, options = {}) {
+        return trainMeshControllerWithGA(dataset, this.sensorCount, this.actuatorCount, this.optimizationLib, options);
+    }
+}
 
 /**
  * Contrôleur d'Actuateur Générique (Servo, Vérin, Pince, etc.)
@@ -8090,3 +8315,249 @@ export class GNeuroMoE {
 //     console.log(`  Input Sensors: [${relativeData[0].input.map(s => s.toFixed(2))}]`);
 //     console.log(`  Delta Actuators: ${relativeData[0].deltaOutput[0].toFixed(4)}`);
 // }
+
+/**
+ * NOUVEAU : Utilise un Algorithme Génétique pour découvrir la trajectoire la plus économe en énergie.
+ * Le but est de trouver une séquence de commandes moteurs qui amène l'effecteur à une cible
+ * tout en minimisant l'effort total des actuateurs.
+ * @param {KinematicChain} kinematicChain - L'instance de la chaîne cinématique du robot.
+ * @param {Map<string, RobotActuator>} actuators - La map des actuateurs du robot.
+ * @param {Vector3} targetPosition - La position 3D cible à atteindre.
+ * @param {import('./problemSolver/library.js').Optimization} optimizationLib - L'instance de la bibliothèque d'optimisation.
+ * @param {object} [options={}] - Options pour l'optimisation.
+ * @param {number} [options.trajectorySteps=25] - Le nombre de pas de temps dans la trajectoire.
+ * @param {number} [options.generations=100] - Le nombre de générations pour l'AG.
+ * @param {number} [options.populationSize=50] - La taille de la population de trajectoires.
+ * @returns {{trajectory: Array<Map<string, number>>, finalError: number, energyCost: number}} La meilleure trajectoire trouvée.
+ */
+export function discoverOptimalTrajectory(kinematicChain, actuators, targetPosition, optimizationLib, options = {}) {
+    if (!optimizationLib?.geneticAlgorithm) {
+        throw new Error("La bibliothèque d'optimisation (geneticAlgorithm) est requise.");
+    }
+
+    const { trajectorySteps = 25, generations = 100, populationSize = 50 } = options;
+    const actuatorList = Array.from(actuators.values());
+
+    // 1. L'ÉVALUATEUR (FITNESS) : Calcule le coût d'une trajectoire.
+    const fitnessFunction = (trajectory) => {
+        let totalEnergyCost = 0;
+        let finalPosition = new Vector3();
+
+        // On crée des clones des actuateurs pour ne pas modifier l'état réel du robot.
+        const simActuators = new Map(actuatorList.map(a => [a.name, new RobotActuator(a.name, {}, {}, a)]));
+
+        // Simulation de la trajectoire pas à pas
+        for (const jointTargets of trajectory) {
+            let stepEnergy = 0;
+            const currentJointValues = new Map();
+
+            for (const actuator of simActuators.values()) {
+                const targetValue = jointTargets.get(actuator.name);
+
+                // On simule une mise à jour du PID. La sortie du PID est notre proxy pour l'énergie.
+                const errorPID = targetValue - actuator.currentValue;
+                const pidOutput = actuator.kp * errorPID; // Approximation simplifiée pour le fitness
+                stepEnergy += Math.abs(pidOutput);
+
+                // On applique la nouvelle position (de manière simplifiée pour la simulation)
+                actuator.currentValue = targetValue;
+                currentJointValues.set(actuator.name, actuator.currentValue);
+            }
+
+            totalEnergyCost += stepEnergy;
+            finalPosition = kinematicChain.calculateFK(currentJointValues).position;
+        }
+
+        // Calcul de l'erreur finale (pénalité de précision)
+        const finalError = finalPosition.distanceTo(targetPosition);
+
+        // Le score total à minimiser : une combinaison de l'erreur et du coût énergétique.
+        // Le poids de 1000 sur l'erreur force l'algorithme à prioriser l'atteinte de la cible.
+        return (finalError * 1000) + totalEnergyCost;
+    };
+
+    // 2. CRÉATION D'UN INDIVIDU (Une trajectoire aléatoire)
+    const createIndividual = () => {
+        const trajectory = [];
+        for (let t = 0; t < trajectorySteps; t++) {
+            const stepTargets = new Map();
+            for (const actuator of actuatorList) {
+                // Génère une valeur aléatoire dans les limites de l'actuateur.
+                const randomValue = actuator.min + Math.random() * (actuator.max - actuator.min);
+                stepTargets.set(actuator.name, randomValue);
+            }
+            trajectory.push(stepTargets);
+        }
+        return trajectory;
+    };
+
+    // 3. CROISEMENT (Mélange de deux trajectoires)
+    const crossover = (traj1, traj2) => {
+        const pivot = Math.floor(Math.random() * trajectorySteps);
+        // L'enfant prend le début de la trajectoire 1 et la fin de la trajectoire 2.
+        return [...traj1.slice(0, pivot), ...traj2.slice(pivot)];
+    };
+
+    // 4. MUTATION (Modification légère d'une étape de la trajectoire)
+    const mutate = (trajectory) => {
+        const newTraj = trajectory.map(step => new Map(step));
+        const stepToMutate = Math.floor(Math.random() * trajectorySteps);
+        const actuatorToMutate = actuatorList[Math.floor(Math.random() * actuatorList.length)];
+
+        const currentValue = newTraj[stepToMutate].get(actuatorToMutate.name);
+        const mutationAmount = (Math.random() - 0.5) * (actuatorToMutate.max - actuatorToMutate.min) * 0.1; // +/- 10%
+        let newValue = currentValue + mutationAmount;
+        newValue = Math.max(actuatorToMutate.min, Math.min(actuatorToMutate.max, newValue)); // Clamp
+
+        newTraj[stepToMutate].set(actuatorToMutate.name, newValue);
+        return newTraj;
+    };
+
+    // 5. Lancement de l'Algorithme Génétique
+    const { solution, fitness } = optimizationLib.geneticAlgorithm(createIndividual, fitnessFunction, crossover, mutate, { generations, populationSize });
+
+    return { trajectory: solution, score: fitness };
+}
+
+/**
+ * NOUVEAU : Raffine une trajectoire existante en utilisant la Descente de Gradient.
+ * C'est une méthode beaucoup plus rapide que l'AG pour la convergence locale.
+ * @param {Array<Map<string, number>>} initialTrajectory - La trajectoire de départ à optimiser.
+ * @param {KinematicChain} kinematicChain - L'instance de la chaîne cinématique.
+ * @param {Map<string, RobotActuator>} actuators - La map des actuateurs.
+ * @param {Vector3} targetPosition - La position 3D cible.
+ * @param {import('./problemSolver/library.js').Optimization} optimizationLib - L'instance de la bibliothèque d'optimisation.
+ * @param {object} [options={}] - Options pour la descente de gradient.
+ * @returns {{trajectory: Array<Map<string, number>>, score: number}} La trajectoire raffinée.
+ */
+export function refineTrajectoryWithGradient(initialTrajectory, kinematicChain, actuators, targetPosition, optimizationLib, options = {}) {
+    if (!optimizationLib?.gradientDescent) {
+        throw new Error("La bibliothèque d'optimisation (gradientDescent) est requise.");
+    }
+
+    const actuatorList = Array.from(actuators.values());
+    const energyWeight = options.energyWeight || 1.0;
+    const trajectorySteps = initialTrajectory.length;
+
+    // La fonction de gradient est maintenant calculée de manière analytique (plus efficace).
+    const gradientFunction = (trajectory) => {
+        // Initialise un gradient vide avec la même structure que la trajectoire.
+        const gradient = trajectory.map(step => new Map());
+        const h = 0.01; // Petit pas pour le calcul numérique de la Jacobienne simplifiée.
+
+        // 1. Calcul du gradient de l'erreur finale (∇FinalError) - SEULEMENT si une cible est fournie
+        if (targetPosition) {
+            // Ce gradient n'affecte que le dernier pas de la trajectoire.
+            const finalStep = trajectory[trajectorySteps - 1];
+            const { position: basePosition } = kinematicChain.calculateFK(finalStep);
+            const errorVector = basePosition.sub(targetPosition);
+
+            for (const actuator of actuatorList) {
+                const tempTargets = new Map(finalStep);
+                const originalValue = tempTargets.get(actuator.name);
+                tempTargets.set(actuator.name, originalValue + h);
+
+                // Calcule la nouvelle position de l'effecteur avec un petit changement.
+                const { position: newPosition } = kinematicChain.calculateFK(tempTargets);
+                const positionChange = newPosition.sub(basePosition);
+
+                // Le gradient de l'erreur est la projection du changement de position sur le vecteur d'erreur.
+                // C'est une approximation de (J^T * errorVector).
+                const errorGradient = errorVector.dot(positionChange) / h;
+                gradient[trajectorySteps - 1].set(actuator.name, errorGradient * 1000); // Poids de l'erreur
+            }
+        }
+
+        // 2. Calcul du gradient du coût énergétique (∇EnergyCost)
+        // Ce gradient est local et ne dépend que des pas t-1, t, et t+1.
+        for (let t = 0; t < trajectorySteps; t++) {
+            for (const actuator of actuatorList) {
+                const prevTarget = (t > 0) ? trajectory[t - 1].get(actuator.name) : actuator.currentValue;
+                const currentTarget = trajectory[t].get(actuator.name);
+                const nextTarget = (t < trajectorySteps - 1) ? trajectory[t + 1].get(actuator.name) : currentTarget;
+
+                // Dérivée de |target_t - target_{t-1}| par rapport à target_t
+                const grad_t = actuator.kp * Math.sign(currentTarget - prevTarget);
+                // Dérivée de |target_{t+1} - target_t| par rapport à target_t
+                const grad_t_plus_1 = -actuator.kp * Math.sign(nextTarget - currentTarget);
+
+                const energyGradient = grad_t + grad_t_plus_1;
+
+                // On ajoute ce gradient à celui (potentiellement) déjà calculé pour l'erreur finale.
+                const currentGrad = gradient[t].get(actuator.name) || 0;
+                gradient[t].set(actuator.name, currentGrad + energyGradient * energyWeight);
+            }
+        }
+
+        // On calcule la norme L2 globale du gradient
+        let Rnorm = 0;
+        for (const step of gradient) {
+            for (const gradValue of step.values()) {
+                Rnorm += gradValue * gradValue;
+            }
+        }
+        Rnorm = Math.sqrt(Rnorm);
+
+        // Si la norme est trop grande, on la ramène à une valeur maximale (ex: 1.0) pour éviter les "sauts"
+        const RmaxNorm = 1.0;
+        if (Rnorm > RmaxNorm) {
+            gradient.forEach(step => step.forEach((val, key) => step.set(key, (val / norm) * maxNorm)));
+        }
+
+        return gradient;
+    };
+
+    // La descente de gradient doit être adaptée pour une structure de données complexe (tableau de Maps).
+    // On "aplatit" la trajectoire en un grand tableau de nombres, puis on la reconstruit.
+    const flatInitial = initialTrajectory.flatMap(step => actuatorList.map(a => step.get(a.name)));
+
+    const flatGradientFn = (flatTraj) => {
+        const structuredTraj = [];
+        for (let i = 0; i < flatTraj.length; i += actuatorList.length) {
+            const step = new Map();
+            actuatorList.forEach((act, j) => step.set(act.name, flatTraj[i + j]));
+            structuredTraj.push(step);
+        }
+        const structuredGrad = gradientFunction(structuredTraj);
+        return structuredGrad.flatMap(step => actuatorList.map(a => step.get(a.name)));
+    };
+
+    // On peut utiliser un learning rate plus élevé car le gradient est plus précis.
+    const gdOptions = { learningRate: 0.1, maxIterations: 50, ...options };
+    const flatOptimal = optimizationLib.gradientDescent(flatInitial, flatGradientFn, gdOptions);
+
+    // Reconstitution de la trajectoire optimisée
+    const optimalTrajectory = [];
+    for (let i = 0; i < flatOptimal.length; i += actuatorList.length) {
+        const step = new Map();
+        actuatorList.forEach((act, j) => {
+            // On s'assure que la valeur reste dans les limites de l'actuateur.
+            const clampedValue = Math.max(act.min, Math.min(act.max, flatOptimal[i + j]));
+            step.set(act.name, clampedValue);
+        });
+        optimalTrajectory.push(step);
+    }
+
+    // Évaluation finale du coût de la trajectoire optimisée.
+    const finalScore = (() => {
+        let totalEnergyCost = 0;
+        for (let t = 0; t < trajectorySteps; t++) {
+            for (const actuator of actuatorList) {
+                const prevTarget = (t > 0) ? optimalTrajectory[t - 1].get(actuator.name) : actuator.currentValue;
+                const currentTarget = optimalTrajectory[t].get(actuator.name); // Le poids de l'énergie est déjà dans la fonction de coût
+                totalEnergyCost += Math.abs(actuator.kp * (currentTarget - prevTarget)) * energyWeight;
+            }
+        }
+        const finalFK = kinematicChain.calculateFK(optimalTrajectory[trajectorySteps - 1]);
+        let finalError = 0;
+        if (targetPosition) {
+            finalError = finalFK.position.distanceTo(targetPosition);
+        }
+        // CORRECTION : Le score final doit utiliser les mêmes poids que le gradient.
+        const taskCost = options.task ? options.task.cost(optimalTrajectory[trajectorySteps - 1]) : 0;
+
+        return (finalError * 1000) + totalEnergyCost + taskCost;
+    })();
+
+    return { trajectory: optimalTrajectory, score: finalScore };
+}

@@ -19,7 +19,8 @@
     "is_slippery": 3,
     "tilt_critical": 4,
     "object_grasped": 5,
-    "overpressure": 6
+    "overpressure": 6,
+    "step_phase": 7
   },
   "sensors": {
     "maillage_main": {
@@ -55,7 +56,8 @@
     "behavior": {
         "bit_0_grasp": { "var": "contact" },
         "bit_1_release": { "type": "NOT", "args": [{ "var": "contact" }] },
-        "bit_2_emergency_open": { "var": "overpressure" }
+        "bit_2_emergency_open": { "var": "overpressure" },
+        "bit_3_walk_cycle": { "var": "step_phase" }
     }
   },
   "kinematics": {
@@ -63,6 +65,20 @@
       "center": [0, 0, 0],
       "radius_max": 0.2,
       "radius_min": 0.0
+    },
+    "main": {
+      "states": [
+        {
+          "tag": "EMERGENCY_OPEN",
+          "values": {
+            "Index_P1": 0, "Index_P2": 0, "Index_P3": 0,
+            "Majeur_P1": 0, "Majeur_P2": 0, "Majeur_P3": 0,
+            "Annulaire_P1": 0, "Annulaire_P2": 0, "Annulaire_P3": 0,
+            "Auriculaire_P1": 0, "Auriculaire_P2": 0, "Auriculaire_P3": 0,
+            "Pouce_P1": 0, "Pouce_P2": 0, "Pouce_Rot": 0
+          }
+        }
+      ]
     },
     "index": {
       "states": [
