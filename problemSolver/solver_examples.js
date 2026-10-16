@@ -987,6 +987,51 @@ const xorNeuron = new neuro.PolynomialMajorityNeuron(xorWeights, xorThreshold, x
 console.log(`XOR(0, 1) -> ${xorNeuron.predict([0, 1])}`); // Attendu: 1
 console.log(`XOR(1, 1) -> ${xorNeuron.predict([1, 1])}`); // Attendu: 0
 
+console.log("\n38b. Détection Neuronale Polynomial++ (Puissances et Multiplicateurs Variables)");
+// Problème : Détecter un motif non-linéaire complexe sur 3 entrées avec saturations :
+// Score = 3*(x0^2 * x1) - 4*(x1 * x2^2) + 2*(x0 * x2^3) >= 2
+const polyPlusTerms = [
+    { multiplier: 3, powers: [2, 1, 0] }, // 3 * x0^2 * x1
+    { multiplier: -4, powers: [0, 1, 2] }, // -4 * x1 * x2^2
+    { multiplier: 2, powers: [1, 0, 3] }  // 2 * x0 * x2^3
+];
+const polyNeuron = new neuro.PolynomialPlusPlusNeuron(polyPlusTerms, 2);
+
+console.log("Évaluation manuelle Polynomial++ :");
+console.log("  Input [2, 1, 0] -> score:", polyNeuron.evaluateScore([2, 1, 0]), "-> Prédit:", polyNeuron.predict([2, 1, 0])); // 3*(4*1) - 0 + 0 = 12 >= 2 -> 1
+console.log("  Input [0, 2, 2] -> score:", polyNeuron.evaluateScore([0, 2, 2]), "-> Prédit:", polyNeuron.predict([0, 2, 2])); // 0 - 4*(2*4) + 0 = -32 < 2 -> 0
+
+// Apprentissage automatique des puissances variables et multiplicateurs via GA
+console.log("\nRecherche de neurone Polynomial++ optimal via GA :");
+const nonLinearDataset = [
+    [[1, 0, 1], 1],
+    [[0, 2, 1], 0],
+    [[2, 1, 0], 1],
+    [[1, 1, 2], 0],
+    [[2, 0, 2], 1],
+    [[0, 1, 2], 0]
+];
+
+const discoveredPoly = neuro.discoverOptimalPolynomialPlusPlusWithGA(
+    nonLinearDataset,
+    3,
+    Optimization,
+    { maxTerms: 4, maxPower: 3, generations: 80, populationSize: 50 }
+);
+
+console.log(`Précision atteinte par le neurone Polynomial++ : ${(discoveredPoly.accuracy * 100).toFixed(1)}%`);
+console.log(`Seuil optimal : ${discoveredPoly.threshold}`);
+console.log("Monômes optimisés découverts :");
+discoveredPoly.terms
+    .filter(t => t.multiplier !== 0)
+    .forEach((t, i) => {
+        const factors = t.powers
+            .map((pow, varIdx) => pow > 0 ? `x${varIdx}^${pow}` : null)
+            .filter(Boolean)
+            .join(' * ');
+        console.log(`  Terme ${i + 1}: ${t.multiplier > 0 ? '+' : ''}${t.multiplier} * (${factors || '1'})`);
+    });
+
 console.log("\n39. Apprentissage Moteur : Entraînement d'un Contrôleur de Main Robotique");
 // Problème : Apprendre à une main robotique à adopter une posture de "pince"
 // en réponse à une pression spécifique sur ses capteurs tactiles.
@@ -1339,5 +1384,49 @@ console.log("\n45. Intelligence Éthique : Apprendre à Lâcher Prise face à un
 
     } catch (e) {
         console.error("\n❌ Erreur lors de l'optimisation de la prise de conscience éthique:", e.message, e.stack);
+    }
+})();
+
+console.log("\n46. Découverte de Formalisme Syntaxique Invisible (PolynomialFormalismMiner)");
+// Problème : Identifier les invariants de construction d'une phrase (règles formelles cachées)
+// sans règles codées en dur, uniquement par apprentissage de polynômes d'ordre supérieur.
+
+(() => {
+    try {
+        const brain = new neuro.SemanticRelationalMemory(8);
+        // Ingestion d'un corpus d'apprentissage structuré
+        const corpus = [
+            "le robot observe la cible attentivement",
+            "le capteur transmet une alerte rapidement",
+            "un actuateur execute une trajectoire avec precision",
+            "le moteur maintient la position fermement",
+            "la pince saisit un objet directement"
+        ];
+        corpus.forEach(phrase => brain.learnText(phrase, false, 2));
+
+        // Forcer une passe de clustering syntaxique pour partitionner les rôles grammaticaux
+        brain._updateSyntacticClusters();
+
+        const miner = new neuro.PolynomialFormalismMiner(brain, 4);
+        console.log("   Lancement de l'extraction de formalisme via GA...");
+        const formalDiscovery = miner.discoverFormalGrammar(corpus, Optimization, {
+            generations: 100,
+            populationSize: 60,
+            maxTerms: 6
+        });
+
+        console.log(`\n✅ Formalisme extrait avec une fidélité discriminante de ${(formalDiscovery.accuracy * 100).toFixed(1)}%`);
+        console.log(`   Seuil d'équilibre : ${formalDiscovery.threshold}`);
+        console.log("   Invariants algébriques découverts :");
+        formalDiscovery.decodedRules.rules.forEach((r, idx) => {
+            console.log(`   [Règle ${idx + 1}] ${r.description}`);
+        });
+
+        // Test d'acceptabilité d'une phrase valide vs phrase inversée
+        const testOk = miner.encodeSequence(["le", "capteur", "observe", "la"]);
+        const testKo = miner.encodeSequence(["observe", "le", "la", "capteur"]);
+        console.log(`   Validation syntaxe correcte : ${formalDiscovery.neuron.predict(testOk) === 1 ? "VALIDE ✅" : "REJETÉE ❌"}`);
+    } catch (e) {
+        console.error("❌ Erreur lors de l'extraction formelle:", e.message);
     }
 })();

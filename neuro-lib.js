@@ -7,6 +7,7 @@
 import zlib from 'node:zlib';
 import fs from 'node:fs';
 import path from 'node:path';
+import {Optimization, Dichotomy} from "./problemSolver/library.js";
 
 // ---------- Noyau Mathématique : Quaternions ----------
 export class Quaternion {
@@ -233,6 +234,71 @@ export class SeekerNeuron {
 }
 
 /**
+ * Détermine le seuil de décision optimal par partitionnement dichotomique sur la courbe contrastive.
+ * Maximise l'indice de Youden (TPR + TNR - 1) pour équilibrer fidélité et sensibilité.
+ * @param {Array<object>} terms - Monômes polynomiaux.
+ * @param {Array<[Uint8Array, number]>} dataset - Exemples contrastifs [inputs, target].
+ * @param {object} [dichotomyLib=Dichotomy] - Bibliothèque de dichotomie.
+ * @returns {{threshold: number, accuracy: number, scoreRange: {min: number, max: number}}}
+ */
+export function calibrateThresholdDichotomy(terms, dataset) {
+    const tempNeuron = new PolynomialPlusPlusNeuron(terms, 0);
+    const evaluated = dataset.map(([inputs, target]) => ({
+        score: tempNeuron.evaluateScore(inputs),
+        target: target & 1
+    }));
+
+    if (evaluated.length === 0) {
+        return { threshold: 0, accuracy: 0.5, scoreRange: { min: 0, max: 0 } };
+    }
+
+    evaluated.sort((a, b) => a.score - b.score);
+    const minScore = evaluated[0].score;
+    const maxScore = evaluated[evaluated.length - 1].score;
+    if (minScore === maxScore) {
+        return { threshold: minScore, accuracy: 0.5, scoreRange: { min: minScore, max: maxScore } };
+    }
+
+    let bestThreshold = minScore;
+    let bestYouden = -Infinity;
+    let bestAccuracy = 0;
+
+    const totalPositives = evaluated.filter(e => e.target === 1).length;
+    const totalNegatives = evaluated.length - totalPositives;
+    if (totalPositives === 0 || totalNegatives === 0) {
+        return { threshold: minScore, accuracy: 1.0, scoreRange: { min: minScore, max: maxScore } };
+    }
+
+    // Balayage linéaire en O(N) au lieu de O(N^2)
+    let tp = totalPositives;
+    let tn = 0;
+
+    for (let i = 0; i < evaluated.length; i++) {
+        const item = evaluated[i];
+        const th = item.score;
+        const tpr = tp / totalPositives;
+        const tnr = tn / totalNegatives;
+        const youdenIndex = tpr + tnr;
+        const acc = (tp + tn) / evaluated.length;
+
+        if (youdenIndex > bestYouden || (youdenIndex === bestYouden && acc > bestAccuracy)) {
+            bestYouden = youdenIndex;
+            bestThreshold = th;
+            bestAccuracy = acc;
+        }
+
+        if (item.target === 1) tp--;
+        else tn++;
+    }
+
+    return {
+        threshold: bestThreshold,
+        accuracy: bestAccuracy,
+        scoreRange: { min: minScore, max: maxScore }
+    };
+}
+
+/**
  * NOUVEAU : Discrimine un flux de bytes en analysant sa "personnalité" par rapport à un expert.
  * Cette fonction détermine le caractère unique du flux, son concept dominant, et le cluster
  * syntaxique auquel il appartient, réalisant ainsi une véritable caractérisation.
@@ -401,7 +467,7 @@ export class AdaptiveMajorityNeuron {
             // If input bit matches target bit, it's a positive correlation. If not, it's negative.
             const correlation = (inputs[i] === targetBit) ? 1 : -1;
             const change = correlation * pressure;
-            this.potentials[i] = Math.max(-127, Math.min(127, this.potentials[i] + change * 5));
+            this.potentials[i] = Math.max(-127, Math.min(127, this.potentials[i] + change * 50)); // Augmentation significative du taux d'apprentissage
         }
         this.learningCounter++;
 
@@ -416,15 +482,15 @@ export class AdaptiveMajorityNeuron {
         for (let i = 0; i < this.inputSize; i++) {
             // Augmentation de la plage dynamique (0 à 63)
             // On ignore les signaux faibles (< 3) pour éliminer le "fantôme" de l'information
-            // CORRECTION: The hard cutoff at p > 2 was too aggressive and zeroed out learned weights.
-            // We now allow small positive potentials to become small weights.
+            // Utilise le potentiel directement comme poids (jusqu'à 63)
             const p = this.potentials[i];
-            this.weights[i] = p > 0 ? Math.min(Math.floor(p / 2), 63) : 0;
+            this.weights[i] = p > 0 ? Math.min(p, 63) : 0; // On garde tous les potentiels positifs (plus indulgent)
             totalWeight += this.weights[i];
         }
         // Consensus optimal à 60% : assez souple pour la suite, assez strict pour l'exactitude
-        // CORRECTION: Un ratio fixe est trop rigide. On utilise une formule plus souple.
-        this.threshold = Math.max(1, Math.floor(totalWeight / 2) + 1);
+        // CORRECTION MAJEURE : Un seuil basé sur la majorité stricte (totalWeight / 2) est trop rigide pour l'apprentissage de séquences.
+        // On passe à un seuil plus bas et adaptatif, basé sur la racine carrée du poids total.
+        this.threshold = Math.max(1, Math.floor(Math.sqrt(totalWeight) * 2.5));
     }
 
     exportState() {
@@ -1124,14 +1190,37 @@ export class StochasticPerceptron {
 /**
  * CELLULE RÉCURRENTE BINAIRE (Bit-RNN)
  * Version adaptative : Apprend les transitions d'états binaires pour le texte.
+ * Intègre une mémoire multi-échelle simple pour accéder à des états plus anciens.
  */
 export class BitwiseRNNCell {
-    constructor(size) {
+    /**
+     * @param {number} size Taille du vecteur d'état (et d'entrée).
+     * @param {number} [memoryDepth=2] Nombre d'états passés à conserver en mémoire.
+     */
+    constructor(size, memoryDepth = 2) {
         this.size = size;
+        this.memoryDepth = memoryDepth;
         this.state = new Uint8Array(size).fill(0);
+        // Initialise pastStates avec des Uint8Arrays vides
+        this.pastStates = Array.from({ length: memoryDepth }, () => new Uint8Array(size).fill(0));
+
         // Chaque bit d'état est géré par un neurone capable d'apprendre
         // l'influence combinée de l'input et de l'état précédent.
-        this.neurons = Array.from({ length: size }, () => new AdaptiveMajorityNeuron(size * 2));
+        // inputSize = inputs (size) + current_state (size) + past_states (memoryDepth * size)
+        const neuronInputSize = size * (1 + 1 + memoryDepth);
+        this.neurons = Array.from({ length: size }, () => new AdaptiveMajorityNeuron(neuronInputSize));
+    }
+
+    _getCombinedInput(inputs) {
+        const combinedInputSize = this.size * (1 + 1 + this.memoryDepth);
+        const combinedInput = new Uint8Array(combinedInputSize);
+        let offset = 0;
+        combinedInput.set(inputs, offset); offset += this.size;
+        combinedInput.set(this.state, offset); offset += this.size;
+        for (let i = 0; i < this.memoryDepth; i++) {
+            combinedInput.set(this.pastStates[i], offset); offset += this.size;
+        }
+        return combinedInput;
     }
 
     /**
@@ -1139,10 +1228,13 @@ export class BitwiseRNNCell {
      * @param {Uint8Array} inputs 
      */
     step(inputs) {
-        const combinedInput = new Uint8Array(this.size * 2);
-        combinedInput.set(inputs, 0);
-        combinedInput.set(this.state, this.size);
-
+        // Store the current state into pastStates before it's updated
+        // Use slice() to create a copy, otherwise pastStates would hold references to the same object
+        this.pastStates.unshift(this.state.slice());
+        if (this.pastStates.length > this.memoryDepth) {
+            this.pastStates.pop(); // Maintain memoryDepth
+        }
+        const combinedInput = this._getCombinedInput(inputs);
         const nextState = new Uint8Array(this.size);
         for (let i = 0; i < this.size; i++) {
             nextState[i] = this.neurons[i].predict(combinedInput);
@@ -1153,18 +1245,131 @@ export class BitwiseRNNCell {
     }
 
     train(inputs, targets) {
-        const combinedInput = new Uint8Array(this.size * 2);
-        combinedInput.set(inputs, 0);
-        combinedInput.set(this.state, this.size);
-
+        const combinedInputForTraining = this._getCombinedInput(inputs);
         for (let i = 0; i < this.size; i++) {
-            this.neurons[i].train(combinedInput, targets[i]);
+            this.neurons[i].train(combinedInputForTraining, targets[i]);
         }
         this.step(inputs); // Avance l'état après l'entraînement
     }
 
     reset() {
         this.state.fill(0);
+        this.pastStates.forEach(s => s.fill(0)); // Clear all past states
+    }
+}
+
+/**
+ * NOUVEAU : CELLULE RÉCURRENTE ÉVOLUTIVE (Evolved-RNN)
+ * Remplace les neurones adaptatifs simples par de petits réseaux de neurones majoritaires
+ * dont la topologie est optimisée par un algorithme génétique.
+ * Chaque bit de l'état est contrôlé par son propre "expert" non-linéaire.
+ */
+export class EvolvedRNNCell {
+    /**
+     * @param {number} size - Taille du vecteur d'état.
+     * @param {number} memoryDepth - Nombre d'états passés à conserver.
+     * @param {import('./problemSolver/library.js').Optimization} optimizationLib - L'instance de la bibliothèque d'optimisation.
+     * @param {object} [options={}] - Options supplémentaires.
+     * @param {number} [options.inputSize] - Taille de l'input externe, si différente de `size`.
+     */
+    constructor(size, memoryDepth, optimizationLib, options = {}) {
+        if (!optimizationLib?.geneticAlgorithm) {
+            throw new Error("La bibliothèque d'optimisation (geneticAlgorithm) est requise.");
+        }
+        this.size = size;
+        this.memoryDepth = memoryDepth;
+        this.optimizationLib = optimizationLib;
+        // La taille de l'input externe peut être différente de la taille de l'état interne.
+        this.inputSize = options.inputSize !== undefined ? options.inputSize : size;
+
+        this.state = new Uint8Array(size).fill(0);
+        this.pastStates = Array.from({ length: memoryDepth }, () => new Uint8Array(size).fill(0));
+
+        // L'input combiné inclut l'entrée, l'état actuel et les états passés.
+        // CORRECTION : Utiliser this.inputSize pour la partie 'entrée' du calcul.
+        this.combinedInputSize = this.inputSize + size * (1 + memoryDepth);
+
+        // Chaque bit de l'état est géré par un réseau expert.
+        // Initialisés à null, ils seront "évolués" lors de l'entraînement.
+        this.expertNetworks = Array(size).fill(null);
+    }
+
+    _getCombinedInput(inputs) {
+        const combinedInput = new Uint8Array(this.combinedInputSize);
+        let offset = 0;
+        combinedInput.set(inputs, offset); offset += this.inputSize;
+        combinedInput.set(this.state, offset); offset += this.size;
+        for (let i = 0; i < this.memoryDepth; i++) {
+            combinedInput.set(this.pastStates[i], offset); offset += this.size;
+        }
+        return combinedInput;
+    }
+
+    /**
+     * Fait évoluer les réseaux experts pour apprendre une séquence.
+     * @param {Array<{input: Uint8Array, target: Uint8Array}>} sequence - La séquence complète à apprendre.
+     * @param {object} [options={}] - Options pour l'algorithme génétique.
+     */
+    evolve(sequence, options = {}) {
+        console.log(`[EvolvedRNNCell] Début de l'évolution pour ${this.size} bits d'état...`);
+
+        for (let i = 0; i < this.size; i++) {
+            console.log(`  -> Évolution de l'expert pour le bit #${i}...`);
+
+            // 1. Créer un jeu de données spécifique pour ce bit.
+            const dataset = [];
+            this.reset(); // Important: reset l'état pour chaque passe de création de dataset.
+            for (const step of sequence) {
+                const combinedInput = this._getCombinedInput(step.input);
+                const targetBit = step.target[i];
+                dataset.push([combinedInput, targetBit]);
+
+                // CORRECTION : On met à jour l'état en utilisant la VÉRITÉ (target),
+                // et non une prédiction, pour construire un dataset cohérent.
+                // AMÉLIORATION : Il faut aussi mettre à jour l'état pour la prochaine itération du dataset.
+                this.step(step.input, step.target); // Utilise la vérité (target) pour avancer l'état
+            }
+
+            // 2. Utiliser l'AG pour découvrir le meilleur réseau pour ce bit.
+            const { network } = discoverOptimalNetworkWithGA(
+                dataset,
+                this.combinedInputSize,
+                this.optimizationLib,
+                { maxHiddenNeurons: 4, generations: 50, populationSize: 40, ...options }
+            );
+
+            this.expertNetworks[i] = network;
+        }
+        this.reset();
+        console.log(`[EvolvedRNNCell] Évolution terminée.`);
+    }
+
+    /**
+     * Un cycle d'horloge du RNN.
+     * @param {Uint8Array} inputs
+     * @param {Uint8Array} [overrideTarget=null] Si fourni, force l'état suivant à cette valeur (pour l'entraînement).
+     */
+    step(inputs, overrideTarget = null) {
+        this.pastStates.unshift(this.state.slice());
+        if (this.pastStates.length > this.memoryDepth) this.pastStates.pop();
+
+        const combinedInput = this._getCombinedInput(inputs);
+        const nextState = new Uint8Array(this.size);
+        if (overrideTarget) {
+            nextState.set(overrideTarget);
+        } else {
+            for (let i = 0; i < this.size; i++) {
+                nextState[i] = this.expertNetworks[i] ? this.expertNetworks[i].predict(combinedInput)[0] : 0;
+            }
+        }
+
+        this.state = nextState;
+        return this.state;
+    }
+
+    reset() {
+        this.state.fill(0);
+        this.pastStates.forEach(s => s.fill(0));
     }
 }
 
@@ -1274,13 +1479,13 @@ export class StatefulMajorityNetwork {
             return this.varMap[a] - this.varMap[b]; // Ensuite, tri par index numérique
         });
 
-        let currentInputCounter = 0; // Compteur pour les indices des inputs actuels
+        let currentInputCounter = 0;
         for (const name of names) {
             const targetIdx = this.varMap[name];
             if (name.startsWith('prev_')) { // Variable d'état précédente
                 const stateIdx = parseInt(name.split('_').pop()) - 1 || 0;
                 this._mappingInstructions.push({ type: 'prevState', stateIdx: stateIdx, targetIdx: targetIdx });
-            } else { // Input actuel
+            } else if (currentInputCounter < this.currentInputSize) { // Input actuel
                 this._mappingInstructions.push({ type: 'currentInput', sourceIdx: currentInputCounter, targetIdx: targetIdx });
                 currentInputCounter++;
             }
@@ -2408,6 +2613,605 @@ export class PolynomialMajorityNeuron {
 }
 
 /**
+ * POLYNOMIAL++ NEURON (Puissances variables & Multiplicateurs variables)
+ * Neurone d'activation à haute capacité polynomiale optimisé pour l'exécution bit-à-bit et entière.
+ *
+ * Évalue des monômes non-linéaires arbitraires :
+ * Score = Somme_k [ multiplicateur_k * Produit_j ( x_{j} ^ puissance_{k, j} ) ]
+ *
+ * Supporte :
+ * - Mode 'arithmetic' : puissances classiques x^p (p=0: neutre, p=1: direct, p>=2: non-linéaire).
+ * - Mode 'bitwise' : puissances équivalentes à des décalages binaires (x << p) sans allocations.
+ * - Entraînement en ligne adaptatif des multiplicateurs et du seuil.
+ */
+export class PolynomialPlusPlusNeuron {
+    /**
+     * @param {Array<{multiplier: number, powers?: number[], factors?: Array<{index: number, power: number}>}>} terms - Liste des termes monomiaux.
+     * @param {number} threshold - Seuil d'activation de la majorité polynomiale.
+     * @param {object} [options={}] - Options d'exécution.
+     * @param {boolean} [options.bitwiseShifts=false] - Si true, x^p est interprété comme un décalage binaire (x << p).
+     */
+    constructor(terms = [], threshold = 1, options = {}) {
+        this.threshold = threshold;
+        this.bitwiseShifts = !!options.bitwiseShifts;
+        
+        // Normalisation des termes en format standard { multiplier, factors: [{ index, power }] }
+        this.terms = terms.map(term => {
+            const multiplier = term.multiplier !== undefined ? term.multiplier : 1;
+            let factors = [];
+
+            if (Array.isArray(term.factors)) {
+                factors = this.bitwiseShifts
+                    ? term.factors.filter(f => f.power !== undefined && f.power >= 0)
+                    : term.factors.filter(f => f.power > 0);
+            } else if (Array.isArray(term.powers)) {
+                factors = term.powers
+                    .map((pow, idx) => ({ index: idx, power: pow }))
+                    .filter(f => f.power > 0);
+            }
+            return { multiplier, factors };
+        });
+    }
+
+    /**
+     * Évalue le score polynomial continu / entier non-seuillé.
+     * @param {Array<number>|Uint8Array|Int32Array} inputs
+     * @returns {number}
+     */
+    evaluateScore(inputs) {
+        let total = 0;
+        const termsCount = this.terms.length;
+
+        for (let i = 0; i < termsCount; i++) {
+            const term = this.terms[i];
+            const mult = term.multiplier;
+            if (mult === 0) continue;
+
+            let termProduct = 1;
+            const factors = term.factors;
+            const fCount = factors.length;
+
+            for (let f = 0; f < fCount; f++) {
+                const factor = factors[f];
+                const rawVal = inputs[factor.index];
+                const val = this.bitwiseShifts ? (rawVal | 0) : rawVal;
+
+                // Court-circuit : si un facteur est nul, tout le monôme est nul
+                if (val === 0) {
+                    termProduct = 0;
+                    break;
+                }
+
+                const p = factor.power;
+                if (p === 1) {
+                    termProduct *= val;
+                } else if (this.bitwiseShifts) {
+                    termProduct *= (val << p);
+                } else if (p === 2) {
+                    termProduct *= (val * val);
+                } else {
+                    termProduct *= Math.pow(val, p);
+                }
+            }
+
+            total += mult * termProduct;
+        }
+
+        return total;
+    }
+
+    /**
+     * Prédit la sortie binaire (0 ou 1) après franchissement du seuil.
+     * @param {Array<number>|Uint8Array} inputs
+     * @returns {number} 0 ou 1
+     */
+    predict(inputs) {
+        return (this.evaluateScore(inputs) >= this.threshold) | 0;
+    }
+
+    /**
+     * Retourne la confiance et le ratio de consensus par rapport au seuil.
+     */
+    getConfidence(inputs) {
+        const score = this.evaluateScore(inputs);
+        const denom = Math.abs(this.threshold) || 1;
+        return {
+            score,
+            thresholdRatio: score / denom,
+            isFired: score >= this.threshold
+        };
+    }
+
+    /**
+     * Entraînement adaptatif hebbien / delta sur les multiplicateurs.
+     */
+    train(inputs, targetBit, lr = 1) {
+        const pred = this.predict(inputs);
+        const error = (targetBit & 1) - pred;
+        if (error === 0) return;
+
+        for (const term of this.terms) {
+            let termProduct = 1;
+            for (const factor of term.factors) {
+                const rawVal = inputs[factor.index];
+                const val = this.bitwiseShifts ? (rawVal | 0) : rawVal;
+                if (val === 0) {
+                    termProduct = 0;
+                    break;
+                }
+                termProduct *= this.bitwiseShifts ? (val << factor.power) : Math.pow(val, factor.power);
+            }
+            term.multiplier = Math.max(-128, Math.min(127, term.multiplier + error * lr * termProduct));
+        }
+        this.threshold = Math.max(-500, Math.min(500, this.threshold - error * lr));
+    }
+
+    exportState() {
+        return {
+            terms: JSON.parse(JSON.stringify(this.terms)),
+            threshold: this.threshold,
+            bitwiseShifts: this.bitwiseShifts
+        };
+    }
+
+    static importState(state) {
+        return new PolynomialPlusPlusNeuron(state.terms, state.threshold, { bitwiseShifts: state.bitwiseShifts });
+    }
+}
+
+/**
+ * Découvre la configuration optimale d'un PolynomialPlusPlusNeuron via Algorithme Génétique.
+ * Évolue conjointement les multiplicateurs variables, les puissances variables et le seuil.
+ * Le seuil est affiné par dichotomie sur le paysage de scores contrastifs.
+ */
+export function discoverOptimalPolynomialPlusPlusWithGA(dataset, inputSize, optimizationLib, options = {}) {
+    if (!optimizationLib?.geneticAlgorithm) {
+        throw new Error("La bibliothèque d'optimisation (geneticAlgorithm) est requise.");
+    }
+
+    const maxTerms = options.maxTerms || 6;
+    const maxPower = options.maxPower || 3;
+    const sparsity = options.sparsity !== undefined ? options.sparsity : 0.85; // 85% de zéros par défaut
+    const slotSize = options.slotSize || null; // Si spécifié, contrainte par slot binaire (ex: 12 bits par token)
+    const dichotomyLib = options.dichotomyLib || Dichotomy;
+
+    // Extraction des motifs positifs réels pour initialiser des hypothèses valides (Data-driven seeding)
+    const positiveInputs = dataset.filter(([_, t]) => (t & 1) === 1).map(([inp]) => inp);
+
+    const createIndividual = () => {
+        const terms = Array.from({ length: maxTerms }, (termIdx) => {
+            let multiplier = Math.floor(Math.random() * 21) - 10;
+            if (multiplier === 0) multiplier = Math.random() < 0.6 ? 2 : -2;
+            const powers = new Array(inputSize).fill(0);
+
+            const bitsPerSlot = slotSize || 12;
+            const numSlots = Math.max(2, Math.floor(inputSize / bitsPerSlot));
+
+            // Seeding contrastif : on extrait des paires actives directement depuis un exemple valide
+            if (dataset.length >= 2 && Math.random() < 0.75) {
+                const pairIdx = Math.floor(Math.random() * (dataset.length / 2)) * 2;
+                const posExample = dataset[pairIdx][0];
+                const activeBits = [];
+                for (let i = 0; i < inputSize; i++) {
+                    if (posExample[i] === 1) activeBits.push(i);
+                }
+                if (activeBits.length >= 2) {
+                    const idx1 = activeBits[Math.floor(Math.random() * activeBits.length)];
+                    const slot1 = Math.floor(idx1 / bitsPerSlot);
+                    // On cherche un second bit sur un slot DIFFÉRENT
+                    const otherSlotBits = activeBits.filter(idx => Math.floor(idx / bitsPerSlot) !== slot1);
+                    const idx2 = otherSlotBits.length > 0
+                        ? otherSlotBits[Math.floor(Math.random() * otherSlotBits.length)]
+                        : activeBits[Math.floor(Math.random() * activeBits.length)];
+                    powers[idx1] = 1;
+                    powers[idx2] = 1;
+                    return { multiplier: Math.abs(multiplier) || 3, powers };
+                }
+            }
+
+            const posA = Math.floor(Math.random() * numSlots);
+            const posB = (posA + 1 + Math.floor(Math.random() * (numSlots - 1))) % numSlots;
+            powers[posA * bitsPerSlot + Math.floor(Math.random() * bitsPerSlot)] = 1;
+            powers[posB * bitsPerSlot + Math.floor(Math.random() * bitsPerSlot)] = 1;
+
+            return { multiplier, powers };
+        });
+        const threshold = 1 + Math.floor(Math.random() * 4);
+        return { terms, threshold };
+    };
+
+    const fitnessFunction = (individual) => {
+        // La marge contrastive (sPos - sNeg) est indépendante du seuil.
+        // Le calcul lourd du seuil n'est nécessaire qu'une seule fois sur la solution finale.
+        let loss = 0;
+        const MARGIN = 2;
+        const neuron = new PolynomialPlusPlusNeuron(individual.terms, 0, options);
+
+        for (let i = 0; i < dataset.length - 1; i += 2) {
+            const sPos = neuron.evaluateScore(dataset[i][0]);
+            const sNeg = neuron.evaluateScore(dataset[i + 1][0]);
+            const diff = sPos - sNeg;
+
+            if (diff < MARGIN) {
+                loss += (MARGIN - diff) * 2;
+            }
+            // Pénalité d'inactivité totale sur la paire
+            if (sPos === 0 && sNeg === 0) {
+                loss += 5;
+            }
+        }
+        return loss;
+    };
+
+    const crossover = (p1, p2) => {
+        const childTerms = p1.terms.map((term, i) => Math.random() < 0.5 ? term : p2.terms[i]);
+        const childThreshold = Math.random() < 0.5 ? p1.threshold : p2.threshold;
+        return { terms: childTerms, threshold: childThreshold };
+    };
+
+    const mutate = (ind) => {
+        const newInd = JSON.parse(JSON.stringify(ind));
+        const term = newInd.terms[Math.floor(Math.random() * newInd.terms.length)];
+        if (Math.random() < 0.4) {
+            term.multiplier = Math.max(-15, Math.min(15, term.multiplier + (Math.random() < 0.5 ? -1 : 1)));
+        } else {
+            const bitsPerSlot = slotSize || 12;
+            const numSlots = Math.max(2, Math.floor(inputSize / bitsPerSlot));
+            const slot = Math.floor(Math.random() * numSlots);
+            const bit = Math.floor(Math.random() * bitsPerSlot);
+            const idx = slot * bitsPerSlot + bit;
+            term.powers[idx] = term.powers[idx] > 0 ? 0 : 1;
+        }
+        if (Math.random() < 0.3) {
+            newInd.threshold += (Math.random() < 0.5 ? -1 : 1);
+        }
+        return newInd;
+    };
+
+    const gaOptions = { generations: 120, populationSize: 60, ...options };
+    const { solution, fitness } = optimizationLib.geneticAlgorithm(createIndividual, fitnessFunction, crossover, mutate, gaOptions);
+
+    // Calibrage final ultra-précis par dichotomie sur la solution retenue
+    const finalCalibration = calibrateThresholdDichotomy(solution.terms, dataset, dichotomyLib);
+    const finalThreshold = finalCalibration.threshold;
+    const neuron = new PolynomialPlusPlusNeuron(solution.terms, finalThreshold, options);
+    const finalAccuracy = finalCalibration.accuracy;
+
+    return { neuron, terms: solution.terms, threshold: finalThreshold, accuracy: finalAccuracy, errors: fitness };
+}
+
+/**
+ * EXTRACTEUR DE FORMALISME & STRUCTURES LATENTES (POLYNOMIAL++)
+ * Induit les lois formelles et invariants structurels directement au niveau des bits (12 bits par token),
+ * éliminant les regroupements arbitraires de surface (clusters).
+ */
+export class PolynomialFormalismMiner {
+    /**
+     * @param {SemanticRelationalMemory|GNeuroMoE} brain - Le cerveau disposant du vocabulaire et des clusters.
+     * @param {number} windowSize - Longueur de la fenêtre d'analyse (ex: 4 ou 5 tokens).
+     */
+    constructor(brain, windowSize = 4, tokenBitLength = 12) {
+        this.brain = brain.sharedState || brain;
+        this.windowSize = windowSize;
+        this.tokenBitLength = tokenBitLength;
+        this.inputSize = this.windowSize * this.tokenBitLength;
+        this.bitDetectors = null;
+        if (this.brain?.vocabulary && this.brain.vocabulary.size > 0) {
+            this.induceFeatures();
+        }
+    }
+
+    /**
+     * Induit de manière non supervisée les détecteurs de traits morphologiques et distributionnels.
+     * Analyse la distribution fréquentielle, la productivité des affixes (diversité de radicaux)
+     * et les clusters syntaxiques appris par le cerveau.
+     * @param {Array<string>} [sentences=[]] - Corpus optionnel pour calibrer les traits.
+     */
+    induceFeatures(sentences = []) {
+        const wordFreqs = new Map();
+        let totalTokens = 0;
+
+        const tokenizer = /[a-z0-9àâäéèêëïîôöùûüç]+|[^\w\s]/gi;
+
+        if (Array.isArray(sentences) && sentences.length > 0) {
+            for (const s of sentences) {
+                const words = String(s).match(tokenizer) || [];
+                for (const w of words) {
+                    const clean = w.toLowerCase();
+                    wordFreqs.set(clean, (wordFreqs.get(clean) || 0) + 1);
+                    totalTokens++;
+                }
+            }
+        }
+
+        if (this.brain?.vocabulary) {
+            for (const [w, id] of this.brain.vocabulary) {
+                const count = (this.brain.wordCounts?.get(id) || 1);
+                const clean = String(w).toLowerCase();
+                wordFreqs.set(clean, (wordFreqs.get(clean) || 0) + count);
+                totalTokens += count;
+            }
+        }
+
+        if (wordFreqs.size === 0) {
+            this._setDefaultDetectors();
+            return;
+        }
+
+        // 1. Découverte statistique des mots fonctionnels / haute fréquence
+        const sortedByFreq = Array.from(wordFreqs.entries()).sort((a, b) => b[1] - a[1]);
+        const highFreqThreshold = Math.max(5, Math.floor(sortedByFreq.length * 0.03));
+        const highFreqWords = new Set(sortedByFreq.slice(0, highFreqThreshold).map(e => e[0]));
+
+        // 2. Découverte morphologique non-supervisée des suffixes les plus productifs
+        // Score de productivité = nombre de radicaux (stems distincts de longueur >= 2)
+        const suffixRoots = new Map();
+        for (const [w] of wordFreqs) {
+            if (w.length >= 4 && /^[a-z0-9àâäéèêëïîôöùûüç]+$/i.test(w)) {
+                for (let len = 1; len <= 4; len++) {
+                    if (w.length - len >= 2) {
+                        const sfx = w.slice(-len);
+                        const stem = w.slice(0, -len);
+                        if (!suffixRoots.has(sfx)) suffixRoots.set(sfx, new Set());
+                        suffixRoots.get(sfx).add(stem);
+                    }
+                }
+            }
+        }
+
+        const candidateSuffixes = Array.from(suffixRoots.entries())
+            .map(([sfx, stems]) => ({ sfx, count: stems.size }))
+            .filter(item => item.count >= 2)
+            .sort((a, b) => b.count - a.count);
+
+        const selectedSuffixes = [];
+        for (const cand of candidateSuffixes) {
+            if (selectedSuffixes.length >= 5) break;
+            if (!selectedSuffixes.includes(cand.sfx)) {
+                selectedSuffixes.push(cand.sfx);
+            }
+        }
+
+        // 3. Découverte morphologique des préfixes productifs
+        const prefixRoots = new Map();
+        for (const [w] of wordFreqs) {
+            if (w.length >= 5 && /^[a-z0-9àâäéèêëïîôöùûüç]+$/i.test(w)) {
+                for (let len = 2; len <= 4; len++) {
+                    if (w.length - len >= 2) {
+                        const pfx = w.slice(0, len);
+                        const stem = w.slice(len);
+                        if (!prefixRoots.has(pfx)) prefixRoots.set(pfx, new Set());
+                        prefixRoots.get(pfx).add(stem);
+                    }
+                }
+            }
+        }
+
+        const candidatePrefixes = Array.from(prefixRoots.entries())
+            .map(([pfx, stems]) => ({ pfx, count: stems.size }))
+            .filter(item => item.count >= 2)
+            .sort((a, b) => b.count - a.count);
+        const selectedPrefix = candidatePrefixes[0]?.pfx || null;
+
+        // 4. Instanciation des détecteurs pour remplir les slots de bits (0 à tokenBitLength - 1)
+        const detectors = [
+            {
+                name: "symbole_ponctuation",
+                test: (w) => /^[^\w\sàâäéèêëïîôöùûüç]$/i.test(w)
+            },
+            {
+                name: "frequent_fonctionnel",
+                test: (w) => highFreqWords.has(w) || (this.brain?.isStructural ? this.brain.isStructural(w) : false)
+            },
+            {
+                name: "forme_courte",
+                test: (w) => w.length > 0 && w.length <= 3 && !/^[^\w\s]$/.test(w)
+            },
+            {
+                name: "forme_longue",
+                test: (w) => w.length >= 7
+            }
+        ];
+
+        // Ajout des suffixes découverts
+        for (let i = 0; i < 5; i++) {
+            const sfx = selectedSuffixes[i];
+            if (sfx) {
+                detectors.push({
+                    name: `suffixe_${sfx}`,
+                    test: (w) => w.length > sfx.length && w.endsWith(sfx)
+                });
+            }
+        }
+
+        // Ajout du préfixe le plus productif
+        if (selectedPrefix) {
+            detectors.push({
+                name: `prefixe_${selectedPrefix}`,
+                test: (w) => w.length > selectedPrefix.length && w.startsWith(selectedPrefix)
+            });
+        }
+
+        // Traits de cluster syntaxique non-supervisé (wordToCluster)
+        detectors.push({
+            name: "cluster_syntaxique_b0",
+            test: (w) => {
+                const id = this.brain?.vocabulary?.get ? this.brain.vocabulary.get(w) : undefined;
+                const c = id !== undefined && this.brain?.wordToCluster ? this.brain.wordToCluster.get(id) : undefined;
+                return c !== undefined ? (c & 1) === 1 : (w.length % 2 === 1);
+            }
+        });
+
+        detectors.push({
+            name: "cluster_syntaxique_b1",
+            test: (w) => {
+                const id = this.brain?.vocabulary?.get ? this.brain.vocabulary.get(w) : undefined;
+                const c = id !== undefined && this.brain?.wordToCluster ? this.brain.wordToCluster.get(id) : undefined;
+                return c !== undefined ? ((c >> 1) & 1) === 1 : /[aeiouy]/i.test(w.slice(1, -1));
+            }
+        });
+
+        // Complément si tokenBitLength est plus large que le jeu de base
+        while (detectors.length < this.tokenBitLength) {
+            const extraIdx = detectors.length;
+            const extraSfx = candidateSuffixes[extraIdx]?.sfx;
+            if (extraSfx) {
+                detectors.push({
+                    name: `suffixe_${extraSfx}`,
+                    test: (w) => w.length > extraSfx.length && w.endsWith(extraSfx)
+                });
+            } else {
+                detectors.push({
+                    name: `trait_b${extraIdx}`,
+                    test: (w) => ((w.charCodeAt(0) || 0) >> (extraIdx % 8) & 1) === 1
+                });
+            }
+        }
+
+        this.bitDetectors = detectors.slice(0, this.tokenBitLength);
+    }
+
+    _setDefaultDetectors() {
+        this.bitDetectors = Array.from({ length: this.tokenBitLength }, (_, b) => ({
+            name: `trait_b${b}`,
+            test: (w) => {
+                if (b === 0) return /^[^\w\s]$/.test(w);
+                if (b === 1) return w.length <= 3;
+                if (b === 2) return w.length >= 7;
+                return (((w.charCodeAt(0) || 0) >> (b % 8)) & 1) === 1;
+            }
+        }));
+    }
+
+    /**
+     * Calcule une signature binaire morphosyntaxique apprise dynamiquement pour un token.
+     * Les bits reflètent les affixes productifs et traits distributionnels découverts.
+     */
+    computeTokenSignature(word) {
+        if (!this.bitDetectors) {
+            this.induceFeatures();
+        }
+        const w = String(word || '').toLowerCase();
+        let sig = 0;
+
+        for (let b = 0; b < this.tokenBitLength; b++) {
+            if (this.bitDetectors[b] && this.bitDetectors[b].test(w)) {
+                sig |= (1 << b);
+            }
+        }
+
+        return sig & ((1 << this.tokenBitLength) - 1);
+    }
+
+    encodeSequence(tokens) {
+        const vec = new Uint8Array(this.inputSize);
+        const maxT = Math.min(tokens.length, this.windowSize);
+
+        for (let t = 0; t < maxT; t++) {
+            const sig = this.computeTokenSignature(tokens[t]);
+            for (let b = 0; b < this.tokenBitLength; b++) {
+                vec[t * this.tokenBitLength + b] = (sig >> b) & 1;
+            }
+        }
+        return vec;
+    }
+
+    /**
+     * Génère un dataset contrastif : 
+     * - Exemples positifs (1) : fenêtres issues du corpus réel respectant le formalisme.
+     * - Exemples négatifs (0) : permutations ou substitutions brisant les invariants structurels.
+     */
+    createContrastiveDataset(sentences) {
+        this.induceFeatures(sentences);
+        const dataset = [];
+        const tokenizer = /[a-z0-9àâäéèêëïîôöùûüç]+|[^\w\s]/gi;
+
+        for (const sentence of sentences) {
+            const words = sentence.match(tokenizer) || [];
+            if (words.length < this.windowSize) continue;
+
+            for (let i = 0; i <= words.length - this.windowSize; i++) {
+                const validWindow = words.slice(i, i + this.windowSize);
+                const posVec = this.encodeSequence(validWindow);
+                dataset.push([posVec, 1]);
+
+                // Exemple corrompu (violation du formalisme : inversion d'ordre ou saut aléatoire)
+                const corrupted = [...validWindow];
+                const idxA = Math.floor(Math.random() * this.windowSize);
+                const idxB = (idxA + 1 + Math.floor(Math.random() * (this.windowSize - 1))) % this.windowSize;
+                [corrupted[idxA], corrupted[idxB]] = [corrupted[idxB], corrupted[idxA]];
+
+                const negVec = this.encodeSequence(corrupted);
+                dataset.push([negVec, 0]);
+            }
+        }
+        return dataset;
+    }
+
+    /**
+     * Découvre le neurone polynomial optimal résumant la structure formelle sous-jacente au niveau binaire.
+     */
+    discoverFormalGrammar(sentences, optimizationLib, options = {}) {
+        const dataset = this.createContrastiveDataset(sentences);
+
+        const gaOptions = {
+            maxTerms: options.maxTerms || 6,
+            maxPower: 1, // Logique binaire idempotente : x^1 = x, x * y = AND logique
+            generations: options.generations || 120,
+            populationSize: options.populationSize || 60,
+            slotSize: this.tokenBitLength,
+            bitwiseShifts: false,
+            dichotomyLib: Dichotomy
+        };
+
+        const result = discoverOptimalPolynomialPlusPlusWithGA(dataset, this.inputSize, optimizationLib, gaOptions);
+
+        return {
+            ...result,
+            tokenBitLength: this.tokenBitLength,
+            windowSize: this.windowSize,
+            inputSize: this.inputSize,
+            decodedRules: this.explainGrammar(result.terms, this.tokenBitLength, result.threshold)
+        };
+    }
+
+    getBitDescription(bit) {
+        if (this.bitDetectors && this.bitDetectors[bit]) {
+            return this.bitDetectors[bit].name;
+        }
+        return `trait_b${bit}`;
+    }
+
+    /**
+     * Traduit les monômes polynomiaux en lois formelles binaires intelligibles.
+     */
+    explainGrammar(terms, tokenBitLength, threshold) {
+        const rules = [];
+        terms.filter(t => t.multiplier !== 0).forEach(term => {
+            const conditions = [];
+            term.powers.forEach((p, idx) => {
+                if (p > 0) {
+                    const slot = Math.floor(idx / tokenBitLength);
+                    const bit = idx % tokenBitLength;
+                    conditions.push(`Pos[${slot}].${this.getBitDescription(bit)}`);
+                }
+            });
+
+            if (conditions.length > 0) {
+                const type = term.multiplier > 0 ? "ACCORD / HARMONIQUE (+)" : "INHIBITION / INTERDICTION (-)";
+                rules.push({
+                    type,
+                    multiplier: term.multiplier,
+                    pattern: conditions.join(" ∧ "),
+                    description: `${type} (coeff ${term.multiplier}) : si ${conditions.join(" ET ")}`
+                });
+            }
+        });
+        return { threshold, rules };
+    }
+}
+
+/**
  * MÉMOIRE RELATIONNELLE SÉMANTIQUE
  * Aligne la structure bit à bit sur des unités de sens (Tokens).
  */
@@ -3104,7 +3908,7 @@ export class SemanticRelationalMemory {
     _updateSyntacticClusters() {
         // On utilise un seuil plus bas pour permettre le regroupement sur un petit corpus.
         // Le seuil est ajusté pour fusionner les clusters sémantiquement purs mais fragmentés.
-        this._performClustering(0.4); // Seuil abaissé pour encourager plus de clustering
+        this._performClustering(0.25, 14);
 
         // NOUVEAU : Log pour la visibilité du clustering
         console.log(`\n\x1b[36m[CLUSTERING]\x1b[0m Analyse syntaxique terminée. Clusters trouvés :`);
@@ -3128,8 +3932,9 @@ export class SemanticRelationalMemory {
     /**
      * NOUVEAU : Exécute une passe de l'algorithme de clustering.
      * @param {number} similarityThreshold Le seuil de similarité pour regrouper les mots.
+     * @param {number} [maxClusters=16] Plafond pour éviter la sur-fragmentation.
      */
-    _performClustering(similarityThreshold) {
+    _performClustering(similarityThreshold = 0.25, maxClusters = 16) {
         // --- NOUVELLE LOGIQUE : Calcul itératif de la similarité ---
         const wordIds = Array.from(this.syntacticFingerprints.keys());
         const similarityCache = new Map();
@@ -3180,11 +3985,17 @@ export class SemanticRelationalMemory {
                 // Ajoute le mot au cluster le plus proche.
                 this.clusters.get(bestCluster).add(wordId);
                 this.wordToCluster.set(wordId, bestCluster);
-            } else {
+            } else if (this.clusters.size < maxClusters) {
                 // Crée un nouveau cluster pour ce mot.
                 const newClusterId = this.nextClusterId++;
                 this.clusters.set(newClusterId, new Set([wordId]));
                 this.wordToCluster.set(wordId, newClusterId);
+            } else {
+                // Si la limite de clusters est atteinte, assigne au cluster le plus peuplé ou par hachage
+                const fallbackId = wordId % maxClusters;
+                if (!this.clusters.has(fallbackId)) this.clusters.set(fallbackId, new Set());
+                this.clusters.get(fallbackId).add(wordId);
+                this.wordToCluster.set(wordId, fallbackId);
             }
         }
 
@@ -3626,6 +4437,11 @@ export class SemanticRelationalMemory {
         let generatedIds = [];
 
         // DÉTERMINATION DE L'OBJECTIF : 
+        // NOUVEAU : Mémoire d'activation à court terme pour simuler l'inhibition neuronale
+        const activationMemory = new Map(); // Map<ID, energy (0-1)>
+        const ACTIVATION_DECAY = 0.75; // Vitesse d'oubli
+        const REPETITION_PENALTY_FACTOR = 20.0; // Force de l'inhibition
+
         // On alloue un quota de phrases basé sur la richesse conceptuelle (un concept par proposition).
         const significantConcepts = queryIds.filter(id => !this.isStructural(id)).length;
         const targetSentences = Math.max(1, Math.min(8, significantConcepts));
@@ -4046,6 +4862,14 @@ export class SemanticRelationalMemory {
                 // PÉNALITÉ DE RÉPÉTITION (Dynamique)
                 // On réduit la pénalité pour les connecteurs pour permettre "Le chat et le chien"
                 const repetitionCount = wordCounts.get(word) || 0;
+
+                // --- NOUVEAU : Pénalité d'activation à court terme (Hiding) ---
+                const activationEnergy = activationMemory.get(id) || 0;
+                if (activationEnergy > 0) {
+                    // On applique une pénalité exponentielle basée sur l'énergie d'activation récente
+                    score *= Math.exp(-activationEnergy * REPETITION_PENALTY_FACTOR);
+                }
+
                 if (repetitionCount > 0) score *= isConnector ? 0.5 : Math.pow(0.001, repetitionCount);
                 
                 // On reconstruit temporairement la fin de la phrase pour la vérification anti-bégaiement
@@ -4192,6 +5016,16 @@ export class SemanticRelationalMemory {
             if (activeIds.length > 2) activeIds.shift(); // Maintient la fenêtre de 2 IDs pour le trigramme
             this._shiftId(selectedId);
             return true; // On signale le succès
+
+            // --- NOUVEAU : Mise à jour de la mémoire d'activation ---
+            // 1. Dégradation de l'énergie de tous les concepts actifs
+            for (const [memId, energy] of activationMemory.entries()) {
+                const newEnergy = energy * ACTIVATION_DECAY;
+                if (newEnergy < 0.01) activationMemory.delete(memId);
+                else activationMemory.set(memId, newEnergy);
+            }
+            // 2. Le concept sélectionné est réactivé au maximum
+            activationMemory.set(selectedId, 1.0);
         };
 
         // --- Main generation loop ---
@@ -5458,49 +6292,23 @@ function benchmarkCompiledRules() {
     runBench("Règle Profonde Imbriquée (3 couches)", deepNet);
 }
 
-// Utilisation
-const gpt = new BinaryTransformer();
-const texteGenere = gpt.generate("Bonjour", 50);
-console.log(texteGenere);
+// Exécution de démonstration conditionnée : ne s'exécute QUE si le fichier est lancé directement
+if (import.meta.url === `file://${process.argv[1]?.replace(/\\/g, '/')}`) {
+    const gpt = new BinaryTransformer();
+    const texteGenere = gpt.generate("Bonjour", 50);
+    console.log(texteGenere);
 
-// Exécution du nouveau benchmark
-//benchmarkCompiledRules();
-
-console.log("\n=== Mode Optionnel : Seeker Quaternions ===");
-
-// --- NOUVEL EXEMPLE AVEC OPTIMISATION ---
-// On a besoin de la bibliothèque d'optimisation pour les nouvelles fonctions
-import { Optimization } from './problemSolver/library.js';
-
-const seekerDataset = [
-    [[[1, 0, 0], [0, 1, 0]], [0.8, 0.2]],  // Entrée 1 -> Cible 1
-    [[[-1, 0, 0], [0, -1, 0]], [-0.8, -0.2]], // Entrée 2 -> Cible 2
-    [[[0, 0, 1], [1, 1, 0]], [0.5, 0.5]]     // Entrée 3 -> Cible 3
-];
-
-console.log("Démarrage de la neuroévolution de la couche Seeker...");
-const trainedSeekerLayer = trainSeekerLayerWithGA(seekerDataset, 2, 2, Optimization);
-console.log("Entraînement par algorithme génétique terminé.");
-
-const finalRes = trainedSeekerLayer.forward(seekerDataset[0][0]);
-console.log("Cibles visées pour l'entrée 1:", seekerDataset[0][1]);
-console.log("Positions finales après entraînement GA:", finalRes.map(v => v.toFixed(4)));
-
-console.log("\n=== Découverte de règle binaire optimale ===");
-const binaryDataset = [[[1,1,0], 1], [[1,0,1], 1], [[0,1,1], 1], [[1,0,0], 0], [[0,0,1], 0]];
-const bestRule = discoverOptimalRule(binaryDataset, 3, Optimization);
-console.log("La meilleure règle trouvée pour le dataset (MAJORITY) est :", bestRule);
-
-
-
-// Exemple d'utilisation pratique
-console.log("\n=== Exemple: classification MNIST binaire ===");
-console.log("(simulation avec des données aléatoires)");
-
-const classifier = new OptimizedMajorityPerceptron([8, 4, 2, 1, 8, 4, 2, 1]);
-const testInputs = [1, 0, 1, 0, 1, 0, 1, 0];
-const prediction = classifier.predict(testInputs);
-console.log(`Prédiction: ${prediction}`);
+    console.log("\n=== Mode Optionnel : Seeker Quaternions ===");
+    import('./problemSolver/library.js').then(({ Optimization }) => {
+        const seekerDataset = [
+            [[[1, 0, 0], [0, 1, 0]], [0.8, 0.2]],
+            [[[-1, 0, 0], [0, -1, 0]], [-0.8, -0.2]],
+            [[[0, 0, 1], [1, 1, 0]], [0.5, 0.5]]
+        ];
+        const trainedSeekerLayer = trainSeekerLayerWithGA(seekerDataset, 2, 2, Optimization);
+        console.log("Positions finales après entraînement GA:", trainedSeekerLayer.forward(seekerDataset[0][0]).map(v => v.toFixed(4)));
+    });
+}
 
 
 // 1. Création d'une règle "Sécurité" :
@@ -8165,7 +8973,6 @@ export class GNeuroMoE {
         return brain;
     }
 }
-
 
 // --- Simulation Pilotée par le Fichier Unique ---
 // // --- Simulation Pilotée par le Fichier Unique ---
