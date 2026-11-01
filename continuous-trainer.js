@@ -61,6 +61,14 @@ function extractCleanSentences(blocks, minWords = 5) {
     return sentences;
 }
 
+function isValidTrainingSentence(sentence, minWords = 5) {
+    // Élimine les notes de bas de page [X], références de versets isolées et fragments
+    if (/^\[\d+\]\s*[a-zàâäéèêëïîôöùûüç0-9_.]*$/i.test(sentence)) return false;
+    if (/\b(?:psa|cap|ver|deu|gen|exo|lev|num|matt|luc|act)\.\b/i.test(sentence) && sentence.length < 25) return false;
+    const words = sentence.match(tokenizer) || [];
+    return words.length >= minWords && words.length <= 30 && /[a-zàâäéèêëïîôöùûüç]/i.test(sentence);
+}
+
 async function getBatchFromLocalCorpus(chunkSize = 1024 * 64) {
     if (!fs.existsSync(CORPUS_PATH)) return { sentences: [], done: true };
     const stats = await fs.promises.stat(CORPUS_PATH);
@@ -209,6 +217,8 @@ async function main() {
     const windowSizeArg = args.find(a => a.startsWith('--window-size='));
     const tempArg = args.find(a => a.startsWith('--temp='));
     const profileArg = args.find(a => a.startsWith('--profile='));
+    const teacherArg = args.find(a => a.startsWith('--teacher=') || a === '--teacher' || a.startsWith('--trainer=') || a === '--trainer');
+    const teacherUrl = teacherArg && teacherArg.includes('=') ? teacherArg.split('=')[1] : (teacherArg ? 'http://localhost:11435' : null);
     const forceSource = sourceArg ? sourceArg.split('=')[1].toLowerCase() : 'books';
 
     // Profils Pareto pré-calibrés
@@ -299,8 +309,16 @@ async function main() {
         }
     }
 
+    const teacherClient = teacherUrl ? new neuro.OllamaTeacherClient({ baseUrl: teacherUrl, timeout: 6000 }) : null;
+    if (teacherClient) {
+        console.log(`🧑‍🏫 [Distillation Qwen] Serveur enseignant actif sur ${teacherUrl}`);
+    } else {
+        console.log(`🤖 [Mode 1-Bit Autonome] Entraînement STE standard sans enseignant.`);
+    }
+
     let cycleCount = 1;
     const memoryBufferSentences = [];
+    let pendingDistillation = null;
 
     // Démarrage du préchargement en arrière-plan
     if (!isOffline && !useLocal) {
@@ -332,6 +350,9 @@ async function main() {
                 replenishPrefetchBuffer(cycleCount, forceSource, batchTargetCount);
             }
 
+            // Filtrage des références marginales et artefacts de segmentation
+            batch = batch.filter(s => isValidTrainingSentence(s, 5));
+
             if (batch.length > 0) {
                 console.log(`📥 Ingestion de ${batch.length} phrases...`);
                 let newMergesCount = 0;
@@ -362,6 +383,30 @@ async function main() {
                             totalSteps += r.steps;
                         }
                     }
+                }
+
+                // Application de la distillation précédente si elle est prête
+                if (pendingDistillation) {
+                    try {
+                        const teacherEmbedding = await pendingDistillation;
+                        if (teacherEmbedding && teacherEmbedding.length > 0) {
+                            bitLM.classifier.attention.backwardBatch([{ inputFloat: teacherEmbedding }], learningRate * 0.5);
+                        }
+                    } catch (e) {
+                        console.warn(`⚠️ [Distillation] Échec requête enseignant : ${e.message}`);
+                    } finally {
+                        pendingDistillation = null;
+                    }
+                }
+
+                // Déclenchement de la distillation sur la phrase la plus riche du lot
+                const distillationTarget = [...batch].sort((a, b) => b.length - a.length)[0];
+                if (teacherClient && distillationTarget) {
+                    pendingDistillation = teacherClient.getEmbedding(distillationTarget, { dim: contextDim })
+                        .catch(e => {
+                            console.warn(`⚠️ [Distillation] Erreur en arrière-plan : ${e.message}`);
+                            return null;
+                        });
                 }
 
                 const avgLoss = (totalLoss / batch.length).toFixed(3);
@@ -412,7 +457,7 @@ async function main() {
             // Génération autorégressive en direct (Inférence BitGEMM 100% binaire)
             const matchedTokens = adaptiveTokenizer.tokenize(batch[0] || FALLBACK_SENTENCES[0]);
             const seedPrompt = matchedTokens.slice(0, 2).join(' ');
-            const bitGenerated = bitLM.generateSentence(seedPrompt, 10, genTemperature, adaptiveTokenizer);
+            const bitGenerated = bitLM.generateSentence(seedPrompt, 10, genTemperature || 0.4, adaptiveTokenizer, 1.35);
             console.log(`🤖 Génération 1-Bit (BitGEMM) : "${bitGenerated}"`);
             console.log(`   (Décodé sans '_')         : "${adaptiveTokenizer.detokenize(bitGenerated.split(' '))}"`);
 
