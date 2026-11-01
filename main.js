@@ -2,7 +2,16 @@
 // ============================================================
 // EXEMPLE D'UTILISATION : CHIFFREMENT NEURONAL AUTHENTIFIÉ
 // ============================================================
-import {BitwiseNeuralCipher, BitwiseWordLearner, BitwiseLosslessCompressor, BitwiseRelationalMemory, SemanticRelationalMemory, SemanticAttentionLayer} from "./neuro-lib.js";
+import {
+    BitwiseNeuralCipher,
+    BitwiseWordLearner,
+    BitwiseLosslessCompressor,
+    BitwiseRelationalMemory,
+    SemanticRelationalMemory,
+    SemanticAttentionLayer,
+    BitwiseRNNCell,
+    EvolvedRNNCell // Import de la nouvelle classe
+} from "./neuro-lib.js";
 
 function _runCipherBenchmark() {
     console.log("\n=== BENCHMARK: BitwiseNeuralCipher Performance ===");
@@ -680,7 +689,25 @@ console.log(`Amorce: "${recursiveAmorce}" -> Sortie: "${recursiveAmorce} ${recur
 console.log("\n--- Interprétation ---");
 console.log("La sortie devrait être une phrase complète et cohérente entre parenthèses, démontrant que le cerveau a bien activé le schéma, lancé une sous-génération, puis fermé la structure.");
 
+// --- NOUVEAU : Chargement d'une image depuis une URL ---
+const imageUrl = 'https://www.photo-paysage.com/albums/userpics/10001/sentier-magnifique-lac-de-braies-P1090767-2.jpg'; // URL de l'image à tester
+const W = 128; // On peut utiliser une plus grande résolution
+const H = 128;
+console.log(`[Vision Test] Chargement de l'image depuis : ${imageUrl}`);
+const image = await Jimp.read(imageUrl);
+image.resize(W, H).greyscale(); // Redimensionnement et conversion en niveaux de gris
 
+// On extrait les pixels en format Uint8Array (uniquement les valeurs de gris)
+const originalImage = new Uint8Array(W * H);
+for (let i = 0; i < image.bitmap.data.length; i += 4) {
+    // Jimp stocke en RGBA. En niveaux de gris, R=G=B. On prend juste la valeur R.
+    originalImage[i / 4] = image.bitmap.data[i];
+}
+console.log("[Vision Test] Image chargée et préparée.");
+// --- FIN DE LA MODIFICATION ---
+
+// Décommentez la ligne ci-dessous pour lancer le test de vision
+// runVisionTest();
 // ============================================================
 // TEST FINAL : DÉCOUVERTE ET APPLICATION DE SCHÉMAS DE LISTE
 // ============================================================
@@ -785,3 +812,100 @@ implicitTests.forEach(test => {
     const success = generation.toLowerCase().includes(test.attendu.toLowerCase());
     console.log(`  Statut   : ${success ? "✅ SCHÉMA APPLIQUÉ" : "⚠️ DÉRIVE"}`);
 });
+
+
+// --- NOUVEL EXEMPLE : BitwiseRNNCell avec mémoire multi-échelle ---
+console.log("\n=== Test de BitwiseRNNCell avec mémoire multi-échelle ===");
+
+// Créons une cellule RNN de taille 4 avec une profondeur de mémoire de 3
+// Cela signifie qu'elle aura accès à l'état actuel (this.state) et aux 3 états précédents (this.pastStates)
+const rnnCell = new BitwiseRNNCell(4, 3);
+
+console.log("État initial:", rnnCell.state); // [0, 0, 0, 0]
+console.log("États passés initiaux:", rnnCell.pastStates); // [[0,0,0,0], [0,0,0,0], [0,0,0,0]]
+
+// Séquence d'entrée et de sortie cible pour l'entraînement
+const sequence = [
+    { input: new Uint8Array([1, 0, 0, 0]), target: new Uint8Array([0, 1, 0, 0]) },
+    { input: new Uint8Array([0, 1, 0, 0]), target: new Uint8Array([0, 0, 1, 0]) },
+    { input: new Uint8Array([0, 0, 1, 0]), target: new Uint8Array([0, 0, 0, 1]) },
+    { input: new Uint8Array([0, 0, 0, 1]), target: new Uint8Array([1, 0, 0, 0]) }, // Boucle
+    { input: new Uint8Array([1, 0, 0, 0]), target: new Uint8Array([0, 1, 0, 0]) },
+];
+
+console.log("\n--- Entraînement de la cellule RNN ---");
+for (let epoch = 0; epoch < 500; epoch++) { // Augmentation significative des époques
+    rnnCell.reset(); // Réinitialise l'état et les états passés à chaque époque
+    let totalError = 0;
+    for (let i = 0; i < sequence.length; i++) {
+        const { input, target } = sequence[i];
+
+        // Avant l'entraînement, l'état actuel est l'état précédent pour le calcul du combinedInput
+        const oldState = rnnCell.state.slice();
+
+        rnnCell.train(input, target);
+
+        // Calcul de l'erreur pour cette étape
+        for (let j = 0; j < rnnCell.size; j++) {
+            totalError += Math.abs(rnnCell.state[j] - target[j]);
+        }
+    }
+    if (epoch % 10 === 0) {
+        console.log(`Époque ${epoch}: Erreur totale = ${totalError}`);
+    }
+}
+
+console.log("\n--- Test de la prédiction après entraînement ---");
+rnnCell.reset();
+for (let i = 0; i < 5; i++) {
+    const input = sequence[i].input;
+    const predictedState = rnnCell.step(input);
+    console.log(`Input: [${input.join(', ')}] -> Predicted State: [${predictedState.join(', ')}]`);
+    console.log(`  États passés après step ${i+1}:`, rnnCell.pastStates.map(s => `[${s.join(', ')}]`).join(', '));
+}
+
+// ============================================================
+// TEST : EvolvedRNNCell pour motifs non-linéaires
+// ============================================================
+import { Optimization } from "./problemSolver/library.js";
+import {Jimp} from "jimp";
+
+console.log("\n\n=== Test de EvolvedRNNCell pour dépendances non-linéaires ===");
+
+// Problème : La sortie doit être le XOR du bit d'entrée actuel et du bit d'état précédent.
+// C'est une dépendance non-linéaire que le RNN de base ne peut pas apprendre.
+const evolvedRnnCell = new EvolvedRNNCell(1, 1, Optimization); // 1 bit d'état, 1 état passé en mémoire
+
+// Séquence d'entraînement
+const xorSequence = [
+    // state=0
+    { input: new Uint8Array([0]), target: new Uint8Array([0]) }, // 0^0=0. state -> 0
+    { input: new Uint8Array([1]), target: new Uint8Array([1]) }, // 1^0=1. state -> 1
+    { input: new Uint8Array([1]), target: new Uint8Array([0]) }, // 1^1=0. state -> 0
+    { input: new Uint8Array([0]), target: new Uint8Array([0]) }, // 0^0=0. state -> 0
+    { input: new Uint8Array([1]), target: new Uint8Array([1]) }, // 1^0=1. state -> 1
+    { input: new Uint8Array([0]), target: new Uint8Array([1]) }, // 0^1=1. state -> 1
+];
+
+console.log("\n--- Évolution du réseau expert pour la tâche XOR temporelle ---");
+// L'AG va découvrir un petit réseau qui implémente la logique XOR
+evolvedRnnCell.evolve(xorSequence, { generations: 80, populationSize: 60 });
+
+console.log("\n--- Test de la prédiction après évolution ---");
+evolvedRnnCell.reset();
+
+const testSequence = [
+    new Uint8Array([0]), // state=0, input=0 -> pred=0. new_state=0
+    new Uint8Array([1]), // state=0, input=1 -> pred=1. new_state=1
+    new Uint8Array([0]), // state=1, input=0 -> pred=1. new_state=1
+    new Uint8Array([1]), // state=1, input=1 -> pred=0. new_state=0
+    new Uint8Array([1]), // state=0, input=1 -> pred=1. new_state=1
+];
+
+console.log("État initial:", evolvedRnnCell.state);
+for (let i = 0; i < testSequence.length; i++) {
+    const input = testSequence[i];
+    const oldState = evolvedRnnCell.state.slice();
+    const predictedState = evolvedRnnCell.step(input);
+    console.log(`Input: [${input[0]}], Prev State: [${oldState[0]}] -> Predicted State: [${predictedState[0]}]`);
+}

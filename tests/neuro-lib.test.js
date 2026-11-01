@@ -3,7 +3,7 @@ import {
     Quaternion,
     Vector3,
     SeekerNeuron, discoverOptimalRuleWithGA,
-    AdaptiveMajorityNeuron, discoverOptimalNetworkWithGA,
+    AdaptiveMajorityNeuron, PolynomialMajorityNeuron, discoverOptimalNetworkWithGA,
     discoverOptimalRule,
     MajorityNeuron,
     MajorityNetwork,
@@ -92,6 +92,42 @@ describe('G-NEURO LIB - Tests d\'industrialisation', () => {
             expect(neuron.predict([1, 0, 0])).toBe(0); // 2 < 3
             expect(neuron.predict([0, 0, 1])).toBe(1); // 3 >= 3
             expect(neuron.predict([1, 1, 0])).toBe(1); // 4 >= 3
+        });
+
+        it('ne devrait PAS résoudre XOR (non-linéairement séparable)', () => {
+            // XOR: (0,0)->0, (0,1)->1, (1,0)->1, (1,1)->0
+            // Un seul neurone majoritaire ne peut pas résoudre XOR parfaitement.
+            // La meilleure approximation linéaire aura une précision de 75%.
+            const neuron = new MajorityNeuron([1, 1], 1); // Poids 1,1, seuil 1 (OR)
+            let correctPredictions = 0;
+            if (neuron.predict([0, 0]) === 0) correctPredictions++;
+            if (neuron.predict([0, 1]) === 1) correctPredictions++;
+            if (neuron.predict([1, 0]) === 1) correctPredictions++;
+            if (neuron.predict([1, 1]) === 0) correctPredictions++; // Faux pour OR
+
+            expect(correctPredictions).toBeLessThan(4); // Ne devrait pas être 100% précis
+        });
+
+        it('devrait fonctionner avec un objet de configuration', () => {
+            const config = { weights: [2, 2, 3], threshold: 3 };
+            const neuron = new MajorityNeuron(config);
+            expect(neuron.predict([1, 0, 0])).toBe(0); // 2 < 3
+            expect(neuron.predict([0, 0, 1])).toBe(1); // 3 >= 3
+            expect(neuron.predict([1, 1, 0])).toBe(1); // 4 >= 3
+        });
+    });
+
+    describe('PolynomialMajorityNeuron', () => {
+        it('devrait résoudre XOR parfaitement avec un seul neurone', () => {
+            // XOR: (0,0)->0, (0,1)->1, (1,0)->1, (1,1)->0
+            // Logique: A + B - 2*(A*B) >= 1
+            const xorFeatureMapper = (inputs) => [inputs[0], inputs[1], inputs[0] * inputs[1]];
+            const neuron = new PolynomialMajorityNeuron([1, 1, -2], 1, xorFeatureMapper);
+
+            expect(neuron.predict([0, 0])).toBe(0);
+            expect(neuron.predict([0, 1])).toBe(1);
+            expect(neuron.predict([1, 0])).toBe(1);
+            expect(neuron.predict([1, 1])).toBe(0);
         });
     });
 

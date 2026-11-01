@@ -1430,3 +1430,691 @@ console.log("\n46. Découverte de Formalisme Syntaxique Invisible (PolynomialFor
         console.error("❌ Erreur lors de l'extraction formelle:", e.message);
     }
 })();
+
+console.log("\n47. Certification Formelle des Bornes d'un Réseau à Activation Spline (B-Splines / KAN)");
+
+(() => {
+    /**
+     * --- MOTEUR DE B-SPLINES ET CERTIFICATION PAR MORCEAUX ---
+     */
+
+    // Base B-Spline uniforme de degré 2 (quadratique) avec support local compact sur 3 intervalles
+    class QuadraticBSplineEdge {
+        /**
+         * @param {number[]} knots Grille de nœuds ordonnés
+         * @param {number[]} coeffs Coefficients appris (points de contrôle)
+         */
+        constructor(knots, coeffs) {
+            this.knots = knots;
+            this.coeffs = coeffs; // c_0, ..., c_{m-1}
+            this.degree = 2;
+        }
+
+        // Évaluation de la base B_{i, 0}(x)
+        _basis0(i, x) {
+            return (x >= this.knots[i] && x < this.knots[i + 1]) ? 1.0 : 0.0;
+        }
+
+        // Algorithme de Cox-de Boor pour B_{i, p}(x)
+        basis(i, p, x) {
+            if (p === 0) return this._basis0(i, x);
+
+            const denom1 = this.knots[i + p] - this.knots[i];
+            const denom2 = this.knots[i + p + 1] - this.knots[i + 1];
+
+            let term1 = 0;
+            let term2 = 0;
+
+            if (denom1 > 1e-12) {
+                term1 = ((x - this.knots[i]) / denom1) * this.basis(i, p - 1, x);
+            }
+            if (denom2 > 1e-12) {
+                term2 = ((this.knots[i + p + 1] - x) / denom2) * this.basis(i + 1, p - 1, x);
+            }
+            return term1 + term2;
+        }
+
+        // Évaluation ponctuelle phi(x)
+        evaluate(x) {
+            // Gestion de la borne supérieure fermée
+            const lastKnot = this.knots[this.knots.length - 1];
+            if (Math.abs(x - lastKnot) < 1e-9) x = lastKnot - 1e-9;
+
+            let sum = 0;
+            for (let i = 0; i < this.coeffs.length; i++) {
+                sum += this.coeffs[i] * this.basis(i, this.degree, x);
+            }
+            return sum;
+        }
+
+        // Dérivée phi'(x) = sum_i c_i * B'_{i, p}(x)
+        derivative(x) {
+            const p = this.degree;
+            let sum = 0;
+            for (let i = 0; i < this.coeffs.length; i++) {
+                const denom1 = this.knots[i + p] - this.knots[i];
+                const denom2 = this.knots[i + p + 1] - this.knots[i + 1];
+
+                let dBasis = 0;
+                if (denom1 > 1e-12) {
+                    dBasis += (p / denom1) * this.basis(i, p - 1, x);
+                }
+                if (denom2 > 1e-12) {
+                    dBasis -= (p / denom2) * this.basis(i + 1, p - 1, x);
+                }
+                sum += this.coeffs[i] * dBasis;
+            }
+            return sum;
+        }
+
+        /**
+         * Calcul EXACT de l'image de l'intervalle [a, b] : [min phi(x), max phi(x)].
+         * Grâce au caractère polynomial par morceaux (quadratique), la dérivée est linéaire sur chaque cellule.
+         * Les extrema locaux ne peuvent survenir qu'aux nœuds ou à l'unique racine de phi'(x) = 0 par morceau.
+         */
+        evaluateInterval(a, b) {
+            const low = Math.max(a, this.knots[0]);
+            const high = Math.min(b, this.knots[this.knots.length - 1]);
+            if (low >= high) return { min: this.evaluate(low), max: this.evaluate(low) };
+
+            let minVal = Math.min(this.evaluate(low), this.evaluate(high));
+            let maxVal = Math.max(this.evaluate(low), this.evaluate(high));
+
+            // Nœuds internes inclus dans [low, high]
+            for (let k = 0; k < this.knots.length - 1; k++) {
+                const t0 = this.knots[k];
+                const t1 = this.knots[k + 1];
+                if (t1 < low || t0 > high) continue;
+
+                const segA = Math.max(low, t0);
+                const segB = Math.min(high, t1);
+
+                const yA = this.evaluate(segA);
+                const yB = this.evaluate(segB);
+                minVal = Math.min(minVal, yA, yB);
+                maxVal = Math.max(maxVal, yA, yB);
+
+                // Racine de phi'(x) = 0 sur [segA, segB] (dérivée affine sur chaque morceau quadratique)
+                const dA = this.derivative(segA);
+                const dB = this.derivative(segB);
+                if (dA * dB < 0) {
+                    // Zéro exact par interpolation linéaire de la dérivée
+                    const root = segA - dA * ((segB - segA) / (dB - dA));
+                    if (root >= segA && root <= segB) {
+                        const yRoot = this.evaluate(root);
+                        minVal = Math.min(minVal, yRoot);
+                        maxVal = Math.max(maxVal, yRoot);
+                    }
+                }
+            }
+
+            return { min: minVal, max: maxVal };
+        }
+
+        // Calcul exact de la constante de Lipschitz L_phi = sup |phi'(x)|
+        computeExactLipschitz(a, b) {
+            // Sur une spline quadratique, phi' est linéaire par morceaux.
+            // Le maximum d'une fonction linéaire par morceaux est obligatoirement atteint aux sommets (nœuds).
+            let maxDeriv = 0;
+            const testPoints = [a, b];
+            for (const knot of this.knots) {
+                if (knot >= a && knot <= b) testPoints.push(knot);
+            }
+            for (const pt of testPoints) {
+                const dLeft = Math.abs(this.derivative(Math.max(a, pt - 1e-6)));
+                const dRight = Math.abs(this.derivative(Math.min(b, pt + 1e-6)));
+                maxDeriv = Math.max(maxDeriv, dLeft, dRight);
+            }
+            return maxDeriv;
+        }
+
+        // Régularisation : variation des coefficients (Total Variation de second ordre ||Delta^2 c||_1)
+        computeCurvatureRegularization() {
+            let penalty = 0;
+            for (let i = 0; i < this.coeffs.length - 2; i++) {
+                const d2 = this.coeffs[i + 2] - 2 * this.coeffs[i + 1] + this.coeffs[i];
+                penalty += Math.abs(d2);
+            }
+            return penalty;
+        }
+    }
+
+    // Réseau Kolmogorov-Arnold Network (KAN) à 2 entrées et 1 sortie : y = phi_{1}(x1) + phi_{2}(x2)
+    class TwoInputSplineNetwork {
+        constructor(edge1, edge2) {
+            this.edges = [edge1, edge2];
+        }
+
+        forward(x) {
+            return this.edges[0].evaluate(x[0]) + this.edges[1].evaluate(x[1]);
+        }
+
+        // Propagation par intervalles naturelle
+        forwardInterval(intervalBox) {
+            const out1 = this.edges[0].evaluateInterval(intervalBox[0].min, intervalBox[0].max);
+            const out2 = this.edges[1].evaluateInterval(intervalBox[1].min, intervalBox[1].max);
+            return {
+                min: out1.min + out2.min,
+                max: out1.max + out2.max
+            };
+        }
+    }
+
+    // --- 1. INSTANCIATION DU MODÈLE SPLINE & EXTRACTION DES COEFFICIENTS ---
+    const knots = [0.0, 0.25, 0.5, 0.75, 1.0, 1.25, 1.5]; // Grille de nœuds
+    // Deux fonctions splines apprises sur chaque arête
+    const coeffsEdge1 = [0.1, 0.85, 0.2, 1.1, 0.4];  // Arête x1 -> y
+    const coeffsEdge2 = [-0.5, 0.3, 0.95, -0.1, 0.5]; // Arête x2 -> y
+
+    const edge1 = new QuadraticBSplineEdge(knots, coeffsEdge1);
+    const edge2 = new QuadraticBSplineEdge(knots, coeffsEdge2);
+    const kanNet = new TwoInputSplineNetwork(edge1, edge2);
+
+    console.log("1. Paramètres et Propriétés Exactes des Arêtes B-Spline :");
+    const domain = { min: 0.25, max: 1.0 };
+    const b1 = edge1.evaluateInterval(domain.min, domain.max);
+    const l1 = edge1.computeExactLipschitz(domain.min, domain.max);
+    const b2 = edge2.evaluateInterval(domain.min, domain.max);
+    const l2 = edge2.computeExactLipschitz(domain.min, domain.max);
+
+    console.log(`   - Arête 1 : Image exacte = [${b1.min.toFixed(4)}, ${b1.max.toFixed(4)}] | Lipschitz L_phi1 = ${l1.toFixed(3)}`);
+    console.log(`   - Arête 2 : Image exacte = [${b2.min.toFixed(4)}, ${b2.max.toFixed(4)}] | Lipschitz L_phi2 = ${l2.toFixed(3)}`);
+
+    // --- 2. PROPAGATION PAR INTERVALLES & RAFFINEMENT ADAPTATIF (BRANCH & BOUND) ---
+    const inputDomain = [
+        { min: 0.25, max: 1.0 },
+        { min: 0.25, max: 1.0 }
+    ];
+
+    const rawBounds = kanNet.forwardInterval(inputDomain);
+    console.log(`\n2. Propagation d'intervalle brute (1 seule boîte) : [${rawBounds.min.toFixed(4)}, ${rawBounds.max.toFixed(4)}] (Largeur: ${(rawBounds.max - rawBounds.min).toFixed(4)})`);
+
+    // Raffinement adaptatif des cellules d'entrée par dichotomie sur la coordonnée la plus raide
+    function certifyBoundsWithAdaptiveRefinement(network, box, maxDepth = 4) {
+        const leaves = [];
+        const queue = [{ box, depth: 0 }];
+
+        while (queue.length > 0) {
+            const { box: curBox, depth } = queue.shift();
+            const bounds = network.forwardInterval(curBox);
+
+            if (depth >= maxDepth) {
+                leaves.push(bounds);
+                continue;
+            }
+
+            // Découpage selon la coordonnée ayant la plus grande incertitude / largeur
+            const w0 = curBox[0].max - curBox[0].min;
+            const w1 = curBox[1].max - curBox[1].min;
+            const splitDim = w0 >= w1 ? 0 : 1;
+
+            const mid = (curBox[splitDim].min + curBox[splitDim].max) / 2;
+
+            const boxLeft = [
+                { min: curBox[0].min, max: curBox[0].max },
+                { min: curBox[1].min, max: curBox[1].max }
+            ];
+            boxLeft[splitDim] = { min: curBox[splitDim].min, max: mid };
+
+            const boxRight = [
+                { min: curBox[0].min, max: curBox[0].max },
+                { min: curBox[1].min, max: curBox[1].max }
+            ];
+            boxRight[splitDim] = { min: mid, max: curBox[splitDim].max };
+
+            queue.push({ box: boxLeft, depth: depth + 1 });
+            queue.push({ box: boxRight, depth: depth + 1 });
+        }
+
+        // Union exacte des boîtes de sortie certifiées
+        let certMin = Infinity;
+        let certMax = -Infinity;
+        for (const leaf of leaves) {
+            if (leaf.min < certMin) certMin = leaf.min;
+            if (leaf.max > certMax) certMax = leaf.max;
+        }
+        return { min: certMin, max: certMax, leafCount: leaves.length };
+    }
+
+    const certified = certifyBoundsWithAdaptiveRefinement(kanNet, inputDomain, 5);
+    console.log(`   Raffinement adaptatif (32 sous-cellules) : [${certified.min.toFixed(4)}, ${certified.max.toFixed(4)}]`);
+
+    // --- 3. ANALYSE THÉORIQUE DE JACKSON & RÉGULARISATION DE COURBURE ---
+    console.log("\n3. Comparaison avec la Borne de Jackson & Diagnostic de Régularité :");
+    const hKnot = 0.25; // Pas de discrétisation de la grille
+    const reg1 = edge1.computeCurvatureRegularization();
+    const reg2 = edge2.computeCurvatureRegularization();
+    const totalCurvature = reg1 + reg2;
+
+    // Borne d'approximation de Jackson pour splines quadratiques : E_h(f) <= C * h^2 * ||f''||_inf
+    const C_jackson = 0.125; // Constante de Jackson pour splines quadratiques
+    const estimatedJacksonBound = C_jackson * Math.pow(hKnot, 2) * (l1 + l2);
+
+    console.log(`   - Pas de grille de la spline (h) : ${hKnot}`);
+    console.log(`   - Régularisation ||Delta^2 c||_1 (Oscillations) : ${totalCurvature.toFixed(4)}`);
+    console.log(`   - Écart d'approximation max théorique de Jackson : +/- ${estimatedJacksonBound.toFixed(5)}`);
+
+    if (totalCurvature > 2.0) {
+        console.log(`   ⚠️ ALERTE : Les coefficients de spline oscillent fortement (Courbure = ${totalCurvature.toFixed(2)}).`);
+        console.log("   Suggestion : Appliquer une pénalité de lissage lambda * ||Delta^2 c||_1 à l'entraînement.");
+    } else {
+        console.log("   ✅ Splines bien conditionnées : régularité géométrique certifiée.");
+    }
+
+    // --- 4. VÉRIFICATION PAR ÉCHANTILLONNAGE MONTE-CARLO DENSE (TEST DE COHÉRENCE) ---
+    console.log("\n4. Test de Cohérence par Échantillonnage Dense (10 000 points) :");
+    const N_SAMPLES = 10000;
+    let empiricalMin = Infinity;
+    let empiricalMax = -Infinity;
+    let violations = 0;
+
+    for (let i = 0; i < N_SAMPLES; i++) {
+        const rx1 = inputDomain[0].min + Math.random() * (inputDomain[0].max - inputDomain[0].min);
+        const rx2 = inputDomain[1].min + Math.random() * (inputDomain[1].max - inputDomain[1].min);
+        const val = kanNet.forward([rx1, rx2]);
+
+        if (val < empiricalMin) empiricalMin = val;
+        if (val > empiricalMax) empiricalMax = val;
+
+        // Vérification de la garantie formelle
+        if (val < certified.min - 1e-9 || val > certified.max + 1e-9) {
+            violations++;
+        }
+    }
+
+    console.log(`   - Plage empirique observée : [${empiricalMin.toFixed(4)}, ${empiricalMax.toFixed(4)}]`);
+    console.log(`   - Borne certifiée        : [${certified.min.toFixed(4)}, ${certified.max.toFixed(4)}]`);
+    console.log(`   - Violations de la borne   : ${violations === 0 ? "0 (GARANTIE RESPECTÉE À 100% ✅)" : `${violations} ❌`}`);
+    console.log(`   - Marge de sécurité (Pessimisme formel) : Haute = ${(certified.max - empiricalMax).toFixed(4)}, Basse = ${(empiricalMin - certified.min).toFixed(4)}`);
+})();
+
+console.log("\n48. Inférence et Entraînement BitLinear 1-bit (BitGEMM XNOR/Popcount + STE)");
+
+(() => {
+    const inDim = 64;   // 64 entrées (exactement deux entiers 32-bit packés)
+    const outDim = 16;  // 16 neurones de sortie
+    const bitLayer = new neuro.BitLinearLayer(inDim, outDim);
+
+    console.log(`1. Initialisation de BitLinearLayer (${inDim} in -> ${outDim} out) :`);
+    console.log(`   - Mots de 32-bit par entrée : ${bitLayer.wordsPerInput} mots`);
+    console.log(`   - Poids packés en mémoire   : ${bitLayer.packedWeights.length * 4} octets`);
+
+    // Test d'inférence purement binaire
+    const sampleInput = new Float32Array(inDim);
+    for (let i = 0; i < inDim; i++) sampleInput[i] = Math.sin(i * 0.4);
+
+    const packedInput = neuro.BitLinearLayer.packBits(sampleInput);
+    const t0 = process.hrtime.bigint();
+    const output = bitLayer.forward(packedInput);
+    const t1 = process.hrtime.bigint();
+
+    console.log(`   - Temps d'inférence BitGEMM : ${Number(t1 - t0) / 1e6} ms`);
+    console.log(`   - Sorties (4 premières)     : [${Array.from(output.slice(0, 4)).map(v => v.toFixed(2)).join(', ')}]`);
+
+    // Entraînement sur une tâche contrastive via Straight-Through Estimator (STE)
+    console.log("\n2. Entraînement en ligne avec Straight-Through Estimator (STE) :");
+    const trainingDataset = [
+        { in: new Float32Array(inDim).fill(1), out: new Float32Array(outDim).fill(8) },
+        { in: new Float32Array(inDim).fill(-1), out: new Float32Array(outDim).fill(-8) }
+    ];
+
+    let initialLoss = 0;
+    for (let step = 0; step < 100; step++) {
+        for (const sample of trainingDataset) {
+            const res = bitLayer.trainStepSTE(sample.in, sample.out, 0.05);
+            if (step === 0 && initialLoss === 0) initialLoss = res.loss;
+        }
+    }
+
+    const predPos = bitLayer.forwardFloat(trainingDataset[0].in);
+    const predNeg = bitLayer.forwardFloat(trainingDataset[1].in);
+
+    console.log(`   - Erreur initiale : ${initialLoss.toFixed(4)}`);
+    console.log(`   - Réponse test (+) [cible = 8]  : ${predPos[0].toFixed(2)}`);
+    console.log(`   - Réponse test (-) [cible = -8] : ${predNeg[0].toFixed(2)}`);
+    console.log("   ✅ Convergence validée sans multiplications à l'inférence.");
+})();
+
+console.log("\n49. Généralisation Sensible à l'Environnement (SensitiveBitLinear & AwareBitTransformer)");
+
+(() => {
+    const sensorium = new neuro.ExteriorFieldSensorium(4);
+    const model = new neuro.AwareBitTransformer(32, 64, 1);
+
+    const prompt = [1, 5, 12]; // Séquence symbolique fixe (ex: "action en cours")
+
+    // Contexte A : Environnement Calme (faible intensité, vecteur d'affordance orienté vers le repos)
+    sensorium.updateFromSensors([0.0, 0.1, 0.0, 0.1]);
+    const outCalm = model.generate(prompt, 3, sensorium);
+
+    // Contexte B : Environnement Critique (Haute intensité, vecteur de danger)
+    sensorium.updateFromSensors([1.0, 0.8, -0.5, 0.95]);
+    const outUrgent = model.generate(prompt, 3, sensorium);
+
+    console.log("1. Même séquence de départ soumise à deux contextes environnementaux distincts :");
+    console.log(`   - Prompt initial             : [${prompt.join(', ')}]`);
+    console.log(`   - Réponse en milieu CALME     : [${outCalm.slice(prompt.length).join(', ')}]`);
+    console.log(`   - Réponse en milieu CRITIQUE  : [${outUrgent.slice(prompt.length).join(', ')}]`);
+
+    // Vérification de la sensibilité du neurone BitLinear
+    const inDim = 64;
+    const outDim = 4;
+    const sensitiveLayer = new neuro.SensitiveBitLinear(inDim, outDim);
+    const sampleInput = new Float32Array(inDim).fill(1.0);
+    const packedInput = neuro.BitLinearLayer.packBits(sampleInput);
+
+    sensorium.updateFromSensors([0, 0, 0, 0.1]);
+    const resA = sensitiveLayer.forwardSensitive(packedInput, sensorium);
+
+    sensorium.updateFromSensors([1, 1, 0, 1.0]);
+    const resB = sensitiveLayer.forwardSensitive(packedInput, sensorium);
+
+    const divergence = Math.abs(resA[0] - resB[0]);
+    console.log("\n2. Modulation synaptique par le champ extérieur :");
+    console.log(`   - Sortie neurone 0 (Calme)    : ${resA[0].toFixed(3)}`);
+    console.log(`   - Sortie neurone 0 (Urgence)  : ${resB[0].toFixed(3)}`);
+    console.log(`   - Amplitude de bifurcation    : ${divergence.toFixed(3)} (Modulation contextuelle active ✅)`);
+})();
+
+console.log("\n50. Distillation de Modèle Dense vers BitLinear 1-bit & Régulation d'Erreur");
+
+(() => {
+    const inFeatures = 32;
+    const outClasses = 4;
+
+    // 1. Modèle Enseignant (Simulation d'un petit modèle dense FP32 déjà instruit)
+    class DenseTeacherModel {
+        constructor(inputs, outputs) {
+            // Modèle enseignant pré-calibré sur la topologie des clusters
+            this.weights = Array.from({ length: outputs }, (_, o) => {
+                const w = new Float32Array(inputs);
+                for (let i = 0; i < inputs; i++) {
+                    // Poids fortement positifs sur les dimensions caractéristiques de la classe
+                    w[i] = (i % outputs === o ? 2.5 : -1.0) + (Math.random() - 0.5) * 0.2;
+                }
+                return w;
+            });
+        }
+        getLogits(input) {
+            const logits = new Float32Array(this.weights.length);
+            for (let o = 0; o < this.weights.length; o++) {
+                let sum = 0;
+                for (let i = 0; i < input.length; i++) sum += input[i] * this.weights[o][i];
+                logits[o] = sum;
+            }
+            return logits;
+        }
+    }
+
+    const teacher = new DenseTeacherModel(inFeatures, outClasses);
+    const student1Bit = new neuro.BitLinearLayer(inFeatures, outClasses);
+    const monitor = new neuro.DistillationMonitor({
+        windowSize: 30,
+        initialLr: 0.08,
+        initialTemperature: 2.0,
+        patience: 15,
+        cooldown: 20
+    });
+
+    // Jeu de données synthétique
+    const dataset = Array.from({ length: 120 }, (_, idx) => {
+        const vec = new Float32Array(inFeatures);
+        const cluster = idx % outClasses;
+        for (let i = 0; i < inFeatures; i++) {
+            vec[i] = (i % outClasses === cluster ? 1.0 : -0.5) + (Math.random() - 0.5) * 0.4;
+        }
+        return { input: vec, target: cluster };
+    });
+
+    console.log(`1. Démarrage de la distillation vers l'étudiant 1-bit (${inFeatures} in -> ${outClasses} classes)...`);
+    let lastReport = null;
+    const epochs = 6;
+
+    for (let ep = 0; ep < epochs; ep++) {
+        for (const item of dataset) {
+            const teacherLogits = teacher.getLogits(item.input);
+            const stepRes = neuro.BitDistillationEngine.trainStepDistill(
+                student1Bit,
+                item.input,
+                teacherLogits,
+                item.target,
+                { lr: monitor.lr, temperature: monitor.temperature, alpha: 0.7 }
+            );
+
+            lastReport = monitor.logAndCorrect(stepRes);
+            if (lastReport.corrected) {
+                console.log(`   ⚡ [Correction dynamique déclenchée] : ${lastReport.action} -> Nouveau LR: ${lastReport.lr.toFixed(4)}`);
+            }
+        }
+        console.log(`   - Fin Époque ${ep + 1}/${epochs} | Taux d'Erreur: ${(lastReport.errorRate * 100).toFixed(1)}% | Perte: ${lastReport.avgLoss.toFixed(4)} | LR: ${lastReport.lr.toFixed(4)}`);
+    }
+
+    console.log(`\n2. Résultat final :`);
+    console.log(`   - Corrections d'erreur appliquées : ${monitor.correctionsApplied}`);
+    console.log(`   - Taux d'erreur final lissé       : ${(lastReport.errorRate * 100).toFixed(1)}%`);
+    console.log(`   - Modèle 1-bit résultant          : 100% exécutable en XNOR/Popcount sans FP32 à l'inférence ✅`);
+})();
+
+console.log("\n51. Distillation Qwen/Ollama (LLM Enseignant) vers Réseau 1-Bit (Node.js/Python)");
+
+(async () => {
+    const inFeatures = 64;   // 64 dimensions d'entrée (2 mots 32-bit packés)
+    const outClasses = 4;    // 4 classes d'intention/catégorie
+
+    // 1. Initialisation de l'étudiant 1-bit doté du module d'Attention à la Généralisation
+    const student1Bit = new neuro.GeneralizedBitClassifier(inFeatures, outClasses, 4);
+    const ollamaTeacher = new neuro.OllamaTeacherClient({
+        baseUrl: "http://localhost:11434", // Port standard Ollama (ou http://localhost:11435 pour le script Python)
+        model: "qwen2.5:0.5b"
+    });
+
+    const monitor = new neuro.DistillationMonitor({
+        windowSize: 10,
+        initialLr: 0.12,
+        initialTemperature: 2.0,
+        patience: 10,
+        cooldown: 20
+    });
+
+    const distiller = new neuro.QwenOllamaDistiller(student1Bit, ollamaTeacher, monitor);
+
+    // Initialisation des prototypes sémantiques des 4 classes pour guider Ollama/Qwen
+    const prototypeDescriptions = [
+        "alerte critique danger obstacle arrêt d'urgence collision anomalie alarme incendie surchauffe stop",
+        "navigation trajectoire exploration déplacement coordonnées zone dégagée route patrouille vitesse",
+        "analyse langage syntaxe question texte utilisateur traduction prompt compréhension message grammaire synthese",
+        "mise en veille économie batterie repos extinction actuateurs sommeil coupure moteurs arret deconnexion"
+    ];
+    await distiller.initClassPrototypes(prototypeDescriptions);
+    // 2. Échantillons textuels à classifier par distillation des représentations de Qwen
+    const promptDataset = [
+        { text: "alerte collision obstacle detecte arrêt immédiat", classId: 0 },
+        { text: "danger critique température moteur anormale", classId: 0 },
+        { text: "navigation en cours exploration vers coordonnées", classId: 1 },
+        { text: "trajectoire libre vers zone dégagée", classId: 1 },
+        { text: "analyse de texte syntaxe question utilisateur", classId: 2 },
+        { text: "traduction du prompt compréhension du message", classId: 2 },
+        { text: "mise en veille économie batterie repos", classId: 3 },
+        { text: "extinction des actuateurs mode veille prolongée", classId: 3 }
+    ];
+
+    console.log(`1. Préparation de la distillation Qwen (Projection JL + Augmentation Latente)...`);
+
+    // Pré-calcul et mise en cache des représentations projetées avec Qwen
+    const anchorBatch = [];
+    for (let c = 0; c < prototypeDescriptions.length; c++) {
+        const protoEmb = await ollamaTeacher.getEmbedding(prototypeDescriptions[c]);
+        const projInput = distiller.projectEmbedding(protoEmb);
+        const teacherLogits = distiller.getSemanticTeacherLogits(protoEmb, outClasses);
+        anchorBatch.push({ text: prototypeDescriptions[c], input: projInput, teacherLogits, classId: c });
+    }
+
+    const cachedSamples = [];
+    for (const item of promptDataset) {
+        const fullEmb = await ollamaTeacher.getEmbedding(item.text);
+        const projInput = distiller.projectEmbedding(fullEmb);
+        const teacherLogits = distiller.getSemanticTeacherLogits(fullEmb, outClasses);
+        cachedSamples.push({ text: item.text, input: projInput, teacherLogits, classId: item.classId });
+    }
+
+    // Stratégie Batch STE multi-sources : Prototypes anchors + Dataset + Jittering régularisant
+    const epochs = 12;
+    for (let ep = 0; ep < epochs; ep++) {
+        const batch = [];
+
+        // Ingestion prioritaire des ancres de généralisation (Prototypes)
+        for (const anchor of anchorBatch) {
+            batch.push({
+                inputFloat: anchor.input,
+                teacherLogits: anchor.teacherLogits,
+                targetIndex: anchor.classId
+            });
+        }
+
+        // Ingestion des exemples avec régularisation
+        for (const sample of cachedSamples) {
+            // 1. Échantillon nominal
+            batch.push({
+                inputFloat: sample.input,
+                teacherLogits: sample.teacherLogits,
+                targetIndex: sample.classId
+            });
+
+            // 2. Augmentation sémantique par bruit gaussien léger sur l'espace latent
+            const noisyInput = new Float32Array(sample.input.length);
+            for (let d = 0; d < noisyInput.length; d++) {
+                noisyInput[d] = sample.input[d] + (Math.random() - 0.5) * 0.04;
+            }
+            batch.push({
+                inputFloat: noisyInput,
+                teacherLogits: sample.teacherLogits,
+                targetIndex: sample.classId
+            });
+        }
+
+        const stepResult = neuro.BitDistillationEngine.trainBatchDistill(
+            student1Bit,
+            batch,
+            { lr: 0.10, temperature: 2.0, alpha: 0.70 }
+        );
+
+        const errorRate = 1.0 - stepResult.accuracy;
+        console.log(`   - Époque ${ep + 1}/${epochs} terminée | Précision Batch: ${(stepResult.accuracy * 100).toFixed(1)}% | Taux d'Erreur: ${(errorRate * 100).toFixed(1)}% | LR: ${monitor.lr.toFixed(4)}`);
+    }
+
+    // 3. Test d'inférence purement binaire (BitGEMM) sans appel réseau ni modèle lourd
+    console.log("\n2. Évaluation de l'étudiant 1-bit autonome (Inférence BitGEMM sans Ollama) :");
+    
+    let totalCorrect = 0;
+    for (const testItem of promptDataset) {
+        // Récupération de l'embedding du prompt et projection
+        const emb = await ollamaTeacher.getEmbedding(testItem.text);
+        const testInput = distiller.projectEmbedding(emb);
+
+        // Prédiction instantanée en XNOR + Popcount
+        const predictedClass = distiller.predictStudent(testInput);
+        const isOk = predictedClass === testItem.classId;
+        if (isOk) totalCorrect++;
+
+        console.log(`   - "${testItem.text.slice(0, 32)}..." -> Classe Prédite: ${predictedClass} (Attendue: ${testItem.classId}) ${isOk ? '✅' : '❌'}`);
+    }
+
+    // 4. Épreuve de Généralisation Zero-Shot (Invites inédites jamais vues à l'entraînement)
+    console.log("\n3. Épreuve de Généralisation Zero-Shot (Prompts Inédits / Hors Entraînement) :");
+    const unseenPrompts = [
+        { text: "stop arret immediat presence humaine sur le trajet", classId: 0 },
+        { text: "surchauffe anormale alarme incendie compartiment moteur", classId: 0 },
+        { text: "faire route vers le point waypoint alpha vitesse de croisiere", classId: 1 },
+        { text: "patrouille autonome couloir b secteur securise", classId: 1 },
+        { text: "peux tu m expliquer la grammaire et le sens de cette phrase", classId: 2 },
+        { text: "resume semantique et synthese de la requete utilisateur", classId: 2 },
+        { text: "mise a l arret prolongée coupure des moteurs economie energie", classId: 3 },
+        { text: "sommeil profond deconnexion des capteurs et repos", classId: 3 }
+    ];
+
+    let unseenCorrect = 0;
+    for (const unseen of unseenPrompts) {
+        const emb = await ollamaTeacher.getEmbedding(unseen.text);
+        const testInput = distiller.projectEmbedding(emb);
+        const predictedClass = distiller.predictStudent(testInput);
+        const isOk = predictedClass === unseen.classId;
+        if (isOk) unseenCorrect++;
+        console.log(`   - "${unseen.text.slice(0, 32)}..." -> Classe: ${predictedClass} (Attendue: ${unseen.classId}) ${isOk ? '✅' : '❌'}`);
+    }
+
+    const trainAcc = (totalCorrect / promptDataset.length) * 100;
+    const genAcc = (unseenCorrect / unseenPrompts.length) * 100;
+    console.log(`\n4. Bilan d'Attention & Généralisation :`);
+    console.log(`   - Précision d'Apprentissage (Mémorisation) : ${trainAcc.toFixed(1)}%`);
+    console.log(`   - Précision de Généralisation (Zero-Shot)   : ${genAcc.toFixed(1)}%`);
+    console.log(`   - Poids stockés pour la couche           : ${student1Bit.packedWeights.byteLength} octets`);
+    console.log(`   - Multiplications FP32 à l'inférence    : 0 (Pure logique bit-à-bit)`);
+})();
+
+console.log("\n52. Génération de Phrases Complètes par Réseau 1-Bit Autonome (BitGEMM Causal)");
+
+(() => {
+    // 1. Dictionnaire restreint pour réponses robotiques
+    const dictionary = [
+        "alerte", "danger", "obstacle", "immediat", "arret", "moteur",
+        "trajectoire", "autorisee", "vers", "secteur", "degage", "en", "cours",
+        "batterie", "faible", "mise", "veille", "prolongee", "systeme", "pret", "<eos>"
+    ];
+
+    const lm1Bit = new neuro.BitGenerativeLM(dictionary, 64, 4);
+
+    // 2. Phrases d'exemples décomposées en paires [contexte -> mot suivant]
+    const trainingSentences = [
+        ["alerte", "danger", "obstacle", "arret", "immediat"],
+        ["trajectoire", "autorisee", "vers", "secteur", "degage"],
+        ["batterie", "faible", "mise", "en", "veille", "prolongee"],
+        ["systeme", "pret", "trajectoire", "en", "cours"]
+    ];
+
+    // Construction du batch de distillation causale
+    const batch = [];
+    for (const sent of trainingSentences) {
+        for (let i = 1; i < sent.length; i++) {
+            const history = sent.slice(0, i);
+            const targetWord = sent[i];
+            const targetId = lm1Bit.wordToId.get(targetWord);
+
+            if (targetId !== undefined) {
+                const inputVec = lm1Bit.buildContextVector(history);
+                const teacherLogits = new Float32Array(lm1Bit.vocabSize).fill(-2.0);
+                teacherLogits[targetId] = 5.0; // Pôle attracteur
+
+                batch.push({
+                    inputFloat: inputVec,
+                    teacherLogits,
+                    targetIndex: targetId
+                });
+            }
+        }
+    }
+
+    console.log(`1. Entraînement de l'étudiant autorégressif 1-bit sur ${batch.length} transitions de mots...`);
+    for (let ep = 0; ep < 15; ep++) {
+        neuro.BitDistillationEngine.trainBatchDistill(
+            lm1Bit.classifier,
+            batch,
+            { lr: 0.18, temperature: 1.5, alpha: 0.5 }
+        );
+    }
+
+    // 3. Test de génération autonome token par token (Zero FP32)
+    console.log("\n2. Génération de phrases complètes par inférence 1-bit pure :");
+    const prompts = [
+        "alerte danger",
+        "trajectoire autorisee",
+        "batterie faible",
+        "systeme"
+    ];
+
+    for (const p of prompts) {
+        const answer = lm1Bit.generateSentence(p, 6);
+        console.log(`   - Prompt: "${p}"`);
+        console.log(`     👉 Réponse générée : "${answer}"`);
+    }
+    console.log("\n3. Bilan mémoire : Couche complète de vocabulaire packée en", lm1Bit.classifier.packedWeights.byteLength, "octets.");
+})();

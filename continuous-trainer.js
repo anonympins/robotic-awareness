@@ -1,5 +1,12 @@
 #!/usr/bin/env node
 
+// ============================================================
+// ENTRAÎNEUR CONTINU 1-BIT (BitGEMM Language Model + STE)
+// Reproduit l'apprentissage autorégressif d'un LLM (prochain token)
+// en combinant descente de gradient sur poids latents continus
+// et inférence bitwise sans flottant (XNOR + Popcount 32-bit).
+// ============================================================
+
 import * as neuro from './neuro-lib.js';
 import { Optimization } from './problemSolver/library.js';
 import { scrapeRandomWikipediaContent } from './wikipedia-scraper.js';
@@ -9,11 +16,15 @@ import path from 'node:path';
 const MODEL_DIR = './formal_model/';
 const BRAIN_FILE = path.join(MODEL_DIR, 'formal_brain.gnr');
 const RULES_FILE = path.join(MODEL_DIR, 'formal_rules.json');
+const BITGEMM_FILE = path.join(MODEL_DIR, 'bitgemm_model.json');
+const TOKENIZER_FILE = path.join(MODEL_DIR, 'adaptive_tokenizer.json');
 const CORPUS_PATH = './training_corpus.txt';
 
-const tokenizer = /[a-z0-9àâäéèêëïîôöùûüç]+|[^\w\s]/gi;
+const tokenizer = /[a-z0-9àâäéèêëïîôöùûüç_]+|[^\w\s]/gi;
 const WINDOW_SIZE = 4;
 const TOKEN_BITS = 12;
+const CONTEXT_DIM = 64;
+let adaptiveTokenizer = null;
 let localCorpusCursor = 0;
 
 const FALLBACK_SENTENCES = [
@@ -83,7 +94,7 @@ async function getBatchFromWikipedia(targetCount = 12) {
             const extracted = extractCleanSentences(page.blocks);
             sentences.push(...extracted);
         } catch (err) {
-            // scraper temporairement indisponible
+            // Scraper temporairement indisponible
         }
     }
     if (sentences.length === 0) {
@@ -92,8 +103,9 @@ async function getBatchFromWikipedia(targetCount = 12) {
     return sentences;
 }
 
-function generateSample(brain, miner, neuron, threshold, prompt) {
-    const tokens = prompt.match(tokenizer) || ['les'];
+function generateSample(brain, miner, neuron, threshold, prompt, adaptiveTokenizer = null) {
+    const tokens = adaptiveTokenizer ? adaptiveTokenizer.tokenize(prompt) : (prompt.match(tokenizer) || ['les']);
+    if (tokens.length === 0) tokens.push('les');
     const generated = [...tokens];
 
     for (let step = 0; step < 10; step++) {
@@ -132,10 +144,41 @@ function generateSample(brain, miner, neuron, threshold, prompt) {
 async function main() {
     const args = process.argv.slice(2);
     let useLocal = args.includes('--local');
+    const isTestMode = args.includes('--test') || args.includes('--once');
+    const isOffline = args.includes('--offline');
+    const cyclesArg = args.find(a => a.startsWith('--cycles='));
+    const lrArg = args.find(a => a.startsWith('--lr='));
 
-    console.log("\x1b[35m=== ENTRAÎNEUR CONTINU : FORMALISME POLYNOMIAL ===\x1b[0m");
+    const maxCycles = cyclesArg ? parseInt(cyclesArg.split('=')[1], 10) : (isTestMode ? 3 : Infinity);
+    const learningRate = lrArg ? parseFloat(lrArg.split('=')[1]) : 0.03;
+
+    console.log("\x1b[35m=== ENTRAÎNEUR CONTINU : BITGEMM 1-BIT & NEURO-SYMBOLIQUE ===\x1b[0m");
     if (!fs.existsSync(MODEL_DIR)) fs.mkdirSync(MODEL_DIR, { recursive: true });
 
+    // 0. Tokenizer adaptatif à fusion progressive
+    adaptiveTokenizer = new neuro.AdaptiveMergeTokenizer({ mergeThreshold: 5, maxVocabSize: 4096 });
+    if (fs.existsSync(TOKENIZER_FILE)) {
+        try {
+            adaptiveTokenizer.importState(JSON.parse(fs.readFileSync(TOKENIZER_FILE, 'utf8')));
+            console.log(`[INIT] Tokenizer adaptatif chargé (${adaptiveTokenizer.merges.size} fusions).`);
+        } catch (e) {
+            console.warn("[INIT] Erreur lecture tokenizer:", e.message);
+        }
+    }
+
+    // 1. Initialisation du modèle de langage 1-bit
+    const initialVocab = ["les", "la", "le", "des", "un", "une", "dans", "avec", "pour", "<eos>"];
+    const bitLM = new neuro.BitGenerativeLM(initialVocab, CONTEXT_DIM, 4);
+    if (fs.existsSync(BITGEMM_FILE)) {
+        try {
+            bitLM.importState(JSON.parse(fs.readFileSync(BITGEMM_FILE, 'utf8')));
+            console.log(`[INIT] Modèle BitGEMM chargé (${bitLM.vocabSize} tokens).`);
+        } catch (e) {
+            console.warn("[INIT] Erreur lecture BitGEMM:", e.message);
+        }
+    }
+
+    // 2. Mémoire relationnelle symbolique
     const brain = new neuro.SemanticRelationalMemory(8);
     if (fs.existsSync(BRAIN_FILE)) {
         try {
@@ -168,11 +211,13 @@ async function main() {
     const memoryBufferSentences = [];
 
     while (true) {
-        console.log(`\n\x1b[7m CYCLE #${cycleCount} \x1b[0m  (Vocabulaire: ${brain.vocabulary.size})`);
+        console.log(`\n\x1b[7m CYCLE #${cycleCount} \x1b[0m (BitGEMM Vocab: ${bitLM.vocabSize} | Merges: ${adaptiveTokenizer.merges.size} | Symbol Vocab: ${brain.vocabulary.size})`);
         let batch = [];
 
         try {
-            if (useLocal) {
+            if (isOffline) {
+                batch = [...FALLBACK_SENTENCES];
+            } else if (useLocal) {
                 const res = await getBatchFromLocalCorpus(1024 * 64);
                 batch = res.sentences;
                 if (res.done) {
@@ -185,7 +230,41 @@ async function main() {
 
             if (batch.length > 0) {
                 console.log(`📥 Ingestion de ${batch.length} phrases...`);
-                batch.forEach(s => brain.learnSense(s, true, 2));
+                let newMergesCount = 0;
+                let totalLoss = 0;
+                let totalAcc = 0;
+                let totalSteps = 0;
+
+                for (const sentence of batch) {
+                    // Ingestion adaptative : les bigrammes récurrents fusionnent en super-tokens
+                    const tokens = adaptiveTokenizer.ingestAndTokenize(sentence, (newToken) => {
+                        newMergesCount++;
+                        bitLM.addWord(newToken);
+                    });
+
+                    // Entraînement symbolique avec les super-tokens
+                    brain.learnSense(tokens.join(' '), true, 2);
+                }
+
+                // Consolidation multi-passes (3 époques locales) pour stabiliser le gradient STE 1-bit
+                const localEpochs = 3;
+                for (let ep = 0; ep < localEpochs; ep++) {
+                    for (const sentence of batch) {
+                        const tokens = adaptiveTokenizer.tokenize(sentence);
+                        const r = bitLM.trainTokens(tokens, learningRate);
+                        if (ep === localEpochs - 1) {
+                            totalLoss += r.avgLoss;
+                            totalAcc += r.accuracy;
+                            totalSteps += r.steps;
+                        }
+                    }
+                }
+
+                const avgLoss = (totalLoss / batch.length).toFixed(3);
+                const avgAcc = ((totalAcc / batch.length) * 100).toFixed(1);
+                const perplexity = Math.exp(parseFloat(avgLoss)).toFixed(2);
+                console.log(`⚡ [BitGEMM 1-Bit STE] Loss: ${avgLoss} | Top-1: ${avgAcc}% | PPL: ${perplexity} | Pas: ${totalSteps} | Nouvelles fusions: ${newMergesCount}`);
+
                 memoryBufferSentences.push(...batch);
                 if (memoryBufferSentences.length > 60) {
                     memoryBufferSentences.splice(0, memoryBufferSentences.length - 60);
@@ -207,7 +286,9 @@ async function main() {
                 }
             }
 
-            // Sauvegarde continue
+            // Sauvegarde continue des poids 1-bit et des graphes symboliques
+            fs.writeFileSync(BITGEMM_FILE, JSON.stringify(bitLM.exportState(), null, 2));
+            fs.writeFileSync(TOKENIZER_FILE, JSON.stringify(adaptiveTokenizer.exportState(), null, 2));
             fs.writeFileSync(BRAIN_FILE, brain.exportBinary());
             if (formalGrammar) {
                 fs.writeFileSync(RULES_FILE, JSON.stringify({
@@ -217,20 +298,42 @@ async function main() {
                     decodedRules: formalGrammar.decodedRules,
                     updatedAt: new Date().toISOString()
                 }, null, 2));
+            }
 
-                // Échantillon de test de parole en direct
-                const seedPrompt = (batch[0] || FALLBACK_SENTENCES[0]).match(tokenizer).slice(0, 2).join(' ');
-                const sample = generateSample(brain, miner, formalGrammar.neuron, formalGrammar.threshold, seedPrompt);
-                console.log(`🗣️ Échantillon généré : "${sample}"`);
+            // Génération autorégressive en direct (Inférence BitGEMM 100% binaire)
+            const matchedTokens = adaptiveTokenizer.tokenize(batch[0] || FALLBACK_SENTENCES[0]);
+            const seedPrompt = matchedTokens.slice(0, 2).join(' ');
+            const bitGenerated = bitLM.generateSentence(seedPrompt, 10, 0.0, adaptiveTokenizer);
+            console.log(`🤖 Génération 1-Bit (BitGEMM) : "${bitGenerated}"`);
+            console.log(`   (Décodé sans '_')         : "${adaptiveTokenizer.detokenize(bitGenerated.split(' '))}"`);
+
+            if (formalGrammar) {
+                const sample = generateSample(brain, miner, formalGrammar.neuron, formalGrammar.threshold, seedPrompt, adaptiveTokenizer);
+                console.log(`🗣️ Génération Symbolique   : "${sample}"`);
             }
 
         } catch (err) {
             console.error(`❌ Erreur cycle #${cycleCount}:`, err.message);
+            if (isTestMode) throw err;
+        }
+
+        if (cycleCount >= maxCycles) {
+            console.log(`\n\x1b[32m=== BILAN : ENTRAÎNEMENT CONTINU VALIDÉ (${cycleCount} cycles) ===\x1b[0m`);
+            console.log(`• Poids BitGEMM 1-bit : ${fs.statSync(BITGEMM_FILE).size} octets (${BITGEMM_FILE})`);
+            console.log(`• Vocabulaire BitGEMM : ${bitLM.vocabSize} tokens`);
+            console.log(`• Fusions Tokenizer  : ${adaptiveTokenizer.merges.size} super-tokens appris`);
+            console.log(`• Mode d'inférence    : XNOR + Popcount 32-bit (sans FPU)`);
+            break;
         }
 
         cycleCount++;
-        await new Promise(r => setTimeout(r, 2000));
+        if (!isTestMode) {
+            await new Promise(r => setTimeout(r, 2000));
+        }
     }
 }
 
-main().catch(err => console.error("💥 Crash:", err));
+main().catch(err => {
+    console.error("💥 Crash:", err);
+    process.exit(1);
+});

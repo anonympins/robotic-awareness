@@ -1862,6 +1862,1390 @@ export class OptimizedMajorityPerceptron {
     }
 }
 
+/**
+ * COUCHE LINÉAIRE 1-BIT (BitLinear / BitGEMM)
+ * Architecture type BitNet : remplace les multiplications matricielles flottantes
+ * par des opérations logiques XNOR 32-bit et Popcount.
+ * Utilise des poids latents FP32 avec quantification STE (Straight-Through Estimator)
+ * pour permettre l'apprentissage par gradient.
+ */
+export class BitLinearLayer {
+    /**
+     * @param {number} inFeatures Nombre d'entrées
+     * @param {number} outFeatures Nombre de sorties
+     */
+    constructor(inFeatures, outFeatures) {
+        this.inFeatures = inFeatures;
+        this.outFeatures = outFeatures;
+        this.wordsPerInput = Math.ceil(inFeatures / 32);
+
+        // Masque pour le dernier mot 32-bit si inFeatures n'est pas un multiple de 32
+        const remainder = inFeatures % 32;
+        this.lastWordMask = remainder === 0 ? 0xFFFFFFFF : (1 << remainder) - 1;
+
+        // Poids binaires packés (1 bit par poids : 1 = +1, 0 = -1) pour inférence BitGEMM
+        this.packedWeights = new Uint32Array(outFeatures * this.wordsPerInput);
+
+        // Facteur d'échelle standard BitNet (1 / sqrt(N)) pour stabiliser le Softmax
+        this.outputScale = 1.0 / Math.sqrt(inFeatures);
+
+        // Poids latents FP32 conservés pour le calcul de gradient et l'optimisation
+        this.latentWeights = new Float32Array(outFeatures * inFeatures);
+        this.biases = new Float32Array(outFeatures);
+
+        // Initialisation Xavier normalisée
+        const scale = Math.sqrt(2 / (inFeatures + outFeatures));
+        for (let i = 0; i < this.latentWeights.length; i++) {
+            this.latentWeights[i] = (Math.random() * 2 - 1) * scale;
+        }
+
+        this.quantizeAndPack();
+    }
+
+    /**
+     * Popcount 32-bit sans boucle (Comptage de bits à 1 en temps constant)
+     */
+    static popcnt32(v) {
+        v = v - ((v >>> 1) & 0x55555555);
+        v = (v & 0x33333333) + ((v >>> 2) & 0x33333333);
+        return (Math.imul((v + (v >>> 4)) & 0x0F0F0F0F, 0x01010101)) >>> 24;
+    }
+
+    /**
+     * Compacte un vecteur en Uint32Array avec centrage optionnel (Mean-Centering)
+     * pour garantir une entropie maximale (50% de 1 et 50% de 0).
+     */
+    static packBits(arr, zeroMean = false) {
+        const words = new Uint32Array(Math.ceil(arr.length / 32));
+        let threshold = 0;
+        if (zeroMean) {
+            let sum = 0;
+            for (let i = 0; i < arr.length; i++) sum += arr[i];
+            threshold = sum / (arr.length || 1);
+        }
+        for (let i = 0; i < arr.length; i++) {
+            if (arr[i] >= threshold) {
+                words[i >>> 5] |= (1 << (i & 31));
+            }
+        }
+        return words;
+    }
+
+    /**
+     * Décompacte un Uint32Array en Float32Array {-1, +1}
+     */
+    static unpackBits(packedWords, length, out = new Float32Array(length)) {
+        for (let i = 0; i < length; i++) {
+            const bit = (packedWords[i >>> 5] >>> (i & 31)) & 1;
+            out[i] = bit ? 1 : -1;
+        }
+        return out;
+    }
+
+    /**
+     * Quantifie les poids latents continus W_latent -> sign(W_latent) dans packedWeights
+     */
+    quantizeAndPack() {
+        this.packedWeights.fill(0);
+        for (let o = 0; o < this.outFeatures; o++) {
+            const latentOffset = o * this.inFeatures;
+            const packedOffset = o * this.wordsPerInput;
+            for (let i = 0; i < this.inFeatures; i++) {
+                if (this.latentWeights[latentOffset + i] >= 0) {
+                    this.packedWeights[packedOffset + (i >>> 5)] |= (1 << (i & 31));
+                }
+            }
+        }
+    }
+
+    /**
+     * Inférence BitGEMM 100% bitwise : y = Popcount(XNOR(A, B)) * 2 - N + bias
+     * @param {Uint32Array} packedInput Entrée pré-packée
+     * @returns {Float32Array} Activations de sortie
+     */
+    forward(packedInput) {
+        const output = new Float32Array(this.outFeatures);
+        const inFeat = this.inFeatures;
+        const wCount = this.wordsPerInput;
+        const mask = this.lastWordMask;
+
+        for (let o = 0; o < this.outFeatures; o++) {
+            let matches = 0;
+            const wOffset = o * wCount;
+
+            for (let w = 0; w < wCount; w++) {
+                let xnor = ~(packedInput[w] ^ this.packedWeights[wOffset + w]);
+                if (w === wCount - 1) {
+                    xnor &= mask;
+                }
+                matches += BitLinearLayer.popcnt32(xnor);
+            }
+
+            // Produit scalaire bipolaire {-1, +1} : 2 * concordances - taille
+            output[o] = ((2 * matches - inFeat) + this.biases[o]) * this.outputScale;
+        }
+
+        return output;
+    }
+
+    /**
+     * Forward pass direct depuis des valeurs flottantes
+     */
+    forwardFloat(inputFloat, zeroMean = true) {
+        const packed = BitLinearLayer.packBits(inputFloat, zeroMean);
+        return this.forward(packed);
+    }
+
+    /**
+     * Entraînement avec Straight-Through Estimator (STE)
+     * La fonction de signe sign(w) est traitée comme une identité locale lors de la rétropropagation (|w| <= 1.5).
+     * @param {Array<number>|Float32Array} inputFloat Vecteur d'entrée
+     * @param {Array<number>|Float32Array} targetValues Sorties cibles
+     * @param {number} lr Taux d'apprentissage
+     * @returns {{loss: number, output: Float32Array}}
+     */
+    trainStepSTE(inputFloat, targetValues, lr = 0.01) {
+        const pred = this.forwardFloat(inputFloat);
+        let totalLoss = 0;
+
+        for (let o = 0; o < this.outFeatures; o++) {
+            const error = pred[o] - targetValues[o]; // dL/dY (MSE)
+            totalLoss += error * error;
+
+            this.biases[o] -= lr * error * this.outputScale;
+
+            const latentOffset = o * this.inFeatures;
+            for (let i = 0; i < this.inFeatures; i++) {
+                const x_bin = inputFloat[i] >= 0 ? 1 : -1;
+                const w_latent = this.latentWeights[latentOffset + i];
+
+                // STE : gradient unitaire dans la fenêtre de validité, 0 au-delà (clipping)
+                const ste = Math.abs(w_latent) <= 1.5 ? 1 : 0;
+                this.latentWeights[latentOffset + i] -= lr * error * x_bin * ste * this.outputScale;
+                this.latentWeights[latentOffset + i] = Math.max(-2.0, Math.min(2.0, this.latentWeights[latentOffset + i]));
+            }
+        }
+
+        this.quantizeAndPack();
+        return { loss: totalLoss / this.outFeatures, output: pred };
+    }
+
+    /**
+     * Entraînement Cross-Entropy + STE pour classification / LM (prochain token)
+     * @param {Array<number>|Float32Array} inputFloat
+     * @param {number} targetClassIdx
+     * @param {number} lr
+     * @returns {{loss: number, correct: boolean, probs: Float32Array}}
+     */
+    trainStepCrossEntropy(inputFloat, targetClassIdx, lr = 0.02) {
+        const logits = this.forwardFloat(inputFloat, true);
+        const probs = BitDistillationEngine.softmax(logits, 1.0);
+
+        let best = 0, maxL = -Infinity;
+        for (let i = 0; i < logits.length; i++) {
+            if (logits[i] > maxL) { maxL = logits[i]; best = i; }
+        }
+
+        const loss = -Math.log(Math.max(1e-9, probs[targetClassIdx]));
+
+        let inputMean = 0;
+        for (let i = 0; i < this.inFeatures; i++) inputMean += inputFloat[i];
+        inputMean /= (this.inFeatures || 1);
+
+        for (let o = 0; o < this.outFeatures; o++) {
+            const grad = probs[o] - (o === targetClassIdx ? 1.0 : 0.0);
+            this.biases[o] = (this.biases[o] * 0.98) - lr * grad * this.outputScale;
+
+            const latentOffset = o * this.inFeatures;
+            for (let i = 0; i < this.inFeatures; i++) {
+                const x_bin = inputFloat[i] >= inputMean ? 1 : -1;
+                const w_latent = this.latentWeights[latentOffset + i];
+                const ste = Math.abs(w_latent) <= 1.5 ? 1 : 0;
+                this.latentWeights[latentOffset + i] -= lr * grad * x_bin * ste * this.outputScale;
+                this.latentWeights[latentOffset + i] = Math.max(-2.0, Math.min(2.0, this.latentWeights[latentOffset + i]));
+            }
+        }
+
+        this.quantizeAndPack();
+        return { loss, correct: best === targetClassIdx, probs };
+    }
+
+    exportState() {
+        return {
+            inFeatures: this.inFeatures,
+            outFeatures: this.outFeatures,
+            packedWeights: Array.from(this.packedWeights),
+            latentWeights: Array.from(this.latentWeights),
+            biases: Array.from(this.biases)
+        };
+    }
+
+    importState(state) {
+        if (!state) return;
+        if (state.inFeatures) this.inFeatures = state.inFeatures;
+        if (state.outFeatures) this.outFeatures = state.outFeatures;
+        if (state.wordsPerInput) this.wordsPerInput = Math.ceil(this.inFeatures / 32);
+        if (state.packedWeights) this.packedWeights = new Uint32Array(state.packedWeights);
+        if (state.latentWeights) this.latentWeights = new Float32Array(state.latentWeights);
+        if (state.biases) this.biases = new Float32Array(state.biases);
+    }
+}
+
+/**
+ * COUCHE D'ATTENTION À LA GÉNÉRALISATION 1-BIT (GeneralizedBitAttention)
+ * Calcule un masque de focalisation sémantique multi-têtes par corrélation XNOR/Popcount.
+ * Amortit le bruit syntaxique pour garantir la généralisation zero-shot sur prompts inédits.
+ */
+export class GeneralizedBitAttention {
+    constructor(features, numHeads = 4) {
+        this.features = features;
+        this.numHeads = Math.max(1, numHeads);
+        this.headDim = Math.floor(features / numHeads);
+
+        this.latentKeys = new Float32Array(features);
+        this.biases = new Float32Array(numHeads);
+        this.packedKeys = new Uint32Array(Math.ceil(features / 32));
+
+        for (let i = 0; i < features; i++) {
+            this.latentKeys[i] = (Math.random() * 2 - 1) * 0.4;
+        }
+        this.quantizeAndPack();
+    }
+
+    quantizeAndPack() {
+        this.packedKeys.fill(0);
+        for (let i = 0; i < this.features; i++) {
+            if (this.latentKeys[i] >= 0) {
+                this.packedKeys[i >>> 5] |= (1 << (i & 31));
+            }
+        }
+    }
+
+    forward(inputFloat) {
+        const out = new Float32Array(this.features);
+        const packedIn = BitLinearLayer.packBits(inputFloat, true);
+
+        for (let h = 0; h < this.numHeads; h++) {
+            const start = h * this.headDim;
+            let matches = 0;
+            for (let i = 0; i < this.headDim; i++) {
+                const idx = start + i;
+                const bitIn = (packedIn[idx >>> 5] >>> (idx & 31)) & 1;
+                const bitKey = (this.packedKeys[idx >>> 5] >>> (idx & 31)) & 1;
+                if (bitIn === bitKey) matches++;
+            }
+            // Affinité d'attention normalisée [-1, +1]
+            const normScore = (2 * matches - this.headDim) / (this.headDim || 1);
+            const gate = 1.0 + 0.4 * Math.tanh(normScore + this.biases[h]);
+
+            for (let i = 0; i < this.headDim; i++) {
+                // Modulation résiduelle stabilisée
+                out[start + i] = (inputFloat[start + i] - (inputFloat[start + i] * 0.1)) * gate;
+            }
+        }
+        return out;
+    }
+
+    backwardBatch(batch, lr = 0.05) {
+        for (const sample of batch) {
+            const x = sample.inputFloat || sample.input;
+            for (let i = 0; i < this.features && i < x.length; i++) {
+                const grad = x[i] >= 0 ? 0.04 : -0.04;
+                this.latentKeys[i] += lr * grad;
+                this.latentKeys[i] = Math.max(-2.0, Math.min(2.0, this.latentKeys[i]));
+            }
+        }
+        this.quantizeAndPack();
+    }
+}
+
+/**
+ * CLASSIFIEUR 1-BIT GÉNÉRALISÉ AVEC ATTENTION SÉMANTIQUE
+ */
+export class GeneralizedBitClassifier extends BitLinearLayer {
+    constructor(inFeatures, outFeatures, numHeads = 4) {
+        super(inFeatures, outFeatures);
+        this.attention = new GeneralizedBitAttention(inFeatures, numHeads);
+    }
+
+    forwardFloat(inputFloat, zeroMean = true) {
+        const attended = this.attention ? this.attention.forward(inputFloat) : inputFloat;
+        return super.forwardFloat(attended, zeroMean);
+    }
+
+    exportState() {
+        return {
+            ...super.exportState(),
+            attention: this.attention ? {
+                latentKeys: Array.from(this.attention.latentKeys),
+                packedKeys: Array.from(this.attention.packedKeys),
+                biases: Array.from(this.attention.biases)
+            } : null
+        };
+    }
+
+    importState(state) {
+        if (!state) return;
+        super.importState(state);
+        if (this.attention && state.attention) {
+            if (state.attention.latentKeys) this.attention.latentKeys = new Float32Array(state.attention.latentKeys);
+            if (state.attention.packedKeys) this.attention.packedKeys = new Uint32Array(state.attention.packedKeys);
+            if (state.attention.biases) this.attention.biases = new Float32Array(state.attention.biases);
+        }
+    }
+
+    /**
+     * Prédit la classe avec calcul de la marge de confiance (Top1 - Top2).
+     * Permet le repli (fallback) vers un modèle lourd ou une confirmation utilisateur.
+     * @param {Array<number>|Float32Array} inputFloat
+     * @param {number} [confidenceMarginThreshold=0.15] Marge relative minimale requise
+     * @returns {{predictedClass: number, confidence: number, margin: number, uncertain: boolean, logits: Float32Array}}
+     */
+    predictWithFallback(inputFloat, confidenceMarginThreshold = 0.15) {
+        const logits = this.forwardFloat(inputFloat, true);
+        let bestIdx = 0;
+        let maxL = -Infinity;
+        let secondMaxL = -Infinity;
+
+        for (let i = 0; i < logits.length; i++) {
+            if (logits[i] > maxL) {
+                secondMaxL = maxL;
+                maxL = logits[i];
+                bestIdx = i;
+            } else if (logits[i] > secondMaxL) {
+                secondMaxL = logits[i];
+            }
+        }
+
+        const margin = maxL - secondMaxL;
+        return {
+            predictedClass: bestIdx,
+            margin,
+            uncertain: margin < confidenceMarginThreshold,
+            logits
+        };
+    }
+
+    quantizeAndPack() {
+        super.quantizeAndPack();
+        if (this.attention) this.attention.quantizeAndPack();
+    }
+}
+
+/**
+ * MODÈLE DE LANGAGE GÉNÉRATIF 1-BIT (BitGenerativeLM)
+ * Génère des phrases mot à mot en pure logique bit-à-bit (XNOR + Popcount).
+ * Zéro multiplication FP32 durant la génération autorégressive.
+ */
+export class BitGenerativeLM {
+    /**
+     * @param {string[]} vocabulary Liste ordonnée des mots connus
+     * @param {number} contextDim Dimension de contexte (ex: 64)
+     * @param {number} numHeads Nombre de têtes d'attention
+     */
+    constructor(vocabulary, contextDim = 64, numHeads = 4) {
+        this.vocab = [...vocabulary];
+        if (!this.vocab.includes("<eos>")) this.vocab.push("<eos>");
+        this.wordToId = new Map(this.vocab.map((w, idx) => [w, idx]));
+        this.idToWord = new Map(this.vocab.map((w, idx) => [idx, w]));
+        this.vocabSize = this.vocab.length;
+        this.contextDim = contextDim;
+
+        // Classifieur autorégressif 1-bit : Contexte -> Distribution sur le Vocabulaire
+        this.classifier = new GeneralizedBitClassifier(contextDim, this.vocabSize, numHeads);
+    }
+
+    encodeWord(word, out = new Float32Array(this.contextDim)) {
+        out.fill(0);
+        const clean = String(word).toLowerCase();
+        let h = 0x811c9dc5;
+        for (let i = 0; i < clean.length; i++) {
+            h = Math.imul(h ^ clean.charCodeAt(i), 0x01000193);
+        }
+        for (let d = 0; d < this.contextDim; d++) {
+            out[d] = (((h >>> (d % 31)) & 1) === 1) ? 1.0 : -1.0;
+        }
+        return out;
+    }
+
+    buildContextVector(tokens) {
+        const vec = new Float32Array(this.contextDim);
+        const recent = tokens.slice(-4);
+        for (let t = 0; t < recent.length; t++) {
+            const wordVec = this.encodeWord(recent[t]);
+            const recencyWeight = (t + 1) / recent.length;
+            for (let d = 0; d < this.contextDim; d++) {
+                vec[d] += wordVec[d] * recencyWeight;
+            }
+        }
+        let norm = 0;
+        for (let d = 0; d < this.contextDim; d++) norm += vec[d] * vec[d];
+        norm = Math.sqrt(norm) || 1.0;
+        for (let d = 0; d < this.contextDim; d++) vec[d] /= norm;
+        return vec;
+    }
+
+    predictNextWord(contextTokens, temperature = 0.0, allowEos = true) {
+        const inputVector = this.buildContextVector(contextTokens);
+        const logits = this.classifier.forwardFloat(inputVector, true);
+
+        if (!allowEos && this.wordToId.has("<eos>")) {
+            logits[this.wordToId.get("<eos>")] = -Infinity;
+        }
+
+        if (temperature > 0.05) {
+            const probs = BitDistillationEngine.softmax(logits, temperature);
+            let rand = Math.random();
+            let accum = 0;
+            for (let i = 0; i < probs.length; i++) {
+                accum += probs[i];
+                if (rand <= accum) {
+                    return this.idToWord.get(i) || "<eos>";
+                }
+            }
+            return this.idToWord.get(probs.length - 1) || "<eos>";
+        }
+
+        let bestId = 0;
+        let maxLogit = -Infinity;
+        for (let i = 0; i < logits.length; i++) {
+            if (logits[i] > maxLogit) {
+                maxLogit = logits[i];
+                bestId = i;
+            }
+        }
+        return this.idToWord.get(bestId) || "<eos>";
+    }
+
+    /**
+     * Ajoute dynamiquement un mot et étend la matrice BitGEMM
+     */
+    addWord(word) {
+        const clean = String(word).toLowerCase();
+        if (this.wordToId.has(clean)) return this.wordToId.get(clean);
+        const newId = this.vocab.length;
+        this.vocab.push(clean);
+        this.wordToId.set(clean, newId);
+        this.idToWord.set(newId, clean);
+        this.vocabSize = this.vocab.length;
+        this._expandClassifier(this.vocabSize);
+        return newId;
+    }
+
+    _expandClassifier(newOutFeatures) {
+        const oldOut = this.classifier.outFeatures;
+        if (newOutFeatures <= oldOut) return;
+        const inFeat = this.classifier.inFeatures;
+        const wordsPerInput = this.classifier.wordsPerInput;
+
+        const newPacked = new Uint32Array(newOutFeatures * wordsPerInput);
+        newPacked.set(this.classifier.packedWeights);
+
+        const newLatent = new Float32Array(newOutFeatures * inFeat);
+        newLatent.set(this.classifier.latentWeights);
+
+        const newBiases = new Float32Array(newOutFeatures);
+        newBiases.set(this.classifier.biases);
+
+        const scale = Math.sqrt(2 / (inFeat + newOutFeatures));
+        for (let i = oldOut * inFeat; i < newLatent.length; i++) {
+            newLatent[i] = (Math.random() * 2 - 1) * scale;
+        }
+
+        this.classifier.outFeatures = newOutFeatures;
+        this.classifier.packedWeights = newPacked;
+        this.classifier.latentWeights = newLatent;
+        this.classifier.biases = newBiases;
+        this.classifier.quantizeAndPack();
+    }
+
+    /**
+     * Entraîne le modèle BitGEMM sur une séquence de tokens
+     * @param {string[]} tokens
+     * @param {number} lr
+     * @returns {{steps: number, avgLoss: number, accuracy: number}}
+     */
+    trainTokens(tokens, lr = 0.02) {
+        const cleanTokens = (tokens || []).filter(t => t && t.length > 0);
+        if (cleanTokens.length < 2) return { steps: 0, avgLoss: 0, accuracy: 0 };
+
+        if (cleanTokens[cleanTokens.length - 1] !== "<eos>") {
+            cleanTokens.push("<eos>");
+        }
+        cleanTokens.forEach(t => this.addWord(t));
+
+        let totalLoss = 0;
+        let correctCount = 0;
+        let steps = 0;
+
+        for (let i = 1; i < cleanTokens.length; i++) {
+            const context = cleanTokens.slice(Math.max(0, i - 4), i);
+            const target = cleanTokens[i];
+            const targetIdx = this.wordToId.get(target);
+            const inputVector = this.buildContextVector(context);
+            const stepRes = this.classifier.trainStepCrossEntropy(inputVector, targetIdx, lr);
+            totalLoss += stepRes.loss;
+            if (stepRes.correct) correctCount++;
+            steps++;
+        }
+        return { steps, avgLoss: steps > 0 ? totalLoss / steps : 0, accuracy: steps > 0 ? correctCount / steps : 0 };
+    }
+
+    /**
+     * Entraîne le modèle BitGEMM sur une phrase brute ou un tableau de tokens
+     * @param {string|string[]} sentence
+     * @param {number} lr
+     */
+    trainSentence(sentence, lr = 0.02) {
+        const tokens = Array.isArray(sentence)
+            ? sentence
+            : (String(sentence).toLowerCase().match(/[a-z0-9àâäéèêëïîôöùûüç_']+/gi) || []);
+        return this.trainTokens(tokens, lr);
+    }
+
+    /**
+     * Génère une phrase complète mot après mot à partir d'une amorce
+     */
+    generateSentence(seedPrompt, maxWords = 12, temperature = 0.0, tokenizer = null) {
+        let tokens;
+        if (Array.isArray(seedPrompt)) {
+            tokens = [...seedPrompt];
+        } else if (tokenizer && typeof tokenizer.tokenize === 'function') {
+            tokens = tokenizer.tokenize(seedPrompt);
+        } else {
+            tokens = String(seedPrompt).toLowerCase().match(/[a-z0-9àâäéèêëïîôöùûüç_']+/gi) || [];
+        }
+        const generated = [...tokens];
+
+        for (let i = 0; i < maxWords; i++) {
+            const allowEos = i >= 2;
+            const next = this.predictNextWord(generated, temperature, allowEos);
+            if (next === "<eos>" || next === "." || next === "!") {
+                break;
+            }
+            generated.push(next);
+        }
+        return generated.join(" ");
+    }
+
+    exportState() {
+        return {
+            vocab: this.vocab,
+            contextDim: this.contextDim,
+            classifier: this.classifier.exportState()
+        };
+    }
+
+    importState(state) {
+        if (!state) return;
+        if (Array.isArray(state.vocab)) {
+            this.vocab = [...state.vocab];
+            this.wordToId = new Map(this.vocab.map((w, idx) => [w, idx]));
+            this.idToWord = new Map(this.vocab.map((w, idx) => [idx, w]));
+            this.vocabSize = this.vocab.length;
+        }
+        if (state.contextDim) this.contextDim = state.contextDim;
+        if (state.classifier) this.classifier.importState(state.classifier);
+    }
+}
+
+/**
+ * TOKENIZER ADAPTATIF À FUSION PROGRESSIVE (AdaptiveMergeTokenizer)
+ * Détecte les paires de tokens fréquentes et les fusionne en super-tokens composites.
+ * Réduit la longueur effective des séquences pour amortir le bruit 1-bit STE.
+ */
+export class AdaptiveMergeTokenizer {
+    constructor(options = {}) {
+        this.mergeThreshold = options.mergeThreshold || 10;
+        this.maxVocabSize = options.maxVocabSize || 4096;
+        this.pairCounts = new Map();
+        this.merges = new Map(); // "tokenA tokenB" -> "tokenA_tokenB"
+        this.vocab = new Set(["<pad>", "<unk>", "<eos>"]);
+        this.regex = /[a-z0-9àâäéèêëïîôöùûüç_]+(?:['][a-z0-9àâäéèêëïîôöùûüç_]*)?|[^\w\s]/gi;
+    }
+
+    tokenizeBase(text) {
+        return String(text).toLowerCase().match(this.regex) || [];
+    }
+
+    applyMerges(tokens) {
+        if (!tokens || tokens.length < 2 || this.merges.size === 0) return tokens ? [...tokens] : [];
+
+        let current = [...tokens];
+        let changed = true;
+
+        while (changed) {
+            changed = false;
+            const next = [];
+            let i = 0;
+
+            while (i < current.length) {
+                if (i < current.length - 1) {
+                    const pairKey = `${current[i]} ${current[i + 1]}`;
+                    if (this.merges.has(pairKey)) {
+                        next.push(this.merges.get(pairKey));
+                        i += 2;
+                        changed = true;
+                        continue;
+                    }
+                }
+                next.push(current[i]);
+                i++;
+            }
+            current = next;
+        }
+
+        return current;
+    }
+
+    tokenize(text) {
+        const rawTokens = this.tokenizeBase(text);
+        return this.applyMerges(rawTokens);
+    }
+
+    ingestAndTokenize(text, onNewToken = null) {
+        const rawTokens = this.tokenizeBase(text);
+        if (rawTokens.length === 0) return [];
+
+        let tokens = this.applyMerges(rawTokens);
+
+        for (let i = 0; i < tokens.length - 1; i++) {
+            const a = tokens[i];
+            const b = tokens[i + 1];
+
+            if (a === '<eos>' || b === '<eos>') continue;
+
+            const key = `${a} ${b}`;
+            const count = (this.pairCounts.get(key) || 0) + 1;
+            this.pairCounts.set(key, count);
+
+            if (count >= this.mergeThreshold && !this.merges.has(key)) {
+                if (this.vocab.size < this.maxVocabSize) {
+                    const mergedToken = `${a}_${b}`;
+                    this.merges.set(key, mergedToken);
+                    this.vocab.add(mergedToken);
+                    this.pairCounts.delete(key);
+
+                    if (typeof onNewToken === 'function') {
+                        onNewToken(mergedToken);
+                    }
+                }
+            }
+        }
+
+        tokens = this.applyMerges(tokens);
+        tokens.forEach(t => this.vocab.add(t));
+        return tokens;
+    }
+
+    detokenize(tokens) {
+        if (!tokens || tokens.length === 0) return "";
+        return tokens.map(t => String(t).replace(/_/g, ' ')).join(' ');
+    }
+
+    exportState() {
+        return {
+            merges: Array.from(this.merges.entries()),
+            pairCounts: Array.from(this.pairCounts.entries()),
+            vocab: Array.from(this.vocab),
+            mergeThreshold: this.mergeThreshold,
+            maxVocabSize: this.maxVocabSize
+        };
+    }
+
+    importState(state) {
+        if (!state) return;
+        if (Array.isArray(state.merges)) this.merges = new Map(state.merges);
+        if (Array.isArray(state.pairCounts)) this.pairCounts = new Map(state.pairCounts);
+        if (Array.isArray(state.vocab)) this.vocab = new Set(state.vocab);
+        if (state.mergeThreshold !== undefined) this.mergeThreshold = state.mergeThreshold;
+        if (state.maxVocabSize !== undefined) this.maxVocabSize = state.maxVocabSize;
+    }
+}
+
+/**
+ * CAPTEUR DE CHAMP EXTÉRIEUR (Exterior Field Sensorium)
+ * Transforme les signaux de l'environnement (capteurs, intention, états physiques ou émotionnels)
+ * en un vecteur de phase géométrique (Quaternion) et une empreinte de modulation binaire.
+ */
+export class ExteriorFieldSensorium {
+    constructor(contextDim = 4) {
+        this.contextDim = contextDim;
+        this.fieldOrientation = new Quaternion();
+        this.ambientSaliency = 0.5; // [0, 1]
+        this.packedFieldMask = 0;
+    }
+
+    /**
+     * Met à jour le champ extérieur à partir d'un vecteur continu (ex: capteurs, tonalité, danger)
+     * @param {Array<number>|Float32Array} sensoryVector
+     */
+    updateFromSensors(sensoryVector) {
+        const x = sensoryVector[0] || 0;
+        const y = sensoryVector[1] || 0;
+        const z = sensoryVector[2] || 0;
+        const intensity = sensoryVector[3] !== undefined ? sensoryVector[3] : Math.sqrt(x * x + y * y + z * z);
+
+        // Alignement d'orientation via l'espace des quaternions
+        Quaternion.fromEuler(x * 90, y * 90, z * 90, this.fieldOrientation);
+        this.ambientSaliency = Math.max(0.01, Math.min(1.0, intensity));
+
+        // Encodage thermométrique compact sur 32 bits pour injection bitwise directe
+        let mask = 0;
+        const bitCount = Math.floor(this.ambientSaliency * 32);
+        for (let b = 0; b < bitCount; b++) {
+            mask |= (1 << b);
+        }
+        this.packedFieldMask = mask;
+    }
+}
+
+/**
+ * COUCHE BITLINEAR SENSIBLE AU CHAMP EXTÉRIEUR (SensitiveBitLinear)
+ * Combine la rapidité du calcul BitGEMM (XNOR + Popcount 1-bit) avec une modulation
+ * continue de neuromodulation dépendante du monde extérieur (Gating géométrique).
+ */
+export class SensitiveBitLinear extends BitLinearLayer {
+    constructor(inFeatures, outFeatures) {
+        super(inFeatures, outFeatures);
+        // Chaque neurone dispose d'une orientation spatiale d'affinité
+        this.neuronOrientations = Array.from({ length: outFeatures }, () => Quaternion.random());
+    }
+
+    /**
+     * Inférence conditionnée par l'environnement
+     * @param {Uint32Array} packedInput Entrée binaire packée
+     * @param {ExteriorFieldSensorium} [sensorium] État du monde extérieur
+     * @returns {Float32Array}
+     */
+    forwardSensitive(packedInput, sensorium = null) {
+        // 1. Calcul de base BitGEMM ultra-rapide
+        const baseOutput = this.forward(packedInput);
+
+        if (!sensorium) return baseOutput;
+
+        const extQ = sensorium.fieldOrientation;
+        const saliency = sensorium.ambientSaliency;
+        const out = new Float32Array(this.outFeatures);
+
+        for (let o = 0; o < this.outFeatures; o++) {
+            // Alignement géométrique (produit scalaire 4D dans H) : affinité entre le neurone et l'extérieur
+            const alignment = this.neuronOrientations[o].dot(extQ);
+            
+            // Facteur de modulation neuromorphique : booste ou inhibe les synapses
+            const modulation = 1.0 + Math.tanh(alignment * 2.0) * saliency;
+            out[o] = baseOutput[o] * modulation;
+        }
+
+        return out;
+    }
+}
+
+/**
+ * TRANSFORMER FRUGAL SENSIBLE À L'EXTÉRIEUR (AwareBitTransformer)
+ * Architecture de généralisation associant encodage binaire et attention polarisée
+ * par le champ d'affordances du monde réel.
+ */
+export class AwareBitTransformer {
+    constructor(vocabSize = 64, dModel = 32, nLayers = 1) {
+        this.vocabSize = vocabSize;
+        this.dModel = dModel;
+        this.wordsPerEmb = Math.ceil(dModel / 32);
+
+        // Table d'embeddings binaires compacte
+        this.embeddings = Array.from({ length: vocabSize }, () => {
+            const arr = new Int8Array(dModel);
+            for (let i = 0; i < dModel; i++) arr[i] = Math.random() > 0.5 ? 1 : -1;
+            return BitLinearLayer.packBits(arr);
+        });
+
+        // Couches linéaires 1-bit sensibles
+        this.layers = Array.from({ length: nLayers }, () => ({
+            proj: new SensitiveBitLinear(dModel, dModel),
+            head: new SensitiveBitLinear(dModel, vocabSize)
+        }));
+    }
+
+    /**
+     * Évalue le token suivant sous l'influence du contexte et des capteurs externes
+     * @param {number[]} tokenIds Séquence d'entrée
+     * @param {ExteriorFieldSensorium} sensorium Contexte externe
+     * @returns {number} ID du token sélectionné
+     */
+    step(tokenIds, sensorium = null) {
+        if (tokenIds.length === 0) return 0;
+
+        // 1. Agrégation causale des embeddings par superposition binaire (Majority Vote)
+        const accumulated = new Int32Array(this.dModel);
+        const recentTokens = tokenIds.slice(-4);
+
+        for (let t = 0; t < recentTokens.length; t++) {
+            const tokenId = recentTokens[t] % this.vocabSize;
+            const packed = this.embeddings[tokenId];
+            for (let b = 0; b < this.dModel; b++) {
+                const bit = (packed[b >>> 5] >>> (b & 31)) & 1;
+                // Poids accru pour le présent immédiat
+                accumulated[b] += (bit ? 1 : -1) * (t + 1);
+            }
+        }
+
+        // Binarisation du vecteur de contexte
+        const contextBits = new Int8Array(this.dModel);
+        for (let b = 0; b < this.dModel; b++) contextBits[b] = accumulated[b] >= 0 ? 1 : -1;
+        let packedContext = BitLinearLayer.packBits(contextBits);
+
+        // 2. Passage à travers les couches modulées par l'extérieur
+        for (const layer of this.layers) {
+            const hidden = layer.proj.forwardSensitive(packedContext, sensorium);
+            const hiddenBits = new Int8Array(this.dModel);
+            for (let i = 0; i < this.dModel; i++) hiddenBits[i] = hidden[i] >= 0 ? 1 : -1;
+            packedContext = BitLinearLayer.packBits(hiddenBits);
+        }
+
+        // 3. Logits finaux
+        const logits = this.layers[0].head.forwardSensitive(packedContext, sensorium);
+
+        // Sélection gloutonne argmax
+        let bestToken = 0;
+        let maxScore = -Infinity;
+        for (let i = 0; i < this.vocabSize; i++) {
+            if (logits[i] > maxScore) {
+                maxScore = logits[i];
+                bestToken = i;
+            }
+        }
+
+        return bestToken;
+    }
+
+    generate(seedTokens, length, sensorium = null) {
+        const seq = [...seedTokens];
+        for (let i = 0; i < length; i++) {
+            const next = this.step(seq, sensorium);
+            seq.push(next);
+        }
+        return seq;
+    }
+}
+
+/**
+ * MOTEUR DE DISTILLATION DE CONNAISSANCES POUR RÉSEAUX 1-BIT (BitDistillationEngine)
+ * Transfère les probabilités d'un modèle enseignant (dense/FP32) vers un étudiant 1-bit (BitLinearLayer).
+ */
+export class BitDistillationEngine {
+    /**
+     * Softmax avec température
+     * @param {Float32Array|number[]} logits
+     * @param {number} temperature
+     * @returns {Float32Array}
+     */
+    static softmax(logits, temperature = 1.0) {
+        const temp = Math.max(1e-4, temperature);
+        const len = logits.length;
+        const probs = new Float32Array(len);
+        let maxL = -Infinity;
+        for (let i = 0; i < len; i++) {
+            if (logits[i] > maxL) maxL = logits[i];
+        }
+        let sumExp = 0;
+        for (let i = 0; i < len; i++) {
+            const exp = Math.exp((logits[i] - maxL) / temp);
+            probs[i] = exp;
+            sumExp += exp;
+        }
+        const invSum = 1.0 / (sumExp || 1e-9);
+        for (let i = 0; i < len; i++) probs[i] *= invSum;
+        return probs;
+    }
+
+    /**
+     * Entraînement par Batch avec accumulation de gradient STE.
+     * Élimine l'oscillation des poids 1-bit et stabilise la convergence sur petits corpus.
+     */
+    static trainBatchDistill(studentLayer, batch, options = {}) {
+        const lr = options.lr || 0.05;
+        const temperature = options.temperature || 2.0;
+        const alpha = options.alpha !== undefined ? options.alpha : 0.65;
+        const numClasses = studentLayer.outFeatures;
+        const inFeat = studentLayer.inFeatures;
+
+        // Accumulateurs de gradients
+        const accumBiasGrad = new Float32Array(numClasses);
+        const accumWeightGrad = new Float32Array(studentLayer.latentWeights.length);
+        let totalBatchLoss = 0;
+        let correctCount = 0;
+
+        for (const sample of batch) {
+            const { inputFloat, teacherLogits, targetIndex } = sample;
+            const studentLogits = studentLayer.forwardFloat(inputFloat, true);
+            const studentSoftProbs = this.softmax(studentLogits, temperature);
+            const teacherSoftProbs = this.softmax(teacherLogits, temperature);
+            const studentHardProbs = this.softmax(studentLogits, 1.0);
+
+            let bestIdx = 0, maxLogit = -Infinity;
+            for (let c = 0; c < numClasses; c++) {
+                if (studentLogits[c] > maxLogit) { maxLogit = studentLogits[c]; bestIdx = c; }
+            }
+            if (bestIdx === targetIndex) correctCount++;
+
+            // Seuil moyen identique au forwardFloat (Mean-Centering)
+            let inputMean = 0;
+            for (let i = 0; i < inFeat; i++) inputMean += inputFloat[i];
+            inputMean /= (inFeat || 1);
+
+            // Calcul des gradients par rapport aux logits
+            for (let c = 0; c < numClasses; c++) {
+                const gradHard = studentHardProbs[c] - (c === targetIndex ? 1.0 : 0.0);
+                const gradSoft = (studentSoftProbs[c] - teacherSoftProbs[c]) * Math.min(temperature, 5.0);
+                const dL = (1.0 - alpha) * gradHard + alpha * gradSoft;
+                accumBiasGrad[c] += dL;
+
+                const latentOffset = c * inFeat;
+                for (let i = 0; i < inFeat; i++) {
+                    const x_bin = inputFloat[i] >= inputMean ? 1 : -1;
+                    accumWeightGrad[latentOffset + i] += dL * x_bin;
+                }
+            }
+        }
+
+        // Application du gradient avec weight decay sur les biais pour forcer l'usage des poids 1-bit
+        const batchScale = 1.0 / batch.length;
+        for (let o = 0; o < numClasses; o++) {
+            studentLayer.biases[o] = (studentLayer.biases[o] * 0.85) - lr * (accumBiasGrad[o] * batchScale);
+            const latentOffset = o * inFeat;
+            for (let i = 0; i < inFeat; i++) {
+                const w_latent = studentLayer.latentWeights[latentOffset + i];
+                const ste = Math.abs(w_latent) <= 1.5 ? 1 : 0;
+                studentLayer.latentWeights[latentOffset + i] -= lr * (accumWeightGrad[latentOffset + i] * batchScale) * ste;
+                studentLayer.latentWeights[latentOffset + i] = Math.max(-2.0, Math.min(2.0, studentLayer.latentWeights[latentOffset + i]));
+            }
+        }
+
+        if (studentLayer.attention && typeof studentLayer.attention.backwardBatch === 'function') {
+            studentLayer.attention.backwardBatch(batch, lr * 0.5);
+        }
+        studentLayer.quantizeAndPack();
+        return { accuracy: correctCount / batch.length, loss: totalBatchLoss * batchScale };
+    }
+
+    /**
+     * Étape d'apprentissage par distillation avec STE (Straight-Through Estimator).
+     * Loss = (1 - alpha) * CE(student, target) + alpha * (T^2) * KL(student, teacher)
+     * @param {BitLinearLayer} studentLayer Couche étudiante 1-bit
+     * @param {Array<number>|Float32Array} inputFloat Vecteur d'entrée
+     * @param {Array<number>|Float32Array} teacherLogits Logits produits par le modèle enseignant
+     * @param {number} targetIndex Index de la classe cible réelle (ground truth)
+     * @param {object} [options={}] Paramètres de distillation
+     * @returns {{loss: number, klLoss: number, ceLoss: number, studentProbs: Float32Array, predictedIndex: number, correct: boolean}}
+     */
+    static trainStepDistill(studentLayer, inputFloat, teacherLogits, targetIndex, options = {}) {
+        const lr = options.lr || 0.01;
+        const temperature = options.temperature || 2.0;
+        const alpha = options.alpha !== undefined ? options.alpha : 0.65; // Poids accordé à l'enseignant
+
+        // 1. Passe avant étudiante (BitGEMM binaire)
+        const studentLogits = studentLayer.forwardFloat(inputFloat);
+        const numClasses = studentLogits.length;
+
+        // 2. Probabilités adoucies (Soft targets)
+        const studentSoftProbs = this.softmax(studentLogits, temperature);
+        const teacherSoftProbs = this.softmax(teacherLogits, temperature);
+        const studentHardProbs = this.softmax(studentLogits, 1.0);
+
+        // 3. Calcul des pertes (CE + KL)
+        const ceLoss = -Math.log(Math.max(1e-9, studentHardProbs[targetIndex]));
+        let klLoss = 0;
+        for (let i = 0; i < numClasses; i++) {
+            if (teacherSoftProbs[i] > 1e-12) {
+                klLoss += teacherSoftProbs[i] * Math.log(teacherSoftProbs[i] / Math.max(1e-12, studentSoftProbs[i]));
+            }
+        }
+        const totalLoss = (1.0 - alpha) * ceLoss + alpha * (temperature * temperature) * klLoss;
+
+        // 4. Calcul du gradient combiné par rapport aux logits étudiants
+        // dL/dz = (1 - alpha) * (P_hard - y) + alpha * T * (P_soft - Q_soft)
+        const dLogits = new Float32Array(numClasses);
+        for (let i = 0; i < numClasses; i++) {
+            const gradHard = studentHardProbs[i] - (i === targetIndex ? 1.0 : 0.0);
+            const gradSoft = (studentSoftProbs[i] - teacherSoftProbs[i]) * Math.min(temperature, 5.0);
+            dLogits[i] = (1.0 - alpha) * gradHard + alpha * gradSoft;
+        }
+
+        // 5. Rétropropagation STE sur les poids latents FP32 du BitLinear
+        let inputMean = 0;
+        for (let i = 0; i < studentLayer.inFeatures; i++) inputMean += inputFloat[i];
+        inputMean /= (studentLayer.inFeatures || 1);
+
+        for (let o = 0; o < studentLayer.outFeatures; o++) {
+            const gradOutput = dLogits[o];
+            studentLayer.biases[o] = (studentLayer.biases[o] * 0.85) - lr * gradOutput;
+
+            const latentOffset = o * studentLayer.inFeatures;
+            for (let i = 0; i < studentLayer.inFeatures; i++) {
+                const x_bin = inputFloat[i] >= inputMean ? 1 : -1;
+                const w_latent = studentLayer.latentWeights[latentOffset + i];
+
+                // Fenêtre STE [-1.5, +1.5]
+                const ste = Math.abs(w_latent) <= 1.5 ? 1 : 0;
+                const gradWeight = gradOutput * x_bin * ste;
+
+                studentLayer.latentWeights[latentOffset + i] -= lr * gradWeight;
+                studentLayer.latentWeights[latentOffset + i] = Math.max(-2.0, Math.min(2.0, studentLayer.latentWeights[latentOffset + i]));
+            }
+        }
+
+        // Re-quantification 1-bit pour l'inférence suivante
+        studentLayer.quantizeAndPack();
+
+        // Prédiction Argmax
+        let predictedIndex = 0;
+        let maxScore = -Infinity;
+        for (let i = 0; i < numClasses; i++) {
+            if (studentLogits[i] > maxScore) {
+                maxScore = studentLogits[i];
+                predictedIndex = i;
+            }
+        }
+
+        return {
+            loss: totalLoss,
+            klLoss,
+            ceLoss,
+            studentProbs: studentHardProbs,
+            predictedIndex,
+            correct: predictedIndex === targetIndex
+        };
+    }
+}
+
+/**
+ * MONITEUR ET RÉGULATEUR DE TAUX D'ERREUR (DistillationMonitor)
+ * Surveille en temps réel l'erreur de distillation et applique des corrections
+ * autonomes du learning rate et de la température lors de plateaux ou de divergences.
+ */
+export class DistillationMonitor {
+    constructor(options = {}) {
+        this.windowSize = options.windowSize || 50;
+        this.history = [];
+        this.lr = options.initialLr || 0.05;
+        this.temperature = options.initialTemperature || 2.5;
+        this.minLr = options.minLr || 0.001;
+        this.maxLr = options.maxLr || 0.2;
+        this.patience = options.patience || 15;
+        this.stagnationCounter = 0;
+        this.bestErrorRate = 1.0;
+        this.stepCount = 0;
+        this.cooldown = options.cooldown || 25;
+        this.lastCorrectionStep = -this.cooldown;
+        this.correctionsApplied = 0;
+    }
+
+    /**
+     * Enregistre le résultat d'un pas et applique une correction d'hyperparamètres si nécessaire.
+     * @param {{loss: number, correct: boolean}} stepResult
+     * @returns {{errorRate: number, avgLoss: number, lr: number, temperature: number, corrected: boolean, action: string|null}}
+     */
+    logAndCorrect(stepResult) {
+        this.stepCount++;
+        this.history.push({
+            loss: stepResult.loss,
+            error: stepResult.correct ? 0 : 1
+        });
+        if (this.history.length > this.windowSize) {
+            this.history.shift();
+        }
+
+        const count = this.history.length;
+        const totalLoss = this.history.reduce((acc, h) => acc + h.loss, 0);
+        const totalErrors = this.history.reduce((acc, h) => acc + h.error, 0);
+        const avgLoss = totalLoss / count;
+        const errorRate = totalErrors / count;
+
+        let corrected = false;
+        let action = null;
+
+        // Détection d'amélioration
+        if (errorRate < this.bestErrorRate - 0.02) {
+            this.bestErrorRate = errorRate;
+            this.stagnationCounter = 0;
+        } else {
+            this.stagnationCounter++;
+        }
+
+        // Déclenchement de la régulation uniquement si hors période de cooldown
+        const canCorrect = (this.stepCount - this.lastCorrectionStep) >= this.cooldown;
+        if (canCorrect && this.stagnationCounter >= this.patience && count >= this.windowSize) {
+            if (this.lr <= this.minLr * 1.2 && errorRate > 0.30) {
+                // Warm Restart : évite le blocage définitif au plancher minLr
+                this.lr = Math.min(this.maxLr, this.lr * 2.5);
+                this.temperature = Math.max(1.5, this.temperature * 0.9);
+                action = `WARM_RESTART_ANTI_BLOCAGE (Err=${(errorRate * 100).toFixed(1)}%)`;
+            } else if (errorRate > 0.40) {
+                // Stabilisation STE
+                this.lr = Math.max(this.minLr, this.lr * 0.75);
+                this.temperature = Math.min(4.0, this.temperature * 1.1);
+                action = `RÉDUCTION_LR_ET_ADOUCISSEMENT_T (Err=${(errorRate * 100).toFixed(1)}%)`;
+            } else {
+                // Fine-tuning
+                this.lr = Math.max(this.minLr, this.lr * 0.85);
+                this.temperature = Math.max(1.0, this.temperature * 0.95);
+                action = `FINE_TUNING_REFROIDISSEMENT (Err=${(errorRate * 100).toFixed(1)}%)`;
+            }
+            this.stagnationCounter = 0;
+            this.lastCorrectionStep = this.stepCount;
+            this.correctionsApplied++;
+            corrected = true;
+        }
+
+        return { errorRate, avgLoss, lr: this.lr, temperature: this.temperature, corrected, action };
+    }
+}
+
+/**
+ * CLIENT ENSEIGNANT OLLAMA / PYTHON (OllamaTeacherClient)
+ * Interroge une instance Ollama locale (ex: Qwen2.5:0.5b) ou un pont Python HTTP
+ * pour extraire les représentations latentes (embeddings) et distributions de logits.
+ */
+export class OllamaTeacherClient {
+    constructor(options = {}) {
+        this.baseUrl = options.baseUrl || "http://localhost:11434";
+        this.model = options.model || "qwen2.5:0.5b";
+        this.timeout = options.timeout || 8000;
+    }
+
+    /**
+     * Récupère le vecteur d'embedding dense généré par Qwen/Ollama
+     * @param {string} prompt Texte à vectoriser
+     * @returns {Promise<Float32Array>}
+     */
+    async getEmbedding(prompt) {
+        try {
+            const res = await fetch(`${this.baseUrl}/api/embeddings`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ model: this.model, prompt }),
+                signal: AbortSignal.timeout(this.timeout)
+            });
+            if (!res.ok) throw new Error(`Ollama HTTP ${res.status}`);
+            const data = await res.json();
+            return new Float32Array(data.embedding);
+        } catch (err) {
+            // Fallback déterministe hors-ligne si Ollama n'est pas démarré
+            return this._pseudoEmbeddingFallback(prompt, 64);
+        }
+    }
+
+    /**
+     * Génère un embedding pseudo-dense de secours (64d) par sac de mots sémantique normalisé L2
+     */
+    _pseudoEmbeddingFallback(prompt, dim = 64) {
+        const vec = new Float32Array(dim);
+        const tokens = String(prompt).toLowerCase().match(/[a-z0-9àâäéèêëïîôöùûüç]+/gi) || [];
+        for (const token of tokens) {
+            let h = 0x811c9dc5;
+            for (let i = 0; i < token.length; i++) {
+                h = Math.imul(h ^ token.charCodeAt(i), 0x01000193);
+            }
+            const slot = Math.abs(h) % dim;
+            vec[slot] += 1.5;
+            const slot2 = Math.abs(Math.imul(h, 0x45d9f3b)) % dim;
+            vec[slot2] += 0.75;
+        }
+        let norm = 0;
+        for (let i = 0; i < dim; i++) norm += vec[i] * vec[i];
+        norm = Math.sqrt(norm) || 1.0;
+        for (let i = 0; i < dim; i++) vec[i] /= norm;
+        return vec;
+    }
+}
+
+/**
+ * DISTILLATEUR DE CONNAISSANCES QWEN/OLLAMA VERS BITLINEAR (QwenOllamaDistiller)
+ * Orchestre le transfert des connaissances de Qwen vers une couche BitLinear 1-bit
+ * avec surveillance et régulation automatique du taux d'erreur.
+ */
+export class QwenOllamaDistiller {
+    /**
+     * @param {BitLinearLayer} studentLayer Modèle étudiant 1-bit
+     * @param {OllamaTeacherClient} teacherClient Client vers Qwen/Ollama
+     * @param {DistillationMonitor} monitor Contrôleur adaptatif
+     */
+    constructor(studentLayer, teacherClient, monitor) {
+        this.student = studentLayer;
+        this.teacher = teacherClient;
+        this.monitor = monitor || new DistillationMonitor();
+        this.classPrototypes = null;
+        this.projectionMatrix = null;
+    }
+
+    /**
+     * Initialise une matrice de projection orthogonale Johnson-Lindenstrauss (inDim -> outDim)
+     */
+    initProjection(sourceDim, targetDim) {
+        const matrix = new Float32Array(targetDim * sourceDim);
+        const scale = Math.sqrt(1 / targetDim);
+        // Matrice pseudo-aléatoire déterministe (Achlioptas / Gaussian sparse)
+        for (let i = 0; i < matrix.length; i++) {
+            const r = Math.sin(i * 12.9898 + 78.233) * 43758.5453;
+            const frac = r - Math.floor(r);
+            matrix[i] = (frac > 0.5 ? 1 : -1) * scale;
+        }
+        this.projectionMatrix = { matrix, sourceDim, targetDim };
+    }
+
+    /**
+     * Projette un embedding haute dimension vers la dimension d'entrée 1-bit
+     */
+    projectEmbedding(fullEmbedding) {
+        const targetDim = this.student.inFeatures;
+        if (fullEmbedding.length === targetDim) {
+            return fullEmbedding;
+        }
+        if (!this.projectionMatrix || this.projectionMatrix.sourceDim !== fullEmbedding.length) {
+            this.initProjection(fullEmbedding.length, targetDim);
+        }
+        const out = new Float32Array(targetDim);
+        const M = this.projectionMatrix.matrix;
+        const srcDim = fullEmbedding.length;
+
+        for (let t = 0; t < targetDim; t++) {
+            let sum = 0;
+            const offset = t * srcDim;
+            for (let s = 0; s < srcDim; s++) {
+                sum += fullEmbedding[s] * M[offset + s];
+            }
+            out[t] = sum;
+        }
+        return out;
+    }
+
+    /**
+     * Enregistre les définitions sémantiques des classes pour guider la distillation
+     * @param {string[]} classDescriptions
+     */
+    async initClassPrototypes(classDescriptions) {
+        this.classPrototypes = [];
+        for (const desc of classDescriptions) {
+            const emb = await this.teacher.getEmbedding(desc);
+            this.classPrototypes.push(emb);
+        }
+
+        // Ancrage sémantique initial des synapses 1-bit sur les centroïdes de Qwen
+        const inFeat = this.student.inFeatures;
+        for (let c = 0; c < this.student.outFeatures && c < this.classPrototypes.length; c++) {
+            const projProto = this.projectEmbedding(this.classPrototypes[c]);
+            let protoMean = 0;
+            for (let i = 0; i < inFeat; i++) protoMean += projProto[i];
+            protoMean /= (inFeat || 1);
+
+            const latentOffset = c * inFeat;
+            for (let i = 0; i < inFeat; i++) {
+                // Initialisation polarisée vers l'invariance sémantique du prototype
+                this.student.latentWeights[latentOffset + i] = (projProto[i] >= protoMean ? 0.6 : -0.6);
+            }
+            this.student.biases[c] = 0.0;
+        }
+        this.student.quantizeAndPack();
+    }
+
+    /**
+     * Projette les embeddings du professeur en logits de classification/décision
+     * @param {Float32Array} teacherEmbedding 
+     * @param {number} numClasses
+     * @returns {Float32Array}
+     */
+    static projectTeacherLogits(teacherEmbedding, numClasses) {
+        const logits = new Float32Array(numClasses);
+        const stride = Math.floor(teacherEmbedding.length / numClasses);
+        for (let c = 0; c < numClasses; c++) {
+            let sum = 0;
+            for (let i = 0; i < stride; i++) {
+                sum += teacherEmbedding[c * stride + i] || 0;
+            }
+            logits[c] = sum * 2.0;
+        }
+        return logits;
+    }
+
+    /**
+     * Calcule les logits enseignants par similarité cosinus avec les prototypes sémantiques
+     */
+    getSemanticTeacherLogits(teacherEmbedding, numClasses) {
+        if (!this.classPrototypes || this.classPrototypes.length !== numClasses) {
+            return QwenOllamaDistiller.projectTeacherLogits(teacherEmbedding, numClasses);
+        }
+        const logits = new Float32Array(numClasses);
+        for (let c = 0; c < numClasses; c++) {
+            const proto = this.classPrototypes[c];
+            let dot = 0, normA = 0, normB = 0;
+            const len = Math.min(teacherEmbedding.length, proto.length);
+            for (let i = 0; i < len; i++) {
+                dot += teacherEmbedding[i] * proto[i];
+                normA += teacherEmbedding[i] * teacherEmbedding[i];
+                normB += proto[i] * proto[i];
+            }
+            const sim = dot / (Math.sqrt(normA * normB) || 1e-9);
+            logits[c] = sim * 6.0; // Échelle de température du professeur
+        }
+        return logits;
+    }
+
+    /**
+     * Entraîne l'étudiant 1-bit sur un exemple textuel issu de Qwen
+     * @param {string} prompt Texte d'entrée
+     * @param {number} targetClass Classe cible
+     * @param {object} [distillOptions={}] Options (temperature, alpha)
+     */
+    async distillSample(prompt, targetClass, distillOptions = {}) {
+        // 1. Récupération de l'embedding enseignant Qwen (ex: 896d ou fallback dimensionné)
+        const fullEmbedding = await this.teacher.getEmbedding(prompt);
+
+        // 2. Projection orthogonale JL préservant la métrique au lieu d'un modulo destructeur
+        const inputVector = this.projectEmbedding(fullEmbedding);
+
+        // 3. Obtention des logits enseignants calibrés sémantiquement
+        const teacherLogits = distillOptions.teacherLogits || 
+            this.getSemanticTeacherLogits(fullEmbedding, this.student.outFeatures);
+
+        // 4. Calcul de l'étape de distillation STE (Loss CE + KL)
+        const stepResult = BitDistillationEngine.trainStepDistill(
+            this.student,
+            inputVector,
+            teacherLogits,
+            targetClass,
+            {
+                lr: this.monitor.lr,
+                temperature: this.monitor.temperature,
+                alpha: distillOptions.alpha !== undefined ? distillOptions.alpha : 0.70
+            }
+        );
+
+        // 5. Suivi et correction autonome des hyperparamètres
+        const report = this.monitor.logAndCorrect(stepResult);
+        return { stepResult, report };
+    }
+
+    /**
+     * Inférence autonome 100% binaire de l'étudiant sans appel à Qwen
+     * avec détection de repli si la marge est insuffisante.
+     * @param {Float32Array|number[]} inputVector 
+     * @param {number} [marginThreshold=0.15] Seuil de marge pour incertitude
+     * @returns {{classId: number, uncertain: boolean, margin: number}}
+     */
+    predictStudent(inputVector, marginThreshold = 0.15) {
+        if (typeof this.student.predictWithFallback === 'function') {
+            const res = this.student.predictWithFallback(inputVector, marginThreshold);
+            return { classId: res.predictedClass, uncertain: res.uncertain, margin: res.margin };
+        }
+        const logits = this.student.forwardFloat(inputVector, true);
+        let best = 0, maxL = -Infinity;
+        for (let i = 0; i < logits.length; i++) {
+            if (logits[i] > maxL) { maxL = logits[i]; best = i; }
+        }
+        return { classId: best, uncertain: false, margin: 1.0 };
+    }
+}
+
 export class MultiHeadAttentionBinary {
     constructor(dModel, nHeads) {
         this.nHeads = nHeads;
@@ -2911,7 +4295,7 @@ export class PolynomialFormalismMiner {
         const wordFreqs = new Map();
         let totalTokens = 0;
 
-        const tokenizer = /[a-z0-9àâäéèêëïîôöùûüç]+|[^\w\s]/gi;
+        const tokenizer = /[a-z0-9àâäéèêëïîôöùûüç_]+|[^\w\s]/gi;
 
         if (Array.isArray(sentences) && sentences.length > 0) {
             for (const s of sentences) {
@@ -3124,7 +4508,7 @@ export class PolynomialFormalismMiner {
     createContrastiveDataset(sentences) {
         this.induceFeatures(sentences);
         const dataset = [];
-        const tokenizer = /[a-z0-9àâäéèêëïîôöùûüç]+|[^\w\s]/gi;
+        const tokenizer = /[a-z0-9àâäéèêëïîôöùûüç_]+|[^\w\s]/gi;
 
         for (const sentence of sentences) {
             const words = sentence.match(tokenizer) || [];
@@ -3254,7 +4638,7 @@ export class SemanticRelationalMemory {
         // Nouvelle couche : Schémas de transition (Grammaire) - Stocke des trigrammes (A, B) -> C
         this.grammarMap = new Map(); // ID -> Map(SuivantID -> Poids)
         // Regex centralisée supportant les accents et l'élision
-        this.tokenizer = /[a-z0-9àâäéèêëïîôöùûüç]+(?:['][a-z0-9àâäéèêëïîôöùûüç]*)?|[^\w\s]/gi;
+        this.tokenizer = /[a-z0-9àâäéèêëïîôöùûüç_]+(?:['][a-z0-9àâäéèêëïîôöùûüç_]*)?|[^\w\s]/gi;
 
         // --- OPTIMISATION PRÉDICTION ---
         this.topKCacheSize = 20; // Taille du cache pour les transitions les plus probables

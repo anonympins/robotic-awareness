@@ -3,187 +3,309 @@
 import express from 'express';
 import path from 'node:path';
 import fs from 'node:fs';
-import { GNeuroMoE, SemanticAttentionLayer } from "./neuro-lib.js";
+import * as neuro from './neuro-lib.js';
+import { Optimization } from './problemSolver/library.js';
 
 const app = express();
 const port = process.env.PORT || 7701;
-// Augmentation de la limite pour permettre l'envoi de textes longs (ex: articles complets)
-// DOIT être placé AVANT la définition des routes qui l'utilisent.
 app.use(express.json({ limit: '10mb' }));
-const EXPERTS_DIR = "./experts_chunks/";
 
-if (!fs.existsSync(EXPERTS_DIR)) fs.mkdirSync(EXPERTS_DIR);
+const MODEL_DIR = './formal_model/';
+const BRAIN_FILE = path.join(MODEL_DIR, 'formal_brain.gnr');
+const RULES_FILE = path.join(MODEL_DIR, 'formal_rules.json');
+const BITGEMM_FILE = path.join(MODEL_DIR, 'bitgemm_model.json');
+const TOKENIZER_FILE = path.join(MODEL_DIR, 'adaptive_tokenizer.json');
+const tokenizer = /[a-z0-9àâäéèêëïîôöùûüç_]+|[^\w\s]/gi;
+const WINDOW_SIZE = 4;
+const TOKEN_BITS = 12;
 
-// Orchestrateur Mixture of Experts
-const moe = new GNeuroMoE(16);
-const attention = new SemanticAttentionLayer();
-let coreBrain = null; // Variable pour stocker l'expert grammatical de base
+if (!fs.existsSync(MODEL_DIR)) fs.mkdirSync(MODEL_DIR, { recursive: true });
 
-// Charger l'état global pour le routage et le vocabulaire dès le démarrage
-moe.loadSharedState(`${EXPERTS_DIR}shared_state.gnr`);
-console.log(`\x1b[2m[MoE] Vocabulaire partagé initialisé avec ${moe.sharedState.vocabulary.size} tokens.\x1b[0m`);
+const INITIAL_SEED_CORPUS = [
+    "les astronomes observent les galaxies lointaines avec des télescopes géants.",
+    "la théorie scientifique explique les phénomènes physiques de manière rationnelle.",
+    "ces animaux sauvages traversent les forêts denses pendant la nuit.",
+    "les chercheurs découvrent de nouvelles lois mathématiques fondamentales.",
+    "un grand nombre de citoyens participent activement aux débats démocratiques.",
+    "cette nouvelle technologie transforme profondément les communications modernes."
+];
 
-// --- CORRECTIF : Pré-chargement de tous les experts au démarrage ---
-console.log("\x1b[2m[MoE] Pré-chargement des chunks d'experts existants...\x1b[0m");
-const expertFiles = fs.readdirSync(EXPERTS_DIR).filter(f => f.startsWith('expert_') && f.endsWith('.gnr'));
-for (const file of expertFiles) {
-    const domain = file.replace('expert_', '').replace('.gnr', '');
-    const expert = moe.getExpert(domain); // Crée ou récupère l'instance
-    const expertPath = path.join(EXPERTS_DIR, file);
-    
-    console.log(`  > Chargement de la grammaire pour '${domain}'...`);
-    try {
-        expert.importBinary(fs.readFileSync(expertPath));
-        expert.hasBeenLoaded = true; // Marque comme chargé pour éviter une relecture
-    } catch (e) {
-            console.error(`\x1b[31m  > Échec du chargement pour '${domain}': ${e.message}\x1b[0m`);
-    }
-}
-console.log("\x1b[2m[MoE] Pré-chargement terminé.\x1b[0m");
+let brain = new neuro.SemanticRelationalMemory(8);
+let miner = new neuro.PolynomialFormalismMiner(brain, WINDOW_SIZE, TOKEN_BITS);
+let formalGrammar = null;
+const initialVocab = ["les", "la", "le", "des", "un", "une", "dans", "avec", "pour", "<eos>"];
+let bitLM = new neuro.BitGenerativeLM(initialVocab, 64, 4);
+let adaptiveTokenizer = new neuro.AdaptiveMergeTokenizer({ mergeThreshold: 5, maxVocabSize: 4096 });
 
-/**
- * Récupère un expert et charge son état binaire si nécessaire
- * La fonction est maintenant asynchrone pour ne pas bloquer le serveur.
- */
+function loadOrInitModel() {
+    console.log("\x1b[36m[Formal Server]\x1b[0m Initialisation des modèles BitGEMM & Polynôme...");
 
-// On récupère l'expert 'core' une seule fois au démarrage pour le fallback
-coreBrain = moe.getCoreExpert();
-// --- CORRECTIF : S'assurer que le cache de fallback du coreBrain est peuplé ---
-if (coreBrain) {
-    coreBrain._updateFrequentWordsCache();
-}
-
-async function getExpertForContent(text) {
-    const domain = moe.route(text);
-    const brain = moe.getExpert(domain);
-    const path = `${EXPERTS_DIR}expert_${domain}.gnr`;
-
-    // Le chargement se fait maintenant au démarrage, mais on garde cette vérification
-    // au cas où un nouvel expert serait créé pendant que le serveur tourne.
-    if (!brain.hasBeenLoaded && fs.existsSync(path)) {
-        console.log(`\x1b[2m[MoE] Chargement binaire de l'expert : ${domain}\x1b[0m`);
-        const data = await fs.promises.readFile(path);
-        brain.importBinary(data); // Utilisation de importBinary
-        brain.hasBeenLoaded = true;
-    }
-    // Statistiques de mémorisation de l'expert
-    const vocabSize = brain.vocabulary.size;
-    const grammarSize = brain.grammarMap.size;
-    const totalTokens = brain.sharedState ? brain.sharedState.totalTokensProcessed : (brain.totalTokensProcessed || 0);
-    
-    console.log(`\x1b[2m[DEBUG] Expert [${domain}]: Vocab=${vocabSize}, Transitions=${grammarSize}, Tokens vus=${totalTokens}\x1b[0m`);
-
-    // Analyse de la compréhension du prompt
-    const tokens = text.toLowerCase().match(brain.tokenizer) || [];
-    const known = tokens.filter(t => brain.vocabulary.has(t)).length;
-    if (tokens.length > 0) {
-        const ratio = (known / tokens.length * 100).toFixed(0);
-        console.log(`\x1b[2m[DEBUG] Compréhension du prompt: ${known}/${tokens.length} mots connus (${ratio}%)\x1b[0m`);
+    // 0. Tokenizer adaptatif
+    if (fs.existsSync(TOKENIZER_FILE)) {
+        try {
+            adaptiveTokenizer.importState(JSON.parse(fs.readFileSync(TOKENIZER_FILE, 'utf8')));
+            console.log(`  🔤 Tokenizer adaptatif chargé (${adaptiveTokenizer.merges.size} fusions).`);
+        } catch (e) {
+            console.warn(`  ⚠️ Échec chargement Tokenizer: ${e.message}`);
+        }
     }
 
-    // On attache l'attention ici, juste avant l'utilisation
-    brain.attachAttention(attention);
+    // 1. Modèle 1-bit BitGEMM
+    if (fs.existsSync(BITGEMM_FILE)) {
+        try {
+            bitLM.importState(JSON.parse(fs.readFileSync(BITGEMM_FILE, 'utf8')));
+            console.log(`  ⚡ Modèle BitGEMM 1-bit chargé (${bitLM.vocabSize} tokens).`);
+        } catch (e) {
+            console.warn(`  ⚠️ Échec chargement BitGEMM: ${e.message}`);
+        }
+    }
 
-    return { brain, domain, path };
+    // 2. Mémoire sémantique
+    if (fs.existsSync(BRAIN_FILE)) {
+        try {
+            brain.importBinary(fs.readFileSync(BRAIN_FILE));
+            console.log(`  📁 Mémoire sémantique chargée (${brain.vocabulary.size} tokens).`);
+        } catch (e) {
+            console.warn(`  ⚠️ Échec chargement brain binaire: ${e.message}`);
+        }
+    } else {
+        INITIAL_SEED_CORPUS.forEach(s => brain.learnSense(s, true, 2));
+    }
+
+    miner = new neuro.PolynomialFormalismMiner(brain, WINDOW_SIZE, TOKEN_BITS);
+
+    if (fs.existsSync(RULES_FILE)) {
+        try {
+            const raw = JSON.parse(fs.readFileSync(RULES_FILE, 'utf8'));
+            const neuron = new neuro.PolynomialPlusPlusNeuron(raw.terms, raw.threshold);
+            formalGrammar = {
+                neuron,
+                threshold: raw.threshold,
+                accuracy: raw.accuracy || 1.0,
+                terms: raw.terms,
+                decodedRules: raw.decodedRules || { rules: [] }
+            };
+            console.log(`  📜 Invariants polynomiaux chargés (seuil: ${raw.threshold}, termes: ${raw.terms?.length}).`);
+        } catch (e) {
+            console.warn(`  ⚠️ Échec lecture invariants json: ${e.message}`);
+        }
+    }
+
+    if (!formalGrammar) {
+        console.log("  🧬 Entraînement initial d'invariants polynomiaux par défaut...");
+        const discovery = miner.discoverFormalGrammar(INITIAL_SEED_CORPUS, Optimization, {
+            generations: 40,
+            populationSize: 40,
+            maxTerms: 8
+        });
+        formalGrammar = discovery;
+        saveModel();
+    }
 }
 
+function saveModel() {
+    fs.writeFileSync(BITGEMM_FILE, JSON.stringify(bitLM.exportState(), null, 2));
+    fs.writeFileSync(TOKENIZER_FILE, JSON.stringify(adaptiveTokenizer.exportState(), null, 2));
+    fs.writeFileSync(BRAIN_FILE, brain.exportBinary());
+    if (formalGrammar) {
+        const payload = {
+            threshold: formalGrammar.threshold,
+            accuracy: formalGrammar.accuracy,
+            terms: formalGrammar.terms,
+            decodedRules: formalGrammar.decodedRules,
+            updatedAt: new Date().toISOString()
+        };
+        fs.writeFileSync(RULES_FILE, JSON.stringify(payload, null, 2));
+    }
+}
 
-/**
- * Endpoint pour interroger le cerveau (similaire à query-brain.js).
- * Attend un prompt et renvoie la prédiction sémantique.
- */
+function generateGuidedSentence(prompt, targetLength = 10, creativity = 0.15, topK = 12) {
+    const tokens = adaptiveTokenizer.tokenize(prompt);
+    if (tokens.length === 0) tokens.push('les');
+    const generated = [...tokens];
+    const threshold = formalGrammar.threshold;
+    const neuron = formalGrammar.neuron;
+    let lastPolyScore = threshold;
+
+    for (let step = 0; step < targetLength; step++) {
+        const currentContext = generated.join(' ');
+        const candidates = brain.predictNextCandidates(currentContext, { topK, creativity });
+        if (!candidates || candidates.length === 0) break;
+
+        let bestCandidate = null;
+        let bestCompositeScore = -Infinity;
+        let selectedScore = threshold;
+
+        for (const cand of candidates) {
+            if (cand.token === '<eos>' && generated.length < tokens.length + 2) continue;
+
+            const testWindow = [...generated.slice(-(WINDOW_SIZE - 1)), cand.token];
+            while (testWindow.length < WINDOW_SIZE) testWindow.unshift(testWindow[0] || 'les');
+
+            const testVec = miner.encodeSequence(testWindow);
+            const polyScore = neuron.evaluateScore(testVec);
+            const isHarmonic = polyScore >= threshold;
+
+            const harmonicBonus = isHarmonic ? (polyScore - threshold + 1) * 3.0 : -10.0;
+            const compositeScore = cand.score + harmonicBonus;
+
+            if (compositeScore > bestCompositeScore) {
+                bestCompositeScore = compositeScore;
+                bestCandidate = cand.token;
+                selectedScore = polyScore;
+            }
+        }
+
+        if (!bestCandidate || bestCandidate === '<eos>') break;
+        generated.push(bestCandidate);
+        lastPolyScore = selectedScore;
+
+        if (['.', '!', '?'].includes(bestCandidate) && generated.length >= tokens.length + 3) {
+            break;
+        }
+    }
+
+    const textResult = brain._intelligentlyJoinTokens(generated);
+    const continuation = generated.slice(tokens.length);
+    return {
+        full_result: textResult,
+        prediction: brain._intelligentlyJoinTokens(continuation),
+        polyScore: lastPolyScore,
+        isHarmonic: lastPolyScore >= threshold
+    };
+}
+
+loadOrInitModel();
+
 app.post('/query', async (req, res) => {
-    // Augmentation des valeurs par défaut pour favoriser le probabilisme
-    // creativity: 0.15 permet une variation notable sans perdre le sens
-    // topK: 5 permet de choisir parmi les 5 meilleures options de manière pondérée
-    const { prompt, depth = 150, creativity = 0.15, topK = 10 } = req.body;
+    const { prompt, depth = 10, creativity = 0.15, topK = 12, mode = "hybrid" } = req.body;
 
     if (!prompt || typeof prompt !== 'string' || prompt.trim().length === 0) {
         return res.status(400).json({ error: "Prompt invalide." });
     }
 
     try {
-        // Le routage initial sert principalement à l'analyse et aux logs.
-        // L'expert sélectionné sera le principal responsable de la génération.
-        const { brain: expert, domain } = await getExpertForContent(prompt);
-        console.log(`\x1b[36m[API QUERY]\x1b[0m Domaine principal détecté: ${domain.toUpperCase()}`);
-        
-        // --- NOUVELLE LOGIQUE : Utilisation directe de `predictSense` ---
-        // C'est la méthode de génération la plus avancée, qui gère les schémas,
-        // la recherche par faisceaux, et une fusion complexe des signaux.
-        const prediction = expert.predictSense(prompt, depth, {
-            creativity: creativity,
-            topK: topK,
-            coreBrain: coreBrain // Fournit le cerveau de base comme filet de sécurité
-        });
+        const cleanPrompt = prompt.trim();
+        const bitgemmText = bitLM.generateSentence(cleanPrompt, depth, 0.0, adaptiveTokenizer);
 
-        if (!prediction || prediction.trim().length === 0) {
-            console.log("\x1b[33m[!] Alerte : La réponse générée est vide.\x1b[0m");
+        if (mode === "bitgemm") {
+            return res.json({
+                success: true,
+                mode: "1-bit-autonomous",
+                full_result: bitgemmText
+            });
         }
+
+        const outcome = generateGuidedSentence(prompt.trim(), depth, creativity, topK);
 
         res.json({
             success: true,
-            domain: domain,
             prompt: prompt,
-            prediction: prediction,
-            full_result: `${prompt} ${prediction}`
+            prediction: outcome.prediction,
+            full_result: outcome.full_result,
+            detokenized_result: adaptiveTokenizer.detokenize(outcome.full_result.split(' ')),
+            bitgemm_inference: bitgemmText,
+            polynomial_validation: {
+                score: outcome.polyScore,
+                threshold: formalGrammar.threshold,
+                valid: outcome.isHarmonic
+            }
         });
     } catch (err) {
         console.error("\x1b[31m[API ERROR]\x1b[0m", err.message);
-        res.status(500).json({ error: "Erreur lors de la génération de la réponse." });
+        res.status(500).json({ error: "Erreur lors de la génération polynomiale." });
     }
 });
 
-/**
- * Endpoint public pour l'ingestion de données textuelles.
- * Utilise learnWithSpecialization de GNeuroMoE pour le découpage en phrases et l'apprentissage pondéré.
- */
 app.post('/ingest', async (req, res) => {
-    // Ajout d'un poids secondaire pour l'apprentissage contextuel
-    const { text, weight = 1.0, secondary_weight = 0.1 } = req.body;
+    const { text, weight = 1.0, lr = 0.03, retrain_grammar = false } = req.body;
 
     if (!text || typeof text !== 'string' || text.trim().length < 5) {
         return res.status(400).json({ error: "Contenu textuel invalide ou trop court (min 5 chars)." });
     }
 
     try {
-        // --- LOGIQUE D'APPRENTISSAGE CENTRALISÉE ---
-        const { report, modifiedExperts, sentences, initialVocabSizes } = moe.learnWithSpecialization(text, {
-            weight,
-            secondary_weight
-        });
-
+        const sentences = text.split(/(?<=[.!?])\s+/).map(s => s.trim()).filter(s => s.length >= 8);
         if (sentences.length === 0) {
             return res.status(400).json({ error: "Aucune phrase valide à ingérer." });
         }
 
-        // Persistance de tous les experts modifiés
-        for (const domain of modifiedExperts) {
-            const expert = moe.experts.get(domain);
-            if (!expert) continue;
+        let newMerges = 0;
+        let totalLoss = 0;
+        let totalAcc = 0;
 
-            const expertPath = path.join(EXPERTS_DIR, `expert_${domain}.gnr`);
-            fs.writeFileSync(expertPath, expert.exportBinary());
-            
-            const expertReport = report[domain];
-            expertReport.new_tokens = expert.vocabulary.size - (initialVocabSizes.get(domain) || expert.vocabulary.size);
-            console.log(`\x1b[32m[API]\x1b[0m Ingestion [${domain}] : ${expertReport.sentences} phrases, +${expertReport.new_tokens} tokens.`);
+        for (const s of sentences) {
+            // 1. Tokenisation avec fusions adaptatives
+            const tokens = adaptiveTokenizer.ingestAndTokenize(s, (mergedToken) => {
+                newMerges++;
+                bitLM.addWord(mergedToken);
+            });
+
+            // 2. Entraînement symbolique sur les super-tokens
+            brain.learnSense(tokens.join(' '), false, weight);
+
+            // 3. Entraînement 1-bit autorégressif sur les tokens compactés
+            const r = bitLM.trainTokens(tokens, lr);
+            totalLoss += r.avgLoss;
+            totalAcc += r.accuracy;
         }
+
+        miner.induceFeatures(sentences);
+
+        if (retrain_grammar && sentences.length >= 4) {
+            formalGrammar = miner.discoverFormalGrammar(sentences, Optimization, {
+                generations: 40,
+                populationSize: 40,
+                maxTerms: 8
+            });
+        }
+
+        saveModel();
 
         res.json({
             success: true,
             ingested_sentences: sentences.length,
-            report: report,
-            total_vocabulary: moe.sharedState.vocabulary.size
+            symbolic_vocabulary: brain.vocabulary.size,
+            tokenizer_merges: adaptiveTokenizer.merges.size,
+            new_merges: newMerges,
+            bitgemm: {
+                vocabSize: bitLM.vocabSize,
+                avgLoss: (totalLoss / sentences.length).toFixed(3),
+                top1Accuracy: `${((totalAcc / sentences.length) * 100).toFixed(1)}%`
+            },
+            grammar_threshold: formalGrammar.threshold,
+            grammar_rules_count: formalGrammar.decodedRules?.rules?.length || 0
         });
     } catch (err) {
         console.error("\x1b[31m[API ERROR]\x1b[0m", err.message);
-        res.status(500).json({ error: "Erreur interne lors de l'apprentissage neuronal." });
+        res.status(500).json({ error: "Erreur interne lors de l'apprentissage." });
     }
 });
 
+app.get('/invariants', (req, res) => {
+    res.json({
+        threshold: formalGrammar?.threshold,
+        accuracy: formalGrammar?.accuracy,
+        rules: formalGrammar?.decodedRules?.rules || []
+    });
+});
+
+app.get('/status', (req, res) => {
+    res.json({
+        bitgemm_vocab: bitLM.vocabSize,
+        tokenizer_merges: adaptiveTokenizer.merges.size,
+        symbolic_vocab: brain.vocabulary.size,
+        bitgemm_file_bytes: fs.existsSync(BITGEMM_FILE) ? fs.statSync(BITGEMM_FILE).size : 0,
+        grammar_rules: formalGrammar?.decodedRules?.rules?.length || 0,
+        threshold: formalGrammar?.threshold
+    });
+});
+
 app.listen(port, () => {
-    console.log(`\n\x1b[35m=== G-NEURO API SERVER ===\x1b[0m`);
-    console.log(`Statut : Opérationnel sur http://localhost:${port}`);
-    console.log(`Usage  : POST /ingest { "text": "..." }\n`);
+    console.log(`\n\x1b[35m=== BITGEMM & POLYNOMIAL FORMALISM API SERVER ===\x1b[0m`);
+    console.log(`📡 Écoute sur http://localhost:${port}`);
+    console.log(`👉 POST /query   { "prompt": "les étoiles" }`);
+    console.log(`👉 POST /ingest  { "text": "...", "retrain_grammar": false }`);
+    console.log(`👉 GET  /status`);
+    console.log(`👉 GET  /invariants\n`);
 });
