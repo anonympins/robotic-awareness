@@ -2054,7 +2054,7 @@ export class BitLinearLayer {
 
         for (let o = 0; o < this.outFeatures; o++) {
             const grad = probs[o] - (o === targetClassIdx ? 1.0 : 0.0);
-            this.biases[o] = (this.biases[o] * 0.98) - lr * grad * this.outputScale;
+            this.biases[o] = (this.biases[o] * 0.9995) - lr * grad * this.outputScale;
 
             const latentOffset = o * this.inFeatures;
             for (let i = 0; i < this.inFeatures; i++) {
@@ -2258,12 +2258,16 @@ export class BitGenerativeLM {
     encodeWord(word, out = new Float32Array(this.contextDim)) {
         out.fill(0);
         const clean = String(word).toLowerCase();
-        let h = 0x811c9dc5;
+        let h1 = 0x811c9dc5;
+        let h2 = 0xdeadbeef;
         for (let i = 0; i < clean.length; i++) {
-            h = Math.imul(h ^ clean.charCodeAt(i), 0x01000193);
+            const c = clean.charCodeAt(i);
+            h1 = Math.imul(h1 ^ c, 0x01000193);
+            h2 = Math.imul(h2 ^ c, 0x27d4eb2d);
         }
         for (let d = 0; d < this.contextDim; d++) {
-            out[d] = (((h >>> (d % 31)) & 1) === 1) ? 1.0 : -1.0;
+            const h = d < 32 ? h1 : h2;
+            out[d] = (((h >>> (d & 31)) & 1) === 1) ? 1.0 : -1.0;
         }
         return out;
     }
@@ -2285,7 +2289,7 @@ export class BitGenerativeLM {
         return vec;
     }
 
-    predictNextWord(contextTokens, temperature = 0.0, allowEos = true) {
+    predictNextWord(contextTokens, temperature = 0.0, allowEos = true, repetitionPenalty = 1.25) {
         const inputVector = this.buildContextVector(contextTokens);
         const logits = this.classifier.forwardFloat(inputVector, true);
 
@@ -2293,8 +2297,22 @@ export class BitGenerativeLM {
             logits[this.wordToId.get("<eos>")] = -Infinity;
         }
 
+        // Pénalité de répétition pour éviter les boucles locales
+        if (repetitionPenalty > 1.0 && Array.isArray(contextTokens)) {
+            const recent = contextTokens.slice(-6);
+            const decay = Math.max(1.1, repetitionPenalty);
+            for (const t of recent) {
+                const id = this.wordToId.get(t);
+                if (id !== undefined) {
+                    logits[id] -= 3.0; // Pénalité additive directe sur les logits 1-bit
+                    if (logits[id] > 0) logits[id] /= repetitionPenalty;
+                    else logits[id] *= repetitionPenalty;
+                }
+            }
+        }
+
         if (temperature > 0.05) {
-            const probs = BitDistillationEngine.softmax(logits, temperature);
+            const probs = BitDistillationEngine.softmax(logits, Math.max(0.2, temperature));
             let rand = Math.random();
             let accum = 0;
             for (let i = 0; i < probs.length; i++) {
@@ -2406,7 +2424,7 @@ export class BitGenerativeLM {
     /**
      * Génère une phrase complète mot après mot à partir d'une amorce
      */
-    generateSentence(seedPrompt, maxWords = 12, temperature = 0.0, tokenizer = null) {
+    generateSentence(seedPrompt, maxWords = 12, temperature = 0.0, tokenizer = null, repetitionPenalty = 1.25) {
         let tokens;
         if (Array.isArray(seedPrompt)) {
             tokens = [...seedPrompt];
@@ -2419,7 +2437,7 @@ export class BitGenerativeLM {
 
         for (let i = 0; i < maxWords; i++) {
             const allowEos = i >= 2;
-            const next = this.predictNextWord(generated, temperature, allowEos);
+            const next = this.predictNextWord(generated, temperature, allowEos, repetitionPenalty);
             if (next === "<eos>" || next === "." || next === "!") {
                 break;
             }

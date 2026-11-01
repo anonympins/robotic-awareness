@@ -4,6 +4,7 @@ import fs from 'node:fs';
 
 const STORAGE_PATH = "./semantic_brain_storage.json";
 const STATS_FILE = "./training_stats.json";
+const BUFFER_FILE = "./books_buffer.json";
 const CORPUS_FILE = "./training_corpus.txt";
 const MAX_REQ_PER_DAY = 1000;
 const API_KEY = "98a15debbamshe9df2d2d7110b0dp1a3943jsnf572cde81f13";
@@ -171,5 +172,85 @@ export async function runBookTraining() {
         console.log("\x1b[32m[Books] État de la mémoire littéraire sauvegardé.\x1b[0m");
     } catch (err) {
         console.error("\x1b[31m[Books] Erreur cycle :\x1b[0m", err.message);
+    }
+}
+
+function loadBuffer() {
+    if (!fs.existsSync(BUFFER_FILE)) return [];
+    try {
+        return JSON.parse(fs.readFileSync(BUFFER_FILE, 'utf8'));
+    } catch (_) {
+        return [];
+    }
+}
+
+function saveBuffer(buffer) {
+    try {
+        fs.writeFileSync(BUFFER_FILE, JSON.stringify(buffer), 'utf8');
+    } catch (e) {
+        console.warn("[Books] Erreur écriture buffer:", e.message);
+    }
+}
+
+export async function getBatchFromBooks(targetCount = 10) {
+    // 1. Priorité au réservoir local déjà téléchargé
+    let buffer = loadBuffer();
+    if (buffer.length >= targetCount) {
+        const batch = buffer.splice(0, targetCount);
+        saveBuffer(buffer);
+        console.log(`📚 [Books] ${batch.length} phrases extraites du buffer local (${buffer.length} restantes en réserve).`);
+        return batch;
+    }
+
+    const stats = getDailyStats();
+    if (stats.count >= MAX_REQ_PER_DAY) {
+        return [];
+    }
+
+    const keywords = ["Victor Hugo", "Jules Verne", "Emile Zola", "Maupassant", "Gustave Flaubert", "Alexandre Dumas", "Baudelaire", "Marcel Proust", "Moliere", "Voltaire", "Rousseau"];
+    const query = keywords[Math.floor(Math.random() * keywords.length)];
+    const tokenizer = /[a-z0-9àâäéèêëïîôöùûüç_]+|[^\w\s]/gi;
+
+    try {
+        const searchResponse = await fetchFromRapidAPI(`/books?search=${encodeURIComponent(query)}&page=1&limit=10`);
+        const books = searchResponse?.results || [];
+        if (books.length === 0) return [];
+
+        const randomBook = books[Math.floor(Math.random() * books.length)];
+        const textData = await fetchFromRapidAPI(`/books/${randomBook.id}/text?cleaning_mode=simple`);
+        const rawText = textData.text || textData.content || "";
+        if (rawText.length < 100) return [];
+
+        const cleanBookText = rawText
+            .replace(/<script\b[^>]*>([\s\S]*?)<\/script>/gim, "")
+            .replace(/<style\b[^>]*>([\s\S]*?)<\/style>/gim, "");
+
+        try {
+            const fileStats = await fs.promises.stat(CORPUS_FILE).catch(() => ({ size: 0 }));
+            if (fileStats.size < 1024 * 1024 * 1024) {
+                await fs.promises.appendFile(CORPUS_FILE, `${randomBook.title}\n${cleanBookText}\n\n`, 'utf-8');
+            }
+        } catch (_) {}
+
+        const rawSentences = cleanBookText.split(/(?<=[.!?])\s+/);
+        const newSentences = [];
+        for (const raw of rawSentences) {
+            const s = raw.replace(/[’']/g, "'").replace(/\s+/g, ' ').trim().toLowerCase();
+            const words = s.match(tokenizer) || [];
+            if (words.length >= 5 && words.length <= 30 && /[a-zàâäéèêëïîôöùûüç]/i.test(s)) {
+                newSentences.push(s);
+            }
+        }
+
+        if (newSentences.length > 0) {
+            buffer.push(...newSentences);
+            console.log(`📚 [Books] "${randomBook.title}" : ${newSentences.length} phrases ajoutées au buffer.`);
+            const batch = buffer.splice(0, targetCount);
+            saveBuffer(buffer);
+            return batch;
+        }
+
+    } catch (e) {
+        return [];
     }
 }

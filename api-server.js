@@ -119,8 +119,59 @@ function saveModel() {
     }
 }
 
-function generateGuidedSentence(prompt, targetLength = 10, creativity = 0.15, topK = 12) {
-    const tokens = adaptiveTokenizer.tokenize(prompt);
+/**
+ * Échantillonnage stochastique selon la loi de probabilités (Softmax + Top-P / Nucleus)
+ */
+function sampleProbabilisticCandidate(scoredCandidates, temperature = 0.7, topP = 0.9, repetitionPenalty = 1.2, recentTokens = []) {
+    if (scoredCandidates.length === 0) return null;
+    if (temperature <= 0.08) {
+        // Mode déterministe (Argmax strict)
+        return scoredCandidates.reduce((best, cur) => cur.score > best.score ? cur : best, scoredCandidates[0]);
+    }
+
+    // Application de la pénalité de présence / répétition sur les logits
+    const penalizedCandidates = scoredCandidates.map(c => {
+        let adjustedScore = c.score;
+        const occurrences = recentTokens.filter(t => t.toLowerCase() === c.token.toLowerCase()).length;
+        if (occurrences > 0) {
+            adjustedScore = adjustedScore > 0 
+                ? adjustedScore / Math.pow(repetitionPenalty, occurrences)
+                : adjustedScore * Math.pow(repetitionPenalty, occurrences);
+        }
+        return { ...c, score: adjustedScore };
+    });
+
+    // Stabilisation numérique Softmax
+    const maxScore = Math.max(...penalizedCandidates.map(c => c.score));
+    const exps = penalizedCandidates.map(c => Math.exp((c.score - maxScore) / Math.max(0.1, temperature)));
+    const sumExp = exps.reduce((acc, v) => acc + v, 0);
+    const probs = exps.map(v => v / (sumExp || 1e-9));
+
+    // Tri décroissant pour le filtrage Nucleus (Top-P)
+    const items = penalizedCandidates.map((c, i) => ({ ...c, prob: probs[i] }));
+    items.sort((a, b) => b.prob - a.prob);
+
+    let cumulative = 0;
+    const nucleus = [];
+    for (const item of items) {
+        nucleus.push(item);
+        cumulative += item.prob;
+        if (cumulative >= topP) break;
+    }
+
+    // Tirage selon la loi multinomiale sur le noyau probabiliste
+    const nucleusSum = nucleus.reduce((acc, it) => acc + it.prob, 0);
+    const rand = Math.random() * nucleusSum;
+    let running = 0;
+    for (const item of nucleus) {
+        running += item.prob;
+        if (rand <= running) return item;
+    }
+    return nucleus[nucleus.length - 1];
+}
+
+function generateGuidedSentence(prompt, targetLength = 10, temperature = 0.7, topK = 12, topP = 0.9, repetitionPenalty = 1.3) {
+    const tokens = adaptiveTokenizer.tokenize(prompt.toLowerCase());
     if (tokens.length === 0) tokens.push('les');
     const generated = [...tokens];
     const threshold = formalGrammar.threshold;
@@ -129,14 +180,13 @@ function generateGuidedSentence(prompt, targetLength = 10, creativity = 0.15, to
 
     for (let step = 0; step < targetLength; step++) {
         const currentContext = generated.join(' ');
-        const candidates = brain.predictNextCandidates(currentContext, { topK, creativity });
+        const candidates = brain.predictNextCandidates(currentContext, { topK, creativity: temperature });
         if (!candidates || candidates.length === 0) break;
 
-        let bestCandidate = null;
-        let bestCompositeScore = -Infinity;
-        let selectedScore = threshold;
+        const scoredCandidates = [];
 
         for (const cand of candidates) {
+            // Éviter une fermeture immédiate ou les tokens parasites
             if (cand.token === '<eos>' && generated.length < tokens.length + 2) continue;
 
             const testWindow = [...generated.slice(-(WINDOW_SIZE - 1)), cand.token];
@@ -146,21 +196,32 @@ function generateGuidedSentence(prompt, targetLength = 10, creativity = 0.15, to
             const polyScore = neuron.evaluateScore(testVec);
             const isHarmonic = polyScore >= threshold;
 
-            const harmonicBonus = isHarmonic ? (polyScore - threshold + 1) * 3.0 : -10.0;
+            // Guidage progressif borné plutôt qu'un malus destructeur de -10.0
+            const delta = polyScore - threshold;
+            const harmonicBonus = isHarmonic 
+                ? Math.min(3.0, (delta + 0.5) * 1.5) 
+                : Math.max(-2.5, delta * 1.5);
             const compositeScore = cand.score + harmonicBonus;
 
-            if (compositeScore > bestCompositeScore) {
-                bestCompositeScore = compositeScore;
-                bestCandidate = cand.token;
-                selectedScore = polyScore;
-            }
+            scoredCandidates.push({
+                token: cand.token,
+                score: compositeScore,
+                polyScore,
+                isHarmonic
+            });
         }
 
-        if (!bestCandidate || bestCandidate === '<eos>') break;
-        generated.push(bestCandidate);
-        lastPolyScore = selectedScore;
+        // Échantillonnage stochastique avec fenêtre glissante de pénalité de répétition
+        const recent = generated.slice(-6);
+        const picked = sampleProbabilisticCandidate(scoredCandidates, temperature, topP, repetitionPenalty, recent);
+        if (!picked) break;
+        if (picked.token === '<eos>' && generated.length >= tokens.length + 2) break;
+        if (picked.token === '<eos>') continue;
 
-        if (['.', '!', '?'].includes(bestCandidate) && generated.length >= tokens.length + 3) {
+        generated.push(picked.token);
+        lastPolyScore = picked.polyScore;
+
+        if (['.', '!', '?'].includes(picked.token) && generated.length >= tokens.length + 3) {
             break;
         }
     }
@@ -178,15 +239,18 @@ function generateGuidedSentence(prompt, targetLength = 10, creativity = 0.15, to
 loadOrInitModel();
 
 app.post('/query', async (req, res) => {
-    const { prompt, depth = 10, creativity = 0.15, topK = 12, mode = "hybrid" } = req.body;
+    const { prompt, depth = 10, creativity = 0.35, temperature = null, topK = 12, topP = 0.9, repetition_penalty = 1.3, mode = "hybrid" } = req.body;
 
     if (!prompt || typeof prompt !== 'string' || prompt.trim().length === 0) {
         return res.status(400).json({ error: "Prompt invalide." });
     }
 
     try {
-        const cleanPrompt = prompt.trim();
-        const bitgemmText = bitLM.generateSentence(cleanPrompt, depth, 0.0, adaptiveTokenizer);
+        const cleanPrompt = prompt.trim().toLowerCase();
+        // Température effective pour l'échantillonnage de Boltzmann / Softmax
+        const effectiveTemp = temperature !== null ? Math.max(0.1, parseFloat(temperature)) : Math.max(0.4, parseFloat(creativity) * 2.0);
+        
+        const bitgemmText = bitLM.generateSentence(cleanPrompt, depth, effectiveTemp, adaptiveTokenizer, parseFloat(repetition_penalty));
 
         if (mode === "bitgemm") {
             return res.json({
@@ -196,7 +260,7 @@ app.post('/query', async (req, res) => {
             });
         }
 
-        const outcome = generateGuidedSentence(prompt.trim(), depth, creativity, topK);
+        const outcome = generateGuidedSentence(cleanPrompt, depth, effectiveTemp, topK, topP, parseFloat(repetition_penalty));
 
         res.json({
             success: true,

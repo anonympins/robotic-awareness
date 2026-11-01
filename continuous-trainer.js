@@ -10,6 +10,8 @@
 import * as neuro from './neuro-lib.js';
 import { Optimization } from './problemSolver/library.js';
 import { scrapeRandomWikipediaContent } from './wikipedia-scraper.js';
+import { getBatchFromBooks } from './train-books.js';
+import { getBatchFromRobert } from './train-le-robert.js';
 import fs from 'node:fs';
 import path from 'node:path';
 
@@ -21,9 +23,7 @@ const TOKENIZER_FILE = path.join(MODEL_DIR, 'adaptive_tokenizer.json');
 const CORPUS_PATH = './training_corpus.txt';
 
 const tokenizer = /[a-z0-9àâäéèêëïîôöùûüç_]+|[^\w\s]/gi;
-const WINDOW_SIZE = 4;
 const TOKEN_BITS = 12;
-const CONTEXT_DIM = 64;
 let adaptiveTokenizer = null;
 let localCorpusCursor = 0;
 
@@ -47,6 +47,8 @@ function extractCleanSentences(blocks, minWords = 5) {
                 .replace(/\[\d+\]/g, '')
                 .replace(/\(.*?\)/g, '')
                 .replace(/["«»]/g, '')
+                .replace(/[-–—]?\s*modifier(?:\s+le\s+code)?/gi, '')
+                .replace(/\b(?:voir aussi|liens externes|articles connexes|notes et références)\b/gi, '')
                 .replace(/\s+/g, ' ')
                 .trim();
 
@@ -103,9 +105,51 @@ async function getBatchFromWikipedia(targetCount = 12) {
     return sentences;
 }
 
+async function getMultiSourceBatch(cycleIndex, targetCount = 12, forceSource = 'books') {
+    const primarySource = forceSource || 'books';
+
+    let sentences = [];
+    if (primarySource === 'books') {
+        console.log("📚 [Source : Gutenberg Books] Récupération d'œuvres littéraires...");
+        sentences = await getBatchFromBooks(targetCount);
+    } else if (primarySource === 'robert') {
+        console.log("📖 [Source : Le Robert] Récupération de données linguistiques...");
+        sentences = await getBatchFromRobert(targetCount);
+    } else {
+        console.log("🌐 [Source : Wikipédia] Récupération encyclopédique...");
+        sentences = await getBatchFromWikipedia(targetCount);
+    }
+
+    if (sentences.length === 0) {
+        console.log("⚠️ Repli sur les phrases de secours locales.");
+        sentences.push(...FALLBACK_SENTENCES);
+    }
+    return sentences;
+}
+
+// File d'attente pour le préchargement asynchrone en arrière-plan
+const batchPrefetchQueue = [];
+let isPrefetching = false;
+
+async function replenishPrefetchBuffer(cycleIndex, forceSource, targetCount = 10, minBuffered = 3) {
+    if (isPrefetching || batchPrefetchQueue.length >= minBuffered) return;
+    isPrefetching = true;
+    try {
+        while (batchPrefetchQueue.length < minBuffered) {
+            const batch = await getMultiSourceBatch(cycleIndex + batchPrefetchQueue.length, targetCount, forceSource);
+            batchPrefetchQueue.push(batch);
+        }
+    } catch (e) {
+        // En cas d'erreur réseau, la boucle d'entraînement gérera le repli
+    } finally {
+        isPrefetching = false;
+    }
+}
+
 function generateSample(brain, miner, neuron, threshold, prompt, adaptiveTokenizer = null) {
     const tokens = adaptiveTokenizer ? adaptiveTokenizer.tokenize(prompt) : (prompt.match(tokenizer) || ['les']);
     if (tokens.length === 0) tokens.push('les');
+    const windowSize = miner?.windowSize || 4;
     const generated = [...tokens];
 
     for (let step = 0; step < 10; step++) {
@@ -119,13 +163,19 @@ function generateSample(brain, miner, neuron, threshold, prompt, adaptiveTokeniz
         for (const cand of candidates) {
             if (cand.token === '<eos>' && generated.length < tokens.length + 2) continue;
 
-            const testWindow = [...generated.slice(-(WINDOW_SIZE - 1)), cand.token];
-            while (testWindow.length < WINDOW_SIZE) testWindow.unshift(testWindow[0] || 'les');
+            // Pénalité de répétition pour éviter les boucles attractrices
+            const recentTokens = generated.slice(-6);
+            const repeatCount = recentTokens.filter(t => t === cand.token).length;
+            let repetitionPenalty = repeatCount > 0 ? repeatCount * 8.0 : 0.0;
+            if (generated[generated.length - 1] === cand.token) repetitionPenalty += 15.0;
+
+            const testWindow = [...generated.slice(-(windowSize - 1)), cand.token];
+            while (testWindow.length < windowSize) testWindow.unshift(testWindow[0] || 'les');
 
             const testVec = miner.encodeSequence(testWindow);
             const polyScore = neuron.evaluateScore(testVec);
             const isHarmonic = polyScore >= threshold;
-            const score = cand.score + (isHarmonic ? (polyScore - threshold + 1) * 3.0 : -10.0);
+            const score = cand.score - repetitionPenalty + (isHarmonic ? (polyScore - threshold + 1) * 3.0 : -10.0);
 
             if (score > bestScore) {
                 bestScore = score;
@@ -148,15 +198,57 @@ async function main() {
     const isOffline = args.includes('--offline');
     const cyclesArg = args.find(a => a.startsWith('--cycles='));
     const lrArg = args.find(a => a.startsWith('--lr='));
+    const delayArg = args.find(a => a.startsWith('--delay='));
+    const sourceArg = args.find(a => a.startsWith('--source='));
+    const epochsArg = args.find(a => a.startsWith('--epochs='));
+    const batchSizeArg = args.find(a => a.startsWith('--batch-size='));
+    const contextDimArg = args.find(a => a.startsWith('--context-dim='));
+    const grammarIntervalArg = args.find(a => a.startsWith('--grammar-interval='));
+    const mergeThresholdArg = args.find(a => a.startsWith('--merge-threshold='));
+    const maxVocabArg = args.find(a => a.startsWith('--max-vocab='));
+    const windowSizeArg = args.find(a => a.startsWith('--window-size='));
+    const tempArg = args.find(a => a.startsWith('--temp='));
+    const profileArg = args.find(a => a.startsWith('--profile='));
+    const forceSource = sourceArg ? sourceArg.split('=')[1].toLowerCase() : 'books';
+
+    // Profils Pareto pré-calibrés
+    let defaultLR = 0.03;
+    let defaultEpochs = 3;
+    let defaultBatchSize = 10;
+    let defaultContextDim = 64;
+    let defaultMergeThreshold = 5;
+    let defaultGrammarInterval = 10;
+
+    if (profileArg) {
+        const prof = profileArg.split('=')[1].toLowerCase();
+        if (prof === 'fast') {
+            defaultLR = 0.055; defaultEpochs = 1; defaultBatchSize = 6; defaultGrammarInterval = 16;
+        } else if (prof === 'quality') {
+            defaultLR = 0.022; defaultEpochs = 4; defaultBatchSize = 14; defaultGrammarInterval = 6; defaultContextDim = 96;
+        } else if (prof === 'balanced') {
+            defaultLR = 0.035; defaultEpochs = 2; defaultBatchSize = 10; defaultGrammarInterval = 10;
+        }
+        console.log(`[PARETO] Profil sélectionné: "${prof}" (LR: ${defaultLR}, Epochs: ${defaultEpochs}, Batch: ${defaultBatchSize}, Gram. Interval: ${defaultGrammarInterval})`);
+    }
 
     const maxCycles = cyclesArg ? parseInt(cyclesArg.split('=')[1], 10) : (isTestMode ? 3 : Infinity);
-    const learningRate = lrArg ? parseFloat(lrArg.split('=')[1]) : 0.03;
+    const learningRate = lrArg ? parseFloat(lrArg.split('=')[1]) : defaultLR;
+    const localEpochs = epochsArg ? parseInt(epochsArg.split('=')[1], 10) : defaultEpochs;
+    const batchTargetCount = batchSizeArg ? parseInt(batchSizeArg.split('=')[1], 10) : defaultBatchSize;
+    const contextDim = contextDimArg ? parseInt(contextDimArg.split('=')[1], 10) : defaultContextDim;
+    const grammarInterval = grammarIntervalArg ? parseInt(grammarIntervalArg.split('=')[1], 10) : defaultGrammarInterval;
+    const mergeThreshold = mergeThresholdArg ? parseInt(mergeThresholdArg.split('=')[1], 10) : defaultMergeThreshold;
+    const maxVocabSize = maxVocabArg ? parseInt(maxVocabArg.split('=')[1], 10) : 4096;
+    const windowSize = windowSizeArg ? parseInt(windowSizeArg.split('=')[1], 10) : 4;
+    const genTemperature = tempArg ? parseFloat(tempArg.split('=')[1]) : 0.0;
+    const cycleDelay = delayArg ? parseInt(delayArg.split('=')[1], 10) : 0;
 
     console.log("\x1b[35m=== ENTRAÎNEUR CONTINU : BITGEMM 1-BIT & NEURO-SYMBOLIQUE ===\x1b[0m");
+    console.log(`[CONFIG] LR: ${learningRate} | Epochs: ${localEpochs} | Batch: ${batchTargetCount} | Dim: ${contextDim} | Fenêtre: ${windowSize}`);
     if (!fs.existsSync(MODEL_DIR)) fs.mkdirSync(MODEL_DIR, { recursive: true });
 
     // 0. Tokenizer adaptatif à fusion progressive
-    adaptiveTokenizer = new neuro.AdaptiveMergeTokenizer({ mergeThreshold: 5, maxVocabSize: 4096 });
+    adaptiveTokenizer = new neuro.AdaptiveMergeTokenizer({ mergeThreshold, maxVocabSize });
     if (fs.existsSync(TOKENIZER_FILE)) {
         try {
             adaptiveTokenizer.importState(JSON.parse(fs.readFileSync(TOKENIZER_FILE, 'utf8')));
@@ -168,7 +260,7 @@ async function main() {
 
     // 1. Initialisation du modèle de langage 1-bit
     const initialVocab = ["les", "la", "le", "des", "un", "une", "dans", "avec", "pour", "<eos>"];
-    const bitLM = new neuro.BitGenerativeLM(initialVocab, CONTEXT_DIM, 4);
+    const bitLM = new neuro.BitGenerativeLM(initialVocab, contextDim, 4);
     if (fs.existsSync(BITGEMM_FILE)) {
         try {
             bitLM.importState(JSON.parse(fs.readFileSync(BITGEMM_FILE, 'utf8')));
@@ -189,7 +281,7 @@ async function main() {
         }
     }
 
-    const miner = new neuro.PolynomialFormalismMiner(brain, WINDOW_SIZE, TOKEN_BITS);
+    const miner = new neuro.PolynomialFormalismMiner(brain, windowSize, TOKEN_BITS);
     let formalGrammar = null;
     if (fs.existsSync(RULES_FILE)) {
         try {
@@ -210,6 +302,11 @@ async function main() {
     let cycleCount = 1;
     const memoryBufferSentences = [];
 
+    // Démarrage du préchargement en arrière-plan
+    if (!isOffline && !useLocal) {
+        replenishPrefetchBuffer(cycleCount, forceSource, batchTargetCount);
+    }
+
     while (true) {
         console.log(`\n\x1b[7m CYCLE #${cycleCount} \x1b[0m (BitGEMM Vocab: ${bitLM.vocabSize} | Merges: ${adaptiveTokenizer.merges.size} | Symbol Vocab: ${brain.vocabulary.size})`);
         let batch = [];
@@ -217,15 +314,22 @@ async function main() {
         try {
             if (isOffline) {
                 batch = [...FALLBACK_SENTENCES];
+                console.log("📴 [Source : Hors-ligne] Utilisation des phrases de secours.");
             } else if (useLocal) {
                 const res = await getBatchFromLocalCorpus(1024 * 64);
                 batch = res.sentences;
+                console.log(`📁 [Source : Corpus local] Ingestion de ${batch.length} phrases.`);
                 if (res.done) {
-                    console.log("🔄 Fin du corpus local. Bascule en mode web.");
+                    console.log("🔄 Fin du corpus local. Bascule en mode web multi-sources.");
                     useLocal = false;
                 }
             } else {
-                batch = await getBatchFromWikipedia(10);
+                if (batchPrefetchQueue.length > 0) {
+                    batch = batchPrefetchQueue.shift();
+                } else {
+                    batch = await getMultiSourceBatch(cycleCount - 1, batchTargetCount, forceSource);
+                }
+                replenishPrefetchBuffer(cycleCount, forceSource, batchTargetCount);
             }
 
             if (batch.length > 0) {
@@ -234,6 +338,7 @@ async function main() {
                 let totalLoss = 0;
                 let totalAcc = 0;
                 let totalSteps = 0;
+                const preTokenizedBatch = [];
 
                 for (const sentence of batch) {
                     // Ingestion adaptative : les bigrammes récurrents fusionnent en super-tokens
@@ -244,13 +349,12 @@ async function main() {
 
                     // Entraînement symbolique avec les super-tokens
                     brain.learnSense(tokens.join(' '), true, 2);
+                    preTokenizedBatch.push(tokens);
                 }
 
-                // Consolidation multi-passes (3 époques locales) pour stabiliser le gradient STE 1-bit
-                const localEpochs = 3;
+                // Consolidation multi-passes pour stabiliser le gradient STE 1-bit
                 for (let ep = 0; ep < localEpochs; ep++) {
-                    for (const sentence of batch) {
-                        const tokens = adaptiveTokenizer.tokenize(sentence);
+                    for (const tokens of preTokenizedBatch) {
                         const r = bitLM.trainTokens(tokens, learningRate);
                         if (ep === localEpochs - 1) {
                             totalLoss += r.avgLoss;
@@ -271,8 +375,8 @@ async function main() {
                 }
             }
 
-            // Rafraîchissement des lois polynomiales tous les 3 cycles
-            if (cycleCount % 3 === 0 && memoryBufferSentences.length >= 8) {
+            // Rafraîchissement des lois polynomiales selon la fréquence Pareto
+            if (cycleCount % grammarInterval === 0 && memoryBufferSentences.length >= 8) {
                 console.log("🧬 Découverte / Affinage des invariants algébriques...");
                 formalGrammar = miner.discoverFormalGrammar(memoryBufferSentences, Optimization, {
                     generations: 45,
@@ -286,24 +390,29 @@ async function main() {
                 }
             }
 
-            // Sauvegarde continue des poids 1-bit et des graphes symboliques
-            fs.writeFileSync(BITGEMM_FILE, JSON.stringify(bitLM.exportState(), null, 2));
-            fs.writeFileSync(TOKENIZER_FILE, JSON.stringify(adaptiveTokenizer.exportState(), null, 2));
-            fs.writeFileSync(BRAIN_FILE, brain.exportBinary());
-            if (formalGrammar) {
-                fs.writeFileSync(RULES_FILE, JSON.stringify({
+            // Sauvegarde périodique (tous les 5 cycles ou au dernier cycle) sans bloquer les I/O
+            const isSaveCycle = (cycleCount % 5 === 0) || (cycleCount >= maxCycles);
+            if (isSaveCycle) {
+                const saves = [
+                    fs.promises.writeFile(BITGEMM_FILE, JSON.stringify(bitLM.exportState())),
+                    fs.promises.writeFile(TOKENIZER_FILE, JSON.stringify(adaptiveTokenizer.exportState())),
+                    fs.promises.writeFile(BRAIN_FILE, brain.exportBinary())
+                ];
+                if (formalGrammar) saves.push(fs.promises.writeFile(RULES_FILE, JSON.stringify({
                     threshold: formalGrammar.threshold,
                     accuracy: formalGrammar.accuracy,
                     terms: formalGrammar.terms,
                     decodedRules: formalGrammar.decodedRules,
                     updatedAt: new Date().toISOString()
-                }, null, 2));
+                })));
+                // Enregistrement non-bloquant
+                Promise.all(saves).catch(e => console.warn("Erreur sauvegarde asynchrone:", e.message));
             }
 
             // Génération autorégressive en direct (Inférence BitGEMM 100% binaire)
             const matchedTokens = adaptiveTokenizer.tokenize(batch[0] || FALLBACK_SENTENCES[0]);
             const seedPrompt = matchedTokens.slice(0, 2).join(' ');
-            const bitGenerated = bitLM.generateSentence(seedPrompt, 10, 0.0, adaptiveTokenizer);
+            const bitGenerated = bitLM.generateSentence(seedPrompt, 10, genTemperature, adaptiveTokenizer);
             console.log(`🤖 Génération 1-Bit (BitGEMM) : "${bitGenerated}"`);
             console.log(`   (Décodé sans '_')         : "${adaptiveTokenizer.detokenize(bitGenerated.split(' '))}"`);
 
@@ -328,7 +437,7 @@ async function main() {
 
         cycleCount++;
         if (!isTestMode) {
-            await new Promise(r => setTimeout(r, 2000));
+            await new Promise(r => setTimeout(r, cycleDelay));
         }
     }
 }

@@ -95,3 +95,80 @@ export async function runRobertTraining(moe) {
     }
     console.log(`\x1b[33m[WARN] Impossible de récupérer une page valide du Robert après ${MAX_ATTEMPTS} tentatives. Cycle sauté.\x1b[0m`);
 }
+
+export async function getBatchFromRobert(targetCount = 10) {
+    const tokenizer = /[a-z0-9àâäéèêëïîôöùûüç_]+|[^\w\s]/gi;
+    let attempts = 0;
+    const maxAttempts = 2;
+
+    while (attempts < maxAttempts) {
+        attempts++;
+        try {
+            const page = await getRandomRobertPage();
+            if (!page || !page.content) {
+                await new Promise(r => setTimeout(r, 600));
+                continue;
+            }
+
+            const { title, content: htmlContent } = page;
+            const content = htmlContent
+                .replace(/<script\b[^>]*>([\s\S]*?)<\/script>/gim, "")
+                .replace(/<style\b[^>]*>([\s\S]*?)<\/style>/gim, "")
+                .replace(/<[^>]*>?/gm, '');
+
+            const cleanContent = content
+                .replace(/Le Robert|Dico en ligne|Découvrir|Abonnement|Boutique|Le Robert Correcteur/gi, '')
+                .replace(/Guide de la langue française|Définitions|Synonymes|Conjugaison/gi, '')
+                .replace(/Paramétrer les cookies|Tous droits réservés|Contact|Mentions légales/gi, '')
+                .replace(/\s+/g, ' ')
+                .trim();
+
+            if (cleanContent.length < 100) continue;
+
+            try {
+                const stats = await stat(TRAINING_CORPUS_PATH).catch(() => ({ size: 0 }));
+                if (stats.size < 1024 * 1024 * 1024) {
+                    await appendFile(TRAINING_CORPUS_PATH, `${title}\n${cleanContent}\n\n`, 'utf-8');
+                }
+            } catch (_) {}
+
+            const rawSentences = cleanContent.split(/(?<=[.!?])\s+/);
+            const sentences = [];
+            for (const raw of rawSentences) {
+                const s = raw.trim().toLowerCase();
+                const words = s.match(tokenizer) || [];
+                if (words.length >= 5 && words.length <= 30 && /[a-zàâäéèêëïîôöùûüç]/i.test(s)) {
+                    sentences.push(s);
+                }
+                if (sentences.length >= targetCount) break;
+            }
+
+            if (sentences.length > 0) return sentences;
+        } catch (e) {
+            // tentative suivante
+        }
+    }
+
+    // Repli de secours : extraction depuis le corpus linguistique déjà constitué
+    try {
+        if (fs.existsSync(TRAINING_CORPUS_PATH)) {
+            const raw = await fs.promises.readFile(TRAINING_CORPUS_PATH, 'utf-8');
+            const lines = raw.split(/(?<=[.!?])\s+/);
+            const localSentences = [];
+            const start = lines.length > targetCount * 2
+                ? Math.floor(Math.random() * (lines.length - targetCount))
+                : 0;
+
+            for (let i = start; i < lines.length && localSentences.length < targetCount; i++) {
+                const s = lines[i].replace(/\s+/g, ' ').trim().toLowerCase();
+                const words = s.match(tokenizer) || [];
+                if (words.length >= 5 && words.length <= 30 && /[a-zàâäéèêëïîôöùûüç]/i.test(s)) {
+                    localSentences.push(s);
+                }
+            }
+            if (localSentences.length > 0) return localSentences;
+        }
+    } catch (_) {}
+
+    return [];
+}
