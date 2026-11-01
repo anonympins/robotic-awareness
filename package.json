@@ -21,7 +21,7 @@
   "author": "G-Neuro Team",
   "license": "MIT",
   "dependencies": {
-    "express": "^4.18.2",
+    "express": "^4.22.3",
     "jimp": "^1.6.1"
   },
   "engines": {
