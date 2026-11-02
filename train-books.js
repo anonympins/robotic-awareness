@@ -10,6 +10,57 @@ const MAX_REQ_PER_DAY = 1000;
 const API_KEY = "98a15debbamshe9df2d2d7110b0dp1a3943jsnf572cde81f13";
 const API_HOST = "project-gutenberg-free-books-api1.p.rapidapi.com";
 
+const NOVEL_AUTHORS = [
+    "Jules Verne",
+    "Emile Zola",
+    "Alexandre Dumas",
+    "Victor Hugo",
+    "Gustave Flaubert",
+    "Guy de Maupassant",
+    "Honore de Balzac",
+    "Stendhal",
+    "Gaston Leroux",
+    "Maurice Leblanc",
+    "George Sand",
+    "Alphonse Daudet"
+];
+
+// Détection stricte des résidus bibliques (versets, abréviations de livres, généalogies)
+const BIBLICAL_GARBLED_REGEX = /(\[?\s*_\d+_\s*\]?|\b\d+_[a-z]|\b[iIvVxX]+_(?:sam|reis|chr|cor|tim|pedro|joao|thess)\b|\b(?:samuel|david|saul|jerusalem|israel|judah|ephraim|levitas?|filhos?_de|gerou_?a?|amminadab|onam|peleth|arphaxad|sephi|merari|joab|elias|salomao)\b)/i;
+
+// Mots caractéristiques du portugais / espagnol à exclure
+const FOREIGN_PORTUGUESE_REGEX = /\b(não|pães|mão|porém|estava|estavam|foram|tinha|tinham|minha|meu|teu|tua|disse|disseram|então|filho|filhos|filha|rei|reis|casa|pelo|pela|dos|das|aos|seus|suas|dele|deles|dela|delas|você|também|quando|muito|eram|está|estão|são|senão|ainda|depois|onde|mesmo|outro|outra|outros)\b/i;
+
+// Mots français de base obligatoires pour garantir un texte littéraire français
+const FRENCH_STOPWORDS = /\b(le|la|les|un|une|des|du|de|ce|cette|ces|mon|ton|son|sa|ses|notre|votre|leur|leurs|il|elle|ils|elles|nous|vous|on|qui|que|quoi|dont|où|dans|sur|avec|pour|par|sans|sous|mais|ou|et|donc|or|ni|car|est|sont|était|étaient|fut|a|ont|avait|faire|fait)\b/i;
+
+export function isGarbageOrBiblical(text = "") {
+    if (!text || text.length < 10) return true;
+    if (BIBLICAL_GARBLED_REGEX.test(text)) return true;
+    if (FOREIGN_PORTUGUESE_REGEX.test(text)) return true;
+    if (!FRENCH_STOPWORDS.test(text)) return true; // Rejette tout ce qui n'est pas du français
+
+    // Trop de chiffres ou de crochets/tirets bas
+    const digitCount = (text.match(/\d/g) || []).length;
+    if (digitCount > 4 || digitCount / text.length > 0.15) return true;
+    const underscoreCount = (text.match(/_/g) || []).length;
+    if (underscoreCount > 3) return true;
+
+    return false;
+}
+
+function sanitizeNovelSentence(raw = "") {
+    return raw
+        .replace(/\[\s*_\d+_?\s*\]/g, "")
+        .replace(/\[\d+\]/g, "")
+        .replace(/_\w+_/g, (m) => m.replace(/_/g, ""))
+        .replace(/\b\d+_[a-z]\b/gi, "")
+        .replace(/[’']/g, "'")
+        .replace(/\s+/g, " ")
+        .trim()
+        .toLowerCase();
+}
+
 function getDailyStats() {
     const today = new Date().toISOString().split('T')[0];
     if (!fs.existsSync(STATS_FILE)) return { date: today, count: 0 };
@@ -76,8 +127,7 @@ export async function runBookTraining() {
         brain.importState(JSON.parse(fs.readFileSync(STORAGE_PATH, 'utf8')));
     }
 
-    const keywords = ["Shakespeare", "Plato", "Dante", "Tolstoy", "Twain", "Homer", "History", "Philosophy"];
-    let query = keywords[Math.floor(Math.random() * keywords.length)];
+    let query = `roman ${NOVEL_AUTHORS[Math.floor(Math.random() * NOVEL_AUTHORS.length)]}`;
 
     let currentPage = 1;
     let totalPages = 1; // Sera mis à jour après le premier appel de recherche
@@ -98,7 +148,10 @@ export async function runBookTraining() {
             console.log(`\x1b[34m[Books]\x1b[0m Chargement de la page ${currentPage}/${totalPages} pour "${query}"...`);
             // 1. Recherche par mot-clé avec pagination
             const searchResponse = await fetchFromRapidAPI(`/books?search=${encodeURIComponent(query)}&page=${currentPage}&limit=${pageSize}`);
-            const booksOnPage = searchResponse?.results || [];
+            const booksOnPage = (searchResponse?.results || []).filter(book => {
+                const title = book.title || "";
+                return !isGarbageOrBiblical(title);
+            });
             totalPages = searchResponse?.totalPages || 1; // Met à jour le nombre total de pages
 
             if (booksOnPage.length === 0) {
@@ -144,6 +197,8 @@ export async function runBookTraining() {
                     .map(s => s.trim())
                     .filter(s => {
                         if (s.length < 3) return false;
+                        const clean = sanitizeNovelSentence(s);
+                        if (isGarbageOrBiblical(clean)) return false;
                         const tokens = s.match(brain.tokenizer) || [];
                         return tokens.length >= 2;
                     });
@@ -178,7 +233,15 @@ export async function runBookTraining() {
 function loadBuffer() {
     if (!fs.existsSync(BUFFER_FILE)) return [];
     try {
-        return JSON.parse(fs.readFileSync(BUFFER_FILE, 'utf8'));
+        const raw = JSON.parse(fs.readFileSync(BUFFER_FILE, 'utf8'));
+        if (!Array.isArray(raw)) return [];
+        const cleaned = raw.map(sanitizeNovelSentence).filter(s => !isGarbageOrBiblical(s));
+        // Si le buffer était corrompu par la Bible portugaise, on le purge immédiatement
+        if (raw.length > 0 && cleaned.length / raw.length < 0.5) {
+            console.log("\x1b[33m🧹 [Books] Purge du buffer pollué par les versets / textes étrangers.\x1b[0m");
+            saveBuffer(cleaned);
+        }
+        return cleaned;
     } catch (_) {
         return [];
     }
@@ -207,13 +270,16 @@ export async function getBatchFromBooks(targetCount = 10) {
         return [];
     }
 
-    const keywords = ["Victor Hugo", "Jules Verne", "Emile Zola", "Maupassant", "Gustave Flaubert", "Alexandre Dumas", "Baudelaire", "Marcel Proust", "Moliere", "Voltaire", "Rousseau"];
-    const query = keywords[Math.floor(Math.random() * keywords.length)];
+    const author = NOVEL_AUTHORS[Math.floor(Math.random() * NOVEL_AUTHORS.length)];
+    const query = `roman ${author}`;
     const tokenizer = /[a-z0-9àâäéèêëïîôöùûüç_]+|[^\w\s]/gi;
 
     try {
         const searchResponse = await fetchFromRapidAPI(`/books?search=${encodeURIComponent(query)}&page=1&limit=10`);
-        const books = searchResponse?.results || [];
+        const books = (searchResponse?.results || []).filter(book => {
+            const title = book.title || "";
+            return !isGarbageOrBiblical(title);
+        });
         if (books.length === 0) return [];
 
         const randomBook = books[Math.floor(Math.random() * books.length)];
@@ -235,9 +301,9 @@ export async function getBatchFromBooks(targetCount = 10) {
         const rawSentences = cleanBookText.split(/(?<=[.!?])\s+/);
         const newSentences = [];
         for (const raw of rawSentences) {
-            const s = raw.replace(/[’']/g, "'").replace(/\s+/g, ' ').trim().toLowerCase();
+            const s = sanitizeNovelSentence(raw);
             const words = s.match(tokenizer) || [];
-            if (words.length >= 5 && words.length <= 30 && /[a-zàâäéèêëïîôöùûüç]/i.test(s)) {
+            if (words.length >= 5 && words.length <= 30 && !isGarbageOrBiblical(s)) {
                 newSentences.push(s);
             }
         }

@@ -782,6 +782,49 @@ const Optimization = {
     },
 
     /**
+     * Version asynchrone du Recuit Simulé pour les évaluateurs I/O (appels API, fetch, etc.).
+     * @template TSolution
+     * @param {TSolution} initialSolution
+     * @param {function(TSolution): Promise<number>} evaluatorAsync - Fonction async retournant l'énergie à minimiser.
+     * @param {function(TSolution): TSolution} neighbor - Générateur de solution voisine.
+     * @param {number} [initialTemperature=100]
+     * @param {number} [coolingRate=0.88]
+     * @param {number} [maxIterations=12]
+     * @returns {Promise<{solution: TSolution, energy: number}>}
+     */
+    async simulatedAnnealingAsync(
+        initialSolution,
+        evaluatorAsync,
+        neighbor,
+        initialTemperature = 100,
+        coolingRate = 0.88,
+        maxIterations = 12
+    ) {
+        let currentSolution = initialSolution;
+        let currentEnergy = await evaluatorAsync(currentSolution);
+        let bestSolution = currentSolution;
+        let bestEnergy = currentEnergy;
+        let temperature = initialTemperature;
+
+        for (let i = 0; i < maxIterations; i++) {
+            const newSolution = neighbor(currentSolution);
+            const newEnergy = await evaluatorAsync(newSolution);
+            const acceptanceProbability = Math.exp((currentEnergy - newEnergy) / Math.max(1e-9, temperature));
+
+            if (newEnergy < currentEnergy || Math.random() < acceptanceProbability) {
+                currentSolution = newSolution;
+                currentEnergy = newEnergy;
+            }
+            if (currentEnergy < bestEnergy) {
+                bestSolution = currentSolution;
+                bestEnergy = currentEnergy;
+            }
+            temperature *= coolingRate;
+        }
+        return { solution: bestSolution, energy: bestEnergy };
+    },
+
+    /**
      * Résout un problème d'optimisation en utilisant un Algorithme Génétique.
      * Idéal pour les problèmes complexes où l'espace de recherche est vaste et non-linéaire.
      * @template TChromosome - Le type de la solution (un "chromosome").
