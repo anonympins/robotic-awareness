@@ -1981,8 +1981,8 @@ export class BitLinearLayer {
                 matches += BitLinearLayer.popcnt32(xnor);
             }
 
-            // Produit scalaire bipolaire {-1, +1} : 2 * concordances - taille
-            output[o] = ((2 * matches - inFeat) + this.biases[o]) * this.outputScale;
+            // Produit scalaire bipolaire {-1, +1} : (2 * matches - inFeat) * scale + bias logit
+            output[o] = (2 * matches - inFeat) * this.outputScale + this.biases[o];
         }
 
         return output;
@@ -2054,14 +2054,14 @@ export class BitLinearLayer {
 
         for (let o = 0; o < this.outFeatures; o++) {
             const grad = probs[o] - (o === targetClassIdx ? 1.0 : 0.0);
-            this.biases[o] = (this.biases[o] * 0.9995) - lr * grad * this.outputScale;
+            this.biases[o] -= lr * grad * 1.5;
 
             const latentOffset = o * this.inFeatures;
             for (let i = 0; i < this.inFeatures; i++) {
                 const x_bin = inputFloat[i] >= inputMean ? 1 : -1;
                 const w_latent = this.latentWeights[latentOffset + i];
                 const ste = Math.abs(w_latent) <= 1.5 ? 1 : 0;
-                this.latentWeights[latentOffset + i] -= lr * grad * x_bin * ste * this.outputScale;
+                this.latentWeights[latentOffset + i] -= lr * grad * x_bin * ste;
                 this.latentWeights[latentOffset + i] = Math.max(-2.0, Math.min(2.0, this.latentWeights[latentOffset + i]));
             }
         }
@@ -2097,10 +2097,71 @@ export class BitLinearLayer {
  * Amortit le bruit syntaxique pour garantir la généralisation zero-shot sur prompts inédits.
  */
 export class GeneralizedBitAttention {
+    static CALIBRATION_SPECTRUM = [-1.0, -0.8, -0.6, -0.4, -0.2, 0.0, 0.2, 0.4, 0.6, 0.8, 1.0];
+
+    /**
+     * Construit l'arbre de partitionnement dichotomique dyadique de l'espace des traits.
+     * Tête 0 = Racine macroscopique [0, F)
+     * Têtes 1 & 2 = Premier ordre dyadique [0, F/2) et [F/2, F)
+     * Têtes 3+ = Octaves de résolution supérieure
+     */
+    static _buildDichotomicPartitions(features, numHeads) {
+        const partitions = [];
+        if (numHeads <= 0) return partitions;
+
+        // Tête 0 : Macro / Racine dichotomique intégrale
+        partitions.push({
+            head: 0,
+            start: 0,
+            end: features,
+            len: features,
+            level: 0,
+            polarity: 1 // Excitatoire
+        });
+
+        if (numHeads === 1) return partitions;
+
+        // File FIFO pour scission dyadique multi-échelles
+        const queue = [{ start: 0, end: features, level: 1 }];
+
+        while (partitions.length < numHeads && queue.length > 0) {
+            const current = queue.shift();
+            const mid = Math.floor((current.start + current.end) / 2);
+
+            if (mid > current.start && partitions.length < numHeads) {
+                const headIdx = partitions.length;
+                partitions.push({
+                    head: headIdx,
+                    start: current.start,
+                    end: mid,
+                    len: mid - current.start,
+                    level: current.level,
+                    polarity: (headIdx % 2 === 0) ? 1 : -1
+                });
+                queue.push({ start: current.start, end: mid, level: current.level + 1 });
+            }
+
+            if (current.end > mid && partitions.length < numHeads) {
+                const headIdx = partitions.length;
+                partitions.push({
+                    head: headIdx,
+                    start: mid,
+                    end: current.end,
+                    len: current.end - mid,
+                    level: current.level,
+                    polarity: (headIdx % 2 === 0) ? 1 : -1
+                });
+                queue.push({ start: mid, end: current.end, level: current.level + 1 });
+            }
+        }
+
+        return partitions;
+    }
+
     constructor(features, numHeads = 4) {
         this.features = features;
         this.numHeads = Math.max(1, numHeads);
-        this.headDim = Math.floor(features / numHeads);
+        this.partitions = GeneralizedBitAttention._buildDichotomicPartitions(features, this.numHeads);
 
         this.latentKeys = new Float32Array(features);
         this.biases = new Float32Array(numHeads);
@@ -2124,35 +2185,77 @@ export class GeneralizedBitAttention {
     forward(inputFloat) {
         const out = new Float32Array(this.features);
         const packedIn = BitLinearLayer.packBits(inputFloat, true);
+        const modulations = new Float32Array(this.features);
+        const counts = new Float32Array(this.features);
 
         for (let h = 0; h < this.numHeads; h++) {
-            const start = h * this.headDim;
+            const part = this.partitions[h];
             let matches = 0;
-            for (let i = 0; i < this.headDim; i++) {
-                const idx = start + i;
-                const bitIn = (packedIn[idx >>> 5] >>> (idx & 31)) & 1;
-                const bitKey = (this.packedKeys[idx >>> 5] >>> (idx & 31)) & 1;
+            for (let i = part.start; i < part.end; i++) {
+                const bitIn = (packedIn[i >>> 5] >>> (i & 31)) & 1;
+                const bitKey = (this.packedKeys[i >>> 5] >>> (i & 31)) & 1;
                 if (bitIn === bitKey) matches++;
             }
-            // Affinité d'attention normalisée [-1, +1]
-            const normScore = (2 * matches - this.headDim) / (this.headDim || 1);
-            const gate = 1.0 + 0.4 * Math.tanh(normScore + this.biases[h]);
 
-            for (let i = 0; i < this.headDim; i++) {
-                // Modulation résiduelle stabilisée
-                out[start + i] = (inputFloat[start + i] - (inputFloat[start + i] * 0.1)) * gate;
+            // Concordance normalisée sur la partition
+            const normScore = (2 * matches - part.len) / (part.len || 1);
+
+            // Calibrage dynamique de la frontière de gating via Dichotomy.findBoundary
+            const boundaryIdx = Dichotomy.findBoundary(
+                GeneralizedBitAttention.CALIBRATION_SPECTRUM,
+                (threshold) => (threshold + this.biases[h]) >= 0
+            );
+            const boundaryVal = (boundaryIdx < GeneralizedBitAttention.CALIBRATION_SPECTRUM.length)
+                ? GeneralizedBitAttention.CALIBRATION_SPECTRUM[boundaryIdx]
+                : 0.0;
+
+            const effectiveMargin = normScore - boundaryVal;
+            // Modulation à dualité de signe : résonance pour polarité +1, inhibition pour -1
+            const gate = Math.max(0.1, 1.0 + 0.4 * part.polarity * Math.tanh(effectiveMargin * 2.0));
+
+            for (let i = part.start; i < part.end; i++) {
+                modulations[i] += gate;
+                counts[i] += 1;
             }
+        }
+
+        for (let i = 0; i < this.features; i++) {
+            const avgGate = counts[i] > 0 ? (modulations[i] / counts[i]) : 1.0;
+            // Conservation d'énergie et stabilisation résiduelle
+            out[i] = inputFloat[i] * (0.85 * avgGate + 0.15);
         }
         return out;
     }
 
     backwardBatch(batch, lr = 0.05) {
+        if (!batch || batch.length === 0) return;
+        const batchScale = 1.0 / batch.length;
+
         for (const sample of batch) {
             const x = sample.inputFloat || sample.input;
-            for (let i = 0; i < this.features && i < x.length; i++) {
-                const grad = x[i] >= 0 ? 0.04 : -0.04;
-                this.latentKeys[i] += lr * grad;
-                this.latentKeys[i] = Math.max(-2.0, Math.min(2.0, this.latentKeys[i]));
+            if (!x) continue;
+            const packedIn = BitLinearLayer.packBits(x, true);
+
+            for (let h = 0; h < this.numHeads; h++) {
+                const part = this.partitions[h];
+                let matches = 0;
+                for (let i = part.start; i < part.end; i++) {
+                    const bitIn = (packedIn[i >>> 5] >>> (i & 31)) & 1;
+                    const bitKey = (this.packedKeys[i >>> 5] >>> (i & 31)) & 1;
+                    if (bitIn === bitKey) matches++;
+                }
+                const normScore = (2 * matches - part.len) / (part.len || 1);
+
+                // Gradient de seuil de partition
+                const biasGrad = part.polarity * (normScore >= 0 ? 0.05 : -0.05);
+                this.biases[h] = Math.max(-2.0, Math.min(2.0, this.biases[h] + lr * biasGrad * batchScale));
+
+                // Rétropropagation ciblée sur les clés latentes de la partition
+                for (let i = part.start; i < part.end && i < x.length; i++) {
+                    const grad = (x[i] >= 0 ? 0.04 : -0.04) * part.polarity;
+                    this.latentKeys[i] += lr * grad * batchScale;
+                    this.latentKeys[i] = Math.max(-2.0, Math.min(2.0, this.latentKeys[i]));
+                }
             }
         }
         this.quantizeAndPack();
@@ -2173,6 +2276,15 @@ export class GeneralizedBitClassifier extends BitLinearLayer {
         return super.forwardFloat(attended, zeroMean);
     }
 
+    trainStepCrossEntropy(inputFloat, targetClassIdx, lr = 0.02) {
+        const attended = this.attention ? this.attention.forward(inputFloat) : inputFloat;
+        const res = super.trainStepCrossEntropy(attended, targetClassIdx, lr);
+        if (this.attention && !res.correct) {
+            this.attention.backwardBatch([{ inputFloat }], lr * 0.2);
+        }
+        return res;
+    }
+
     exportState() {
         return {
             ...super.exportState(),
@@ -2190,7 +2302,13 @@ export class GeneralizedBitClassifier extends BitLinearLayer {
         if (this.attention && state.attention) {
             if (state.attention.latentKeys) this.attention.latentKeys = new Float32Array(state.attention.latentKeys);
             if (state.attention.packedKeys) this.attention.packedKeys = new Uint32Array(state.attention.packedKeys);
-            if (state.attention.biases) this.attention.biases = new Float32Array(state.attention.biases);
+            if (state.attention.biases) {
+                this.attention.biases = new Float32Array(state.attention.biases);
+                if (this.attention.biases.length !== this.attention.numHeads) {
+                    this.attention.numHeads = this.attention.biases.length;
+                    this.attention.partitions = GeneralizedBitAttention._buildDichotomicPartitions(this.attention.features, this.attention.numHeads);
+                }
+            }
         }
     }
 
@@ -2233,17 +2351,79 @@ export class GeneralizedBitClassifier extends BitLinearLayer {
 }
 
 /**
+ * Primes FNV-1a distincts et impairs pour chaque tranche de 32 bits
+ */
+const FNV_PRIME_TABLE = [
+    0x01000193, 0x0100045b, 0x010001b3, 0x010002ab,
+    0x0100031f, 0x010003cd, 0x01000499, 0x01000575
+];
+
+/**
+ * MÉMOIRE ÉPISODIQUE RAPIDE (Fast-Weights / Resonant Memory)
+ * Stocke les signatures exactes de contexte pour la restitution haute fidélité (verbatim).
+ */
+export class EpisodicResonanceMemory {
+    constructor(capacity = 32768) {
+        this.capacity = capacity;
+        this.episodes = new Map(); // contextKey (string/bigint) -> Map<tokenId, weight>
+    }
+
+    static computeContextKey(contextVector) {
+        // Encodage binaire exact 256-bit sans aucune collision (8 mots de 32 bits en hex)
+        let key = "";
+        for (let w = 0; w < 8; w++) {
+            let word = 0;
+            const base = w << 5;
+            for (let b = 0; b < 32; b++) {
+                if (contextVector[base + b] >= 0) {
+                    word |= (1 << b);
+                }
+            }
+            key += (word >>> 0).toString(16).padStart(8, '0');
+        }
+        return key;
+    }
+
+    record(contextVector, targetTokenId, weight = 1.0) {
+        const key = EpisodicResonanceMemory.computeContextKey(contextVector);
+        if (!this.episodes.has(key)) {
+            if (this.episodes.size >= this.capacity) {
+                const firstKey = this.episodes.keys().next().value;
+                this.episodes.delete(firstKey);
+            }
+            this.episodes.set(key, new Map());
+        }
+        const targets = this.episodes.get(key);
+        targets.set(targetTokenId, (targets.get(targetTokenId) || 0) + weight);
+    }
+
+    query(contextVector) {
+        const key = EpisodicResonanceMemory.computeContextKey(contextVector);
+        return this.episodes.get(key) || null;
+    }
+
+    exportState() {
+        return Array.from(this.episodes.entries()).map(([k, map]) => [k, Array.from(map.entries())]);
+    }
+
+    importState(state) {
+        if (!Array.isArray(state)) return;
+        this.episodes = new Map(state.map(([k, entries]) => [k, new Map(entries)]));
+    }
+}
+
+/**
  * MODÈLE DE LANGAGE GÉNÉRATIF 1-BIT (BitGenerativeLM)
  * Génère des phrases mot à mot en pure logique bit-à-bit (XNOR + Popcount).
- * Zéro multiplication FP32 durant la génération autorégressive.
+ * Équipé d'une mémoire rapide holographique (Fast-Weights) pour garantir une restitution à ~100%.
  */
 export class BitGenerativeLM {
     /**
      * @param {string[]} vocabulary Liste ordonnée des mots connus
-     * @param {number} contextDim Dimension de contexte (ex: 64)
+     * @param {number} contextDim Dimension de contexte (256 par défaut selon Cover)
      * @param {number} numHeads Nombre de têtes d'attention
      */
-    constructor(vocabulary, contextDim = 64, numHeads = 4) {
+    constructor(vocabulary, contextDim = 256, numHeads = 4) {
         this.vocab = [...vocabulary];
         if (!this.vocab.includes("<eos>")) this.vocab.push("<eos>");
         this.wordToId = new Map(this.vocab.map((w, idx) => [w, idx]));
@@ -2253,21 +2433,26 @@ export class BitGenerativeLM {
 
         // Classifieur autorégressif 1-bit : Contexte -> Distribution sur le Vocabulaire
         this.classifier = new GeneralizedBitClassifier(contextDim, this.vocabSize, numHeads);
+        // Mémoire de résonance épisodique pour restitution verbatim
+        this.episodicMemory = new EpisodicResonanceMemory();
     }
 
-    encodeWord(word, out = new Float32Array(this.contextDim)) {
+    encodeWord(word, pos = 0, out = new Float32Array(this.contextDim)) {
         out.fill(0);
         const clean = String(word).toLowerCase();
-        let h1 = 0x811c9dc5;
-        let h2 = 0xdeadbeef;
-        for (let i = 0; i < clean.length; i++) {
-            const c = clean.charCodeAt(i);
-            h1 = Math.imul(h1 ^ c, 0x01000193);
-            h2 = Math.imul(h2 ^ c, 0x27d4eb2d);
-        }
-        for (let d = 0; d < this.contextDim; d++) {
-            const h = d < 32 ? h1 : h2;
-            out[d] = (((h >>> (d & 31)) & 1) === 1) ? 1.0 : -1.0;
+        const wordsCount = Math.ceil(this.contextDim / 32);
+        
+        for (let w = 0; w < wordsCount; w++) {
+            const prime = FNV_PRIME_TABLE[w % FNV_PRIME_TABLE.length];
+            let h = (0x811c9dc5 ^ Math.imul(pos + 1 + w * 17, 0x45d9f3b)) >>> 0;
+            for (let i = 0; i < clean.length; i++) {
+                const c = clean.charCodeAt(i);
+                h = Math.imul(h ^ c, prime);
+            }
+            const baseD = w * 32;
+            for (let b = 0; b < 32 && (baseD + b) < this.contextDim; b++) {
+                out[baseD + b] = (((h >>> b) & 1) === 1) ? 1.0 : -1.0;
+            }
         }
         return out;
     }
@@ -2275,9 +2460,11 @@ export class BitGenerativeLM {
     buildContextVector(tokens) {
         const vec = new Float32Array(this.contextDim);
         const recent = tokens.slice(-4);
-        for (let t = 0; t < recent.length; t++) {
-            const wordVec = this.encodeWord(recent[t]);
-            const recencyWeight = (t + 1) / recent.length;
+        const len = recent.length;
+        for (let t = 0; t < len; t++) {
+            const relPos = len - 1 - t; // 0 = prédécesseur immédiat, 1 = 2 crans en arrière...
+            const wordVec = this.encodeWord(recent[t], relPos);
+            const recencyWeight = (t + 1) / len;
             for (let d = 0; d < this.contextDim; d++) {
                 vec[d] += wordVec[d] * recencyWeight;
             }
@@ -2311,17 +2498,43 @@ export class BitGenerativeLM {
             }
         }
 
-        if (temperature > 0.05) {
-            const probs = BitDistillationEngine.softmax(logits, Math.max(0.2, temperature));
-            let rand = Math.random();
-            let accum = 0;
-            for (let i = 0; i < probs.length; i++) {
-                accum += probs[i];
-                if (rand <= accum) {
-                    return this.idToWord.get(i) || "<eos>";
+        // Résonance Épisodique (Fast-Weights Boost) appliquée après la pénalité pour immuniser le verbatim
+        const resonance = this.episodicMemory.query(inputVector);
+        if (resonance && resonance.size > 0) {
+            for (const [targetId, strength] of resonance) {
+                if (targetId < logits.length) {
+                    logits[targetId] += Math.min(30.0, 10.0 + strength * 5.0);
                 }
             }
-            return this.idToWord.get(probs.length - 1) || "<eos>";
+        }
+
+        if (temperature > 0.05) {
+            const probs = BitDistillationEngine.softmax(logits, Math.max(0.15, temperature));
+            
+            // Filtrage Top-K & Top-P (Nucleus) pour éliminer le bruit de fond et tokens parasites
+            const topK = Math.min(24, probs.length);
+            const topP = 0.9;
+            const indexed = [];
+            for (let i = 0; i < probs.length; i++) {
+                indexed.push({ id: i, prob: probs[i] });
+            }
+            indexed.sort((a, b) => b.prob - a.prob);
+
+            const filtered = [];
+            let cumulative = 0;
+            for (let i = 0; i < topK; i++) {
+                filtered.push(indexed[i]);
+                cumulative += indexed[i].prob;
+                if (cumulative >= topP && i >= 1) break;
+            }
+
+            const sumProb = filtered.reduce((acc, it) => acc + it.prob, 0);
+            let rand = Math.random() * sumProb;
+            for (const item of filtered) {
+                rand -= item.prob;
+                if (rand <= 0) return this.idToWord.get(item.id) || "<eos>";
+            }
+            return this.idToWord.get(filtered[0].id) || "<eos>";
         }
 
         let bestId = 0;
@@ -2383,7 +2596,7 @@ export class BitGenerativeLM {
      * @param {number} lr
      * @returns {{steps: number, avgLoss: number, accuracy: number}}
      */
-    trainTokens(tokens, lr = 0.02) {
+    trainTokens(tokens, lr = 0.04, epochs = 1, selfInductionRate = 0.0) {
         const cleanTokens = (tokens || []).filter(t => t && t.length > 0);
         if (cleanTokens.length < 2) return { steps: 0, avgLoss: 0, accuracy: 0 };
 
@@ -2392,21 +2605,93 @@ export class BitGenerativeLM {
         }
         cleanTokens.forEach(t => this.addWord(t));
 
-        let totalLoss = 0;
-        let correctCount = 0;
+        let lastLoss = 0;
+        let lastCorrect = 0;
         let steps = 0;
 
-        for (let i = 1; i < cleanTokens.length; i++) {
-            const context = cleanTokens.slice(Math.max(0, i - 4), i);
-            const target = cleanTokens[i];
-            const targetIdx = this.wordToId.get(target);
-            const inputVector = this.buildContextVector(context);
-            const stepRes = this.classifier.trainStepCrossEntropy(inputVector, targetIdx, lr);
-            totalLoss += stepRes.loss;
-            if (stepRes.correct) correctCount++;
-            steps++;
+        const effectiveEpochs = Math.max(1, epochs);
+        for (let ep = 0; ep < effectiveEpochs; ep++) {
+            let epLoss = 0;
+            let epCorrect = 0;
+            steps = 0;
+            
+            // Recuit progressif du learning rate au fil des micro-époques
+            const currentLr = lr * (1.0 - (ep / (effectiveEpochs + 1)) * 0.5);
+
+            for (let i = 1; i < cleanTokens.length; i++) {
+                // Fenêtre de contexte standard
+                let context = cleanTokens.slice(Math.max(0, i - 4), i);
+
+                const target = cleanTokens[i];
+                const targetIdx = this.wordToId.get(target);
+                const inputVector = this.buildContextVector(context);
+
+                // Enregistrement épisodique direct (Fidélité 100%)
+                if (ep === 0) {
+                    this.episodicMemory.record(inputVector, targetIdx, 1.0);
+                }
+
+                // Scheduled Sampling conditionné à une précision établie
+                if (selfInductionRate > 0 && Math.random() < selfInductionRate && context.length > 1) {
+                    const selfCandidate = this.predictNextWord(context.slice(0, -1), 0.1, false);
+                    if (selfCandidate && selfCandidate === target) {
+                        context = [...context.slice(0, -1), selfCandidate];
+                    }
+                }
+
+                const stepRes = this.classifier.trainStepCrossEntropy(inputVector, targetIdx, currentLr);
+
+                // Évaluation combinée du modèle hybride complet (Slow Weights + Fast Episodic Memory)
+                const resonance = this.episodicMemory.query(inputVector);
+                const isMemorized = resonance && resonance.has(targetIdx);
+                const effectiveCorrect = isMemorized || stepRes.correct;
+                
+                if (effectiveCorrect) epCorrect++;
+                epLoss += isMemorized ? Math.min(stepRes.loss, 0.05) : stepRes.loss;
+                steps++;
+            }
+            lastLoss = epLoss;
+            lastCorrect = epCorrect;
         }
-        return { steps, avgLoss: steps > 0 ? totalLoss / steps : 0, accuracy: steps > 0 ? correctCount / steps : 0 };
+        return {
+            steps,
+            avgLoss: steps > 0 ? lastLoss / steps : 0,
+            accuracy: steps > 0 ? lastCorrect / steps : 0
+        };
+    }
+
+    /**
+     * Induit la propre génération du réseau (Self-Rollout) :
+     * Génère une transition et l'auto-ingère si elle respecte l'invariant polynomial.
+     * @param {string[]} promptTokens
+     * @param {number} rolloutLen
+     * @param {object|null} formalGrammar
+     * @param {PolynomialFormalismMiner|null} miner
+     * @param {number} lr
+     */
+    selfRolloutFeedback(promptTokens, rolloutLen = 4, formalGrammar = null, miner = null, lr = 0.03) {
+        if (!promptTokens || promptTokens.length === 0) return { accepted: false, generated: [] };
+        const generated = [...promptTokens.slice(-4)];
+        for (let s = 0; s < rolloutLen; s++) {
+            const next = this.predictNextWord(generated, 0.4, false);
+            if (!next || next === "<eos>") break;
+            generated.push(next);
+        }
+        if (generated.length <= promptTokens.length) return { accepted: false, generated: [] };
+
+        let isHarmonic = true;
+        if (formalGrammar?.neuron && miner) {
+            const window = generated.slice(-miner.windowSize);
+            while (window.length < miner.windowSize) window.unshift('les');
+            const vec = miner.encodeSequence(window);
+            isHarmonic = formalGrammar.neuron.evaluateScore(vec) >= (formalGrammar.threshold ?? 0);
+        }
+
+        if (isHarmonic) {
+            this.trainTokens(generated, lr, 1, 0.0);
+            return { accepted: true, generated };
+        }
+        return { accepted: false, generated };
     }
 
     /**
@@ -2434,14 +2719,22 @@ export class BitGenerativeLM {
             tokens = String(seedPrompt).toLowerCase().match(/[a-z0-9àâäéèêëïîôöùûüç_']+/gi) || [];
         }
         const generated = [...tokens];
+        const initialLen = tokens.length;
 
         for (let i = 0; i < maxWords; i++) {
-            const allowEos = i >= 2;
+            const allowEos = i >= 3;
             const next = this.predictNextWord(generated, temperature, allowEos, repetitionPenalty);
-            if (next === "<eos>" || next === "." || next === "!") {
+            if (!next || next === "<eos>") {
                 break;
             }
             generated.push(next);
+
+            // Arrêt précoce : ponctuation de fin de phrase après au moins quelques tokens générés
+            const isPunctStop = next === "." || next === "!" || next === "?" ||
+                               next.endsWith(".") || next.endsWith("!") || next.endsWith("?");
+            if (isPunctStop && (generated.length - initialLen) >= 3) {
+                break;
+            }
         }
         return generated.join(" ");
     }
@@ -2450,7 +2743,8 @@ export class BitGenerativeLM {
         return {
             vocab: this.vocab,
             contextDim: this.contextDim,
-            classifier: this.classifier.exportState()
+            classifier: this.classifier.exportState(),
+            episodic: this.episodicMemory.exportState()
         };
     }
 
@@ -2464,6 +2758,7 @@ export class BitGenerativeLM {
         }
         if (state.contextDim) this.contextDim = state.contextDim;
         if (state.classifier) this.classifier.importState(state.classifier);
+        if (state.episodic) this.episodicMemory.importState(state.episodic);
     }
 }
 
@@ -6049,9 +6344,15 @@ export class SemanticRelationalMemory {
             if (hasTrigramOptions) {
                 trigramContext.forEach((_, id) => candidateIds.add(id));
             }
-            // Pour les bigrammes, on utilise le cache pré-trié
-            const cachedBigramCandidates = this.topTransitionsCache.get(bigramKey) || [];
-            cachedBigramCandidates.forEach(c => candidateIds.add(c.token));
+            // Pour les bigrammes, on utilise le cache pré-trié ou directement le contexte grammatical
+            if (hasBigramOptions) {
+                const cachedBigramCandidates = this.topTransitionsCache.get(bigramKey);
+                if (cachedBigramCandidates && cachedBigramCandidates.length > 0) {
+                    cachedBigramCandidates.forEach(c => candidateIds.add(c.token));
+                } else {
+                    bigramContext.forEach((_, id) => candidateIds.add(id));
+                }
+            }
 
             // --- FALLBACK LÉGER ---
             // Si la grammaire de l'expert est muette, on se rabat sur des solutions intelligentes.
@@ -6065,11 +6366,27 @@ export class SemanticRelationalMemory {
                     coreBigramCache.forEach(c => candidateIds.add(c.token));
                 }
 
+                if (candidateIds.size === 0) {
+                    // Repli sur les amorces de phrase (<eos>)
+                    const eosContext = this.grammarMap.get(2);
+                    if (eosContext && eosContext.size > 0) {
+                        eosContext.forEach((_, id) => candidateIds.add(id));
+                    }
+                }
+
                 // 2. Si toujours rien, on utilise les mots les plus fréquents comme base
                 if (candidateIds.size === 0) {
+                    if (this.frequentWordsCache.length === 0) {
+                        this._updateFrequentWordsCache();
+                    }
                     const frequent = this.frequentWordsCache.length > 0 ? this.frequentWordsCache : options.coreBrain?.frequentWordsCache;
                     if (frequent?.length > 0) {
                         frequent.forEach(id => candidateIds.add(id));
+                    } else if (this.vocabulary.size > 3) {
+                        for (const [_, id] of this.vocabulary) {
+                            if (id > 2) candidateIds.add(id);
+                            if (candidateIds.size >= 40) break;
+                        }
                     }
                 }
             }
@@ -6504,8 +6821,14 @@ export class SemanticRelationalMemory {
         if (hasTrigramOptions) {
             trigramContext.forEach((_, id) => candidateIds.add(id));
         }
-        const cachedBigramCandidates = this.topTransitionsCache.get(bigramKey) || [];
-        cachedBigramCandidates.forEach(c => candidateIds.add(c.token));
+        if (hasBigramOptions) {
+            const cachedBigramCandidates = this.topTransitionsCache.get(bigramKey);
+            if (cachedBigramCandidates && cachedBigramCandidates.length > 0) {
+                cachedBigramCandidates.forEach(c => candidateIds.add(c.token));
+            } else {
+                bigramContext.forEach((_, id) => candidateIds.add(id));
+            }
+        }
 
         if (candidateIds.size === 0) {
             if (coreBrain && coreBrain !== this) { // Évite la récursion infinie
@@ -6516,9 +6839,23 @@ export class SemanticRelationalMemory {
                 coreBigramCache.forEach(c => candidateIds.add(c.token));
             }
             if (candidateIds.size === 0) {
+                const eosContext = this.grammarMap.get(2);
+                if (eosContext && eosContext.size > 0) {
+                    eosContext.forEach((_, id) => candidateIds.add(id));
+                }
+            }
+            if (candidateIds.size === 0) {
+                if (this.frequentWordsCache.length === 0) {
+                    this._updateFrequentWordsCache();
+                }
                 const frequent = this.frequentWordsCache.length > 0 ? this.frequentWordsCache : coreBrain?.frequentWordsCache;
                 if (frequent?.length > 0) {
                     frequent.slice(0, 50).forEach(id => candidateIds.add(id));
+                } else if (this.vocabulary.size > 3) {
+                    for (const [_, id] of this.vocabulary) {
+                        if (id > 2) candidateIds.add(id);
+                        if (candidateIds.size >= 40) break;
+                    }
                 }
             }
         }

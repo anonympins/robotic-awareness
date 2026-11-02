@@ -34,7 +34,7 @@ let brain = new neuro.SemanticRelationalMemory(8);
 let miner = new neuro.PolynomialFormalismMiner(brain, WINDOW_SIZE, TOKEN_BITS);
 let formalGrammar = null;
 const initialVocab = ["les", "la", "le", "des", "un", "une", "dans", "avec", "pour", "<eos>"];
-let bitLM = new neuro.BitGenerativeLM(initialVocab, 64, 4);
+let bitLM = new neuro.BitGenerativeLM(initialVocab, 256, 4);
 let adaptiveTokenizer = new neuro.AdaptiveMergeTokenizer({ mergeThreshold: 5, maxVocabSize: 4096 });
 
 function loadOrInitModel() {
@@ -101,6 +101,7 @@ function loadOrInitModel() {
         formalGrammar = discovery;
         saveModel();
     }
+    brain._updateFrequentWordsCache?.();
 }
 
 function saveModel() {
@@ -124,22 +125,24 @@ function saveModel() {
  */
 function sampleProbabilisticCandidate(scoredCandidates, temperature = 0.7, topP = 0.9, repetitionPenalty = 1.2, recentTokens = []) {
     if (scoredCandidates.length === 0) return null;
-    if (temperature <= 0.08) {
-        // Mode déterministe (Argmax strict)
-        return scoredCandidates.reduce((best, cur) => cur.score > best.score ? cur : best, scoredCandidates[0]);
-    }
 
-    // Application de la pénalité de présence / répétition sur les logits
+    // Application de la pénalité de répétition sur les logits AVANT la sélection (déterministe ou stochastique)
     const penalizedCandidates = scoredCandidates.map(c => {
         let adjustedScore = c.score;
         const occurrences = recentTokens.filter(t => t.toLowerCase() === c.token.toLowerCase()).length;
         if (occurrences > 0) {
-            adjustedScore = adjustedScore > 0 
-                ? adjustedScore / Math.pow(repetitionPenalty, occurrences)
-                : adjustedScore * Math.pow(repetitionPenalty, occurrences);
+            adjustedScore -= occurrences * 3.5 * repetitionPenalty;
+            if (recentTokens[recentTokens.length - 1]?.toLowerCase() === c.token.toLowerCase()) {
+                adjustedScore -= 7.0 * repetitionPenalty; // Pénalité renforcée contre le bégaiement consécutif
+            }
         }
         return { ...c, score: adjustedScore };
     });
+
+    if (temperature <= 0.08) {
+        // Mode déterministe (Argmax strict sur les scores pénalisés)
+        return penalizedCandidates.reduce((best, cur) => cur.score > best.score ? cur : best, penalizedCandidates[0]);
+    }
 
     // Stabilisation numérique Softmax
     const maxScore = Math.max(...penalizedCandidates.map(c => c.score));
@@ -174,13 +177,20 @@ function generateGuidedSentence(prompt, targetLength = 10, temperature = 0.7, to
     const tokens = adaptiveTokenizer.tokenize(prompt.toLowerCase());
     if (tokens.length === 0) tokens.push('les');
     const generated = [...tokens];
-    const threshold = formalGrammar.threshold;
-    const neuron = formalGrammar.neuron;
+    const threshold = formalGrammar?.threshold ?? 0;
+    const neuron = formalGrammar?.neuron ?? null;
     let lastPolyScore = threshold;
 
     for (let step = 0; step < targetLength; step++) {
         const currentContext = generated.join(' ');
-        const candidates = brain.predictNextCandidates(currentContext, { topK, creativity: temperature });
+        let candidates = brain.predictNextCandidates(currentContext, { topK, creativity: temperature });
+        if ((!candidates || candidates.length === 0) && step === 0) {
+            // Repli sur les amorces grammaticales si le mot de départ est inconnu
+            candidates = brain.predictNextCandidates('<eos>', { topK, creativity: temperature }) || [];
+            if (!candidates || candidates.length === 0) {
+                candidates = brain.predictNextCandidates('les', { topK, creativity: temperature }) || [];
+            }
+        }
         if (!candidates || candidates.length === 0) break;
 
         const scoredCandidates = [];
@@ -193,10 +203,10 @@ function generateGuidedSentence(prompt, targetLength = 10, temperature = 0.7, to
             while (testWindow.length < WINDOW_SIZE) testWindow.unshift(testWindow[0] || 'les');
 
             const testVec = miner.encodeSequence(testWindow);
-            const polyScore = neuron.evaluateScore(testVec);
+            const polyScore = neuron ? neuron.evaluateScore(testVec) : threshold;
             const isHarmonic = polyScore >= threshold;
 
-            // Guidage progressif borné plutôt qu'un malus destructeur de -10.0
+            // Guidage harmonique progressif borné
             const delta = polyScore - threshold;
             const harmonicBonus = isHarmonic 
                 ? Math.min(3.0, (delta + 0.5) * 1.5) 
@@ -216,7 +226,6 @@ function generateGuidedSentence(prompt, targetLength = 10, temperature = 0.7, to
         const picked = sampleProbabilisticCandidate(scoredCandidates, temperature, topP, repetitionPenalty, recent);
         if (!picked) break;
         if (picked.token === '<eos>' && generated.length >= tokens.length + 2) break;
-        if (picked.token === '<eos>') continue;
 
         generated.push(picked.token);
         lastPolyScore = picked.polyScore;
@@ -247,10 +256,31 @@ app.post('/query', async (req, res) => {
 
     try {
         const cleanPrompt = prompt.trim().toLowerCase();
-        // Température effective pour l'échantillonnage de Boltzmann / Softmax
-        const effectiveTemp = temperature !== null ? Math.max(0.1, parseFloat(temperature)) : Math.max(0.4, parseFloat(creativity) * 2.0);
+        const effectiveDepth = Math.max(1, parseInt(depth, 10) || 10);
+        // Température effective avec prise en compte des valeurs basses de créativité
+        const effectiveTemp = temperature !== null ? Math.max(0.05, parseFloat(temperature)) : Math.max(0.05, parseFloat(creativity) * 1.5);
         
-        const bitgemmText = bitLM.generateSentence(cleanPrompt, depth, effectiveTemp, adaptiveTokenizer, parseFloat(repetition_penalty));
+        if (mode === "symbolic") {
+            const outcome = generateGuidedSentence(cleanPrompt, effectiveDepth, effectiveTemp, topK, topP, parseFloat(repetition_penalty));
+            const pureSymbolic = brain.predictSense(cleanPrompt, effectiveDepth, { creativity: effectiveTemp, topK });
+            return res.json({
+                success: true,
+                mode: "symbolic",
+                prompt: prompt,
+                prediction: outcome.prediction,
+                full_result: outcome.full_result,
+                symbolic_generation: outcome.full_result,
+                detokenized_result: adaptiveTokenizer.detokenize(outcome.full_result.split(' ')),
+                pure_symbolic_memory: pureSymbolic,
+                polynomial_validation: {
+                    score: outcome.polyScore,
+                    threshold: formalGrammar?.threshold ?? null,
+                    valid: outcome.isHarmonic
+                }
+            });
+        }
+
+        const bitgemmText = bitLM.generateSentence(cleanPrompt, effectiveDepth, effectiveTemp, adaptiveTokenizer, parseFloat(repetition_penalty));
 
         if (mode === "bitgemm") {
             return res.json({
@@ -260,18 +290,24 @@ app.post('/query', async (req, res) => {
             });
         }
 
-        const outcome = generateGuidedSentence(cleanPrompt, depth, effectiveTemp, topK, topP, parseFloat(repetition_penalty));
+        // Mode hybrid (par défaut) : combine génération symbolique guidée et inférence 1-bit
+        const outcome = generateGuidedSentence(cleanPrompt, effectiveDepth, effectiveTemp, topK, topP, parseFloat(repetition_penalty));
+        const pureSymbolic = brain.predictSense(cleanPrompt, effectiveDepth, { creativity: effectiveTemp, topK });
 
         res.json({
             success: true,
+            mode: "hybrid",
             prompt: prompt,
             prediction: outcome.prediction,
             full_result: outcome.full_result,
+            symbolic_generation: outcome.full_result,
             detokenized_result: adaptiveTokenizer.detokenize(outcome.full_result.split(' ')),
+            pure_symbolic_memory: pureSymbolic,
             bitgemm_inference: bitgemmText,
+            bitgemm_detokenized: adaptiveTokenizer.detokenize(bitgemmText.split(' ')),
             polynomial_validation: {
                 score: outcome.polyScore,
-                threshold: formalGrammar.threshold,
+                threshold: formalGrammar?.threshold ?? null,
                 valid: outcome.isHarmonic
             }
         });
@@ -282,7 +318,7 @@ app.post('/query', async (req, res) => {
 });
 
 app.post('/ingest', async (req, res) => {
-    const { text, weight = 1.0, lr = 0.03, retrain_grammar = false } = req.body;
+    const { text, weight = 1.0, lr = 0.045, epochs = 3, retrain_grammar = false } = req.body;
 
     if (!text || typeof text !== 'string' || text.trim().length < 5) {
         return res.status(400).json({ error: "Contenu textuel invalide ou trop court (min 5 chars)." });
@@ -297,21 +333,46 @@ app.post('/ingest', async (req, res) => {
         let newMerges = 0;
         let totalLoss = 0;
         let totalAcc = 0;
+        let selfInductions = 0;
+        const numEpochs = Math.max(1, Math.min(10, parseInt(epochs, 10) || 3));
+        const effectiveLr = Math.max(0.005, parseFloat(lr) || 0.045);
+        const allDocumentTokens = [];
 
-        for (const s of sentences) {
+        for (let i = 0; i < sentences.length; i++) {
+            const s = sentences[i];
             // 1. Tokenisation avec fusions adaptatives
             const tokens = adaptiveTokenizer.ingestAndTokenize(s, (mergedToken) => {
                 newMerges++;
                 bitLM.addWord(mergedToken);
             });
+            allDocumentTokens.push(tokens);
 
             // 2. Entraînement symbolique sur les super-tokens
             brain.learnSense(tokens.join(' '), false, weight);
 
-            // 3. Entraînement 1-bit autorégressif sur les tokens compactés
-            const r = bitLM.trainTokens(tokens, lr);
+            // 3. Entraînement 1-bit autorégressif sur les tokens compactés avec micro-époques
+            const r = bitLM.trainTokens(tokens, effectiveLr, numEpochs, 0.0);
             totalLoss += r.avgLoss;
             totalAcc += r.accuracy;
+        }
+
+        // 4. Apprentissage explicite des JONCTIONS INTER-PHRASES (Discourse Bridges)
+        for (let i = 0; i < allDocumentTokens.length - 1; i++) {
+            const bridgeTokens = [
+                ...allDocumentTokens[i].slice(-3),
+                ...allDocumentTokens[i + 1].slice(0, 4)
+            ];
+            if (bridgeTokens.length >= 4) {
+                brain.learnSense(bridgeTokens.join(' '), false, weight * 0.8);
+                bitLM.trainTokens(bridgeTokens, effectiveLr * 0.75, 1, 0.0);
+            }
+
+            // 5. Auto-induction de sa propre génération (Self-Rollout Feedback)
+            const rolloutSeed = allDocumentTokens[i].slice(-3);
+            const rolloutRes = bitLM.selfRolloutFeedback(rolloutSeed, 3, formalGrammar, miner, effectiveLr * 0.5);
+            if (rolloutRes.accepted) {
+                selfInductions++;
+            }
         }
 
         miner.induceFeatures(sentences);
@@ -329,9 +390,11 @@ app.post('/ingest', async (req, res) => {
         res.json({
             success: true,
             ingested_sentences: sentences.length,
+            micro_epochs: numEpochs,
             symbolic_vocabulary: brain.vocabulary.size,
             tokenizer_merges: adaptiveTokenizer.merges.size,
             new_merges: newMerges,
+            self_inductions_accepted: selfInductions,
             bitgemm: {
                 vocabSize: bitLM.vocabSize,
                 avgLoss: (totalLoss / sentences.length).toFixed(3),
@@ -368,7 +431,7 @@ app.get('/status', (req, res) => {
 app.listen(port, () => {
     console.log(`\n\x1b[35m=== BITGEMM & POLYNOMIAL FORMALISM API SERVER ===\x1b[0m`);
     console.log(`📡 Écoute sur http://localhost:${port}`);
-    console.log(`👉 POST /query   { "prompt": "les étoiles" }`);
+    console.log(`👉 POST /query   { "prompt": "les étoiles", "mode": "hybrid|symbolic|bitgemm" }`);
     console.log(`👉 POST /ingest  { "text": "...", "retrain_grammar": false }`);
     console.log(`👉 GET  /status`);
     console.log(`👉 GET  /invariants\n`);
