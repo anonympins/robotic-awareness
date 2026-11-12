@@ -1862,6 +1862,271 @@ export class OptimizedMajorityPerceptron {
     }
 }
 
+// ============================================================
+// MOTEUR D'ACCÉLÉRATION WEBGPU COMPUTE SHADER (BitGEMM)
+// ============================================================
+
+export const BITGEMM_WGSL = /* wgsl */ `
+struct Uniforms {
+    inFeatures: u32,
+    outFeatures: u32,
+    wordsPerInput: u32,
+    lastWordMask: u32,
+    outputScale: f32,
+    batchSize: u32,
+    pad0: u32,
+    pad1: u32,
+};
+
+@group(0) @binding(0) var<uniform> uniforms: Uniforms;
+@group(0) @binding(1) var<storage, read> packedInputs: array<u32>;
+@group(0) @binding(2) var<storage, read> packedWeights: array<u32>;
+@group(0) @binding(3) var<storage, read> biases: array<f32>;
+@group(0) @binding(4) var<storage, read_write> outputs: array<f32>;
+
+@compute @workgroup_size(64, 1, 1)
+fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
+    let outIdx = global_id.x;
+    let batchIdx = global_id.y;
+
+    if (outIdx >= uniforms.outFeatures || batchIdx >= uniforms.batchSize) {
+        return;
+    }
+
+    let inFeat = uniforms.inFeatures;
+    let wCount = uniforms.wordsPerInput;
+    let mask = uniforms.lastWordMask;
+    let inOffset = batchIdx * wCount;
+    let wOffset = outIdx * wCount;
+
+    var matches: u32 = 0u;
+    for (var w: u32 = 0u; w < wCount; w = w + 1u) {
+        var xnorVal: u32 = ~(packedInputs[inOffset + w] ^ packedWeights[wOffset + w]);
+        if (w == wCount - 1u) {
+            xnorVal = xnorVal & mask;
+        }
+        matches = matches + countOneBits(xnorVal);
+    }
+
+    let score: f32 = (2.0 * f32(matches) - f32(inFeat)) * uniforms.outputScale + biases[outIdx];
+    outputs[batchIdx * uniforms.outFeatures + outIdx] = score;
+}
+`;
+
+const SHADER_STAGE_COMPUTE = typeof GPUShaderStage !== 'undefined' ? GPUShaderStage.COMPUTE : 4;
+const MAP_MODE_READ = typeof GPUMapMode !== 'undefined' ? GPUMapMode.READ : 1;
+const BUFFER_USAGE_MAP_READ = typeof GPUBufferUsage !== 'undefined' ? GPUBufferUsage.MAP_READ : 1;
+const BUFFER_USAGE_COPY_SRC = typeof GPUBufferUsage !== 'undefined' ? GPUBufferUsage.COPY_SRC : 4;
+const BUFFER_USAGE_COPY_DST = typeof GPUBufferUsage !== 'undefined' ? GPUBufferUsage.COPY_DST : 8;
+const BUFFER_USAGE_UNIFORM = typeof GPUBufferUsage !== 'undefined' ? GPUBufferUsage.UNIFORM : 64;
+const BUFFER_USAGE_STORAGE = typeof GPUBufferUsage !== 'undefined' ? GPUBufferUsage.STORAGE : 128;
+
+/**
+ * Moteur singleton de gestion de pipeline et buffers WebGPU pour BitGEMM.
+ */
+export class WebGPUBitGEMMEngine {
+    static gpu = null;
+    static device = null;
+    static pipeline = null;
+    static bindGroupLayout = null;
+    static initAttempted = false;
+    static lastInitReason = null;
+    static bufferCache = new Map();
+
+    static async getDevice() {
+        if (this.device) return this.device;
+        if (this.initAttempted && !this.device) return null;
+        this.initAttempted = true;
+
+        try {
+            if (typeof navigator !== 'undefined' && navigator.gpu) {
+                this.gpu = navigator.gpu;
+            } else if (typeof globalThis !== 'undefined' && globalThis.navigator?.gpu) {
+                this.gpu = globalThis.navigator.gpu;
+            } else {
+                for (const pkg of ['webgpu', '@webgpu/node']) {
+                    try {
+                        const mod = await import(pkg);
+                        if (mod.globals && typeof globalThis.GPUBufferUsage === 'undefined') {
+                            Object.assign(globalThis, mod.globals);
+                        }
+                        if (typeof mod.create === 'function') {
+                            try {
+                                this.gpu = mod.create([]);
+                            } catch (_) {
+                                this.gpu = mod.create(['--disable-dawn-features=disallow_unsafe_apis']);
+                            }
+                            if (this.gpu) break;
+                        } else if (typeof mod.createGPU === 'function') {
+                            this.gpu = mod.createGPU();
+                            if (this.gpu) break;
+                        } else if (mod.gpu || mod.default?.gpu) {
+                            this.gpu = mod.gpu || mod.default.gpu;
+                            if (this.gpu) break;
+                        } else if (typeof mod.default === 'function') {
+                            this.gpu = mod.default([]);
+                            if (this.gpu) break;
+                        }
+                    } catch (_) {}
+                }
+            }
+
+            if (!this.gpu) {
+                this.lastInitReason = "Module WebGPU introuvable ou échec d'initialisation.";
+                return null;
+            }
+
+            const adapter = await this.gpu.requestAdapter({ powerPreference: 'high-performance' });
+            if (!adapter) {
+                this.lastInitReason = "Aucun adaptateur GPU compatible trouvé (requestAdapter).";
+                return null;
+            }
+
+            this.device = await adapter.requestDevice();
+            if (!this.device) {
+                this.lastInitReason = "Échec d'obtention du GPUDevice (requestDevice).";
+                return null;
+            }
+
+            const shaderModule = this.device.createShaderModule({ code: BITGEMM_WGSL });
+
+            this.bindGroupLayout = this.device.createBindGroupLayout({
+                entries: [
+                    { binding: 0, visibility: SHADER_STAGE_COMPUTE, buffer: { type: 'uniform' } },
+                    { binding: 1, visibility: SHADER_STAGE_COMPUTE, buffer: { type: 'read-only-storage' } },
+                    { binding: 2, visibility: SHADER_STAGE_COMPUTE, buffer: { type: 'read-only-storage' } },
+                    { binding: 3, visibility: SHADER_STAGE_COMPUTE, buffer: { type: 'read-only-storage' } },
+                    { binding: 4, visibility: SHADER_STAGE_COMPUTE, buffer: { type: 'storage' } }
+                ]
+            });
+
+            const pipelineLayout = this.device.createPipelineLayout({
+                bindGroupLayouts: [this.bindGroupLayout]
+            });
+
+            this.pipeline = this.device.createComputePipeline({
+                layout: pipelineLayout,
+                compute: {
+                    module: shaderModule,
+                    entryPoint: 'main'
+                }
+            });
+
+            return this.device;
+        } catch (err) {
+            console.warn('[WebGPUBitGEMM] WebGPU non disponible:', err.message);
+            this.device = null;
+            return null;
+        }
+    }
+
+    static _getCachedBuffer(device, key, size, usage) {
+        const existing = this.bufferCache.get(key);
+        if (existing && existing.size >= size && existing.usage === usage) {
+            return existing.buffer;
+        }
+        if (existing?.buffer) {
+            try { existing.buffer.destroy(); } catch (_) {}
+        }
+        const buffer = device.createBuffer({ size: Math.max(32, size), usage });
+        this.bufferCache.set(key, { buffer, size, usage });
+        return buffer;
+    }
+
+    /**
+     * Exécute la multiplication BitGEMM vectorisée sur GPU
+     * @param {BitLinearLayer} layer
+     * @param {Uint32Array} packedInputs
+     * @param {number} batchSize
+     * @returns {Promise<Float32Array|null>}
+     */
+    static async executeBitGEMM(layer, packedInputs, batchSize = 1) {
+        const device = await this.getDevice();
+        if (!device || !this.pipeline) return null;
+
+        const inFeat = layer.inFeatures;
+        const outFeat = layer.outFeatures;
+        const wCount = layer.wordsPerInput;
+
+        // 1. Initialisation ou synchronisation paresseuse des poids sur le GPU
+        const weightsBytes = outFeat * wCount * 4;
+        if (!layer._gpuWeightBuffer || layer._gpuWeightBuffer.size < weightsBytes) {
+            if (layer._gpuWeightBuffer) try { layer._gpuWeightBuffer.destroy(); } catch (_) {}
+            layer._gpuWeightBuffer = device.createBuffer({
+                size: weightsBytes,
+                usage: BUFFER_USAGE_STORAGE | BUFFER_USAGE_COPY_DST
+            });
+            layer._gpuDirty = true;
+        }
+
+        const biasesBytes = outFeat * 4;
+        if (!layer._gpuBiasBuffer || layer._gpuBiasBuffer.size < biasesBytes) {
+            if (layer._gpuBiasBuffer) try { layer._gpuBiasBuffer.destroy(); } catch (_) {}
+            layer._gpuBiasBuffer = device.createBuffer({
+                size: biasesBytes,
+                usage: BUFFER_USAGE_STORAGE | BUFFER_USAGE_COPY_DST
+            });
+            layer._gpuDirty = true;
+        }
+
+        if (layer._gpuDirty) {
+            device.queue.writeBuffer(layer._gpuWeightBuffer, 0, layer.packedWeights.subarray(0, outFeat * wCount));
+            device.queue.writeBuffer(layer._gpuBiasBuffer, 0, layer.biases.subarray(0, outFeat));
+            layer._gpuDirty = false;
+        }
+
+        // 2. Buffers d'entrées / sorties mis en cache
+        const inputBytes = batchSize * wCount * 4;
+        const outputBytes = batchSize * outFeat * 4;
+        const inputBuf = this._getCachedBuffer(device, `in_${batchSize}_${wCount}`, inputBytes, BUFFER_USAGE_STORAGE | BUFFER_USAGE_COPY_DST);
+        const outputBuf = this._getCachedBuffer(device, `out_${batchSize}_${outFeat}`, outputBytes, BUFFER_USAGE_STORAGE | BUFFER_USAGE_COPY_SRC);
+        const stagingBuf = this._getCachedBuffer(device, `stage_${batchSize}_${outFeat}`, outputBytes, BUFFER_USAGE_MAP_READ | BUFFER_USAGE_COPY_DST);
+        const uniformBuf = this._getCachedBuffer(device, 'uniform_bitgemm', 32, BUFFER_USAGE_UNIFORM | BUFFER_USAGE_COPY_DST);
+
+        const uniformArray = new ArrayBuffer(32);
+        const u32View = new Uint32Array(uniformArray);
+        const f32View = new Float32Array(uniformArray);
+        u32View[0] = inFeat;
+        u32View[1] = outFeat;
+        u32View[2] = wCount;
+        u32View[3] = layer.lastWordMask;
+        f32View[4] = layer.outputScale;
+        u32View[5] = batchSize;
+        u32View[6] = 0;
+        u32View[7] = 0;
+
+        device.queue.writeBuffer(uniformBuf, 0, uniformArray);
+        device.queue.writeBuffer(inputBuf, 0, packedInputs.subarray(0, batchSize * wCount));
+
+        const bindGroup = device.createBindGroup({
+            layout: this.bindGroupLayout,
+            entries: [
+                { binding: 0, resource: { buffer: uniformBuf } },
+                { binding: 1, resource: { buffer: inputBuf } },
+                { binding: 2, resource: { buffer: layer._gpuWeightBuffer } },
+                { binding: 3, resource: { buffer: layer._gpuBiasBuffer } },
+                { binding: 4, resource: { buffer: outputBuf } }
+            ]
+        });
+
+        const commandEncoder = device.createCommandEncoder();
+        const pass = commandEncoder.beginComputePass();
+        pass.setPipeline(this.pipeline);
+        pass.setBindGroup(0, bindGroup);
+        pass.dispatchWorkgroups(Math.ceil(outFeat / 64), batchSize, 1);
+        pass.end();
+
+        commandEncoder.copyBufferToBuffer(outputBuf, 0, stagingBuf, 0, outputBytes);
+        device.queue.submit([commandEncoder.finish()]);
+
+        await stagingBuf.mapAsync(MAP_MODE_READ, 0, outputBytes);
+        const result = new Float32Array(stagingBuf.getMappedRange(0, outputBytes).slice(0));
+        stagingBuf.unmap();
+
+        return result;
+    }
+}
+
 /**
  * COUCHE LINÉAIRE 1-BIT (BitLinear / BitGEMM)
  * Architecture type BitNet : remplace les multiplications matricielles flottantes
@@ -1898,6 +2163,11 @@ export class BitLinearLayer {
         for (let i = 0; i < this.latentWeights.length; i++) {
             this.latentWeights[i] = (Math.random() * 2 - 1) * scale;
         }
+
+        // Accélération GPU
+        this._gpuWeightBuffer = null;
+        this._gpuBiasBuffer = null;
+        this._gpuDirty = true;
 
         this.quantizeAndPack();
     }
@@ -1956,6 +2226,7 @@ export class BitLinearLayer {
                 }
             }
         }
+        this._gpuDirty = true;
     }
 
     /**
@@ -1994,6 +2265,47 @@ export class BitLinearLayer {
     forwardFloat(inputFloat, zeroMean = true) {
         const packed = BitLinearLayer.packBits(inputFloat, zeroMean);
         return this.forward(packed);
+    }
+
+    /**
+     * Exécute l'inférence BitGEMM accélérée par WebGPU Compute Shader
+     * avec repli transparent sur CPU si aucun périphérique n'est disponible.
+     * @param {Uint32Array} packedInput Entrée pré-packée
+     * @param {number} [batchSize=1] Nombre de vecteurs dans le lot
+     * @returns {Promise<Float32Array>} Activations de sortie
+     */
+    async forwardGPU(packedInput, batchSize = 1) {
+        try {
+            const gpuResult = await WebGPUBitGEMMEngine.executeBitGEMM(this, packedInput, batchSize);
+            if (gpuResult) return gpuResult;
+        } catch (_) {}
+
+        if (batchSize > 1) {
+            const out = new Float32Array(batchSize * this.outFeatures);
+            const wCount = this.wordsPerInput;
+            for (let b = 0; b < batchSize; b++) {
+                const singleIn = packedInput.subarray(b * wCount, (b + 1) * wCount);
+                out.set(this.forward(singleIn), b * this.outFeatures);
+            }
+            return out;
+        }
+        return this.forward(packedInput);
+    }
+
+    /**
+     * Inférence GPU directe depuis des valeurs flottantes
+     * @param {Array<number>|Float32Array} inputFloat
+     * @param {boolean} [zeroMean=true]
+     * @param {number} [batchSize=1]
+     * @returns {Promise<Float32Array>}
+     */
+    async forwardFloatGPU(inputFloat, zeroMean = true, batchSize = 1) {
+        const wCount = this.wordsPerInput;
+        const inFeat = this.inFeatures;
+        const packed = new Uint32Array(batchSize * wCount);
+        const slice = inputFloat.subarray ? inputFloat.subarray(0, inFeat) : inputFloat.slice(0, inFeat);
+        packed.set(BitLinearLayer.packBits(slice, zeroMean), 0);
+        return this.forwardGPU(packed, batchSize);
     }
 
     /**
@@ -2229,6 +2541,12 @@ export class BitLinearLayer {
         if (state.packedWeights) this.packedWeights = new Uint32Array(state.packedWeights);
         if (state.latentWeights) this.latentWeights = new Float32Array(state.latentWeights);
         if (state.biases) this.biases = new Float32Array(state.biases);
+        this._gpuDirty = true;
+    }
+
+    disposeGPU() {
+        if (this._gpuWeightBuffer) { try { this._gpuWeightBuffer.destroy(); } catch (_) {} this._gpuWeightBuffer = null; }
+        if (this._gpuBiasBuffer) { try { this._gpuBiasBuffer.destroy(); } catch (_) {} this._gpuBiasBuffer = null; }
     }
 }
 
@@ -2435,6 +2753,29 @@ export class BitResidualBlock {
         return { z, h1Act, h2Raw, invRms };
     }
 
+    async forwardGPU(x) {
+        const h1Raw = await this.mlp1.forwardFloatGPU(x, true);
+        const h1Act = new Float32Array(this.hiddenDim);
+        for (let i = 0; i < this.hiddenDim; i++) {
+            h1Act[i] = Math.tanh(h1Raw[i]);
+        }
+        const h2Raw = await this.mlp2.forwardFloatGPU(h1Act, true);
+
+        const z = new Float32Array(this.inFeatures);
+        let sumSq = 0;
+        for (let i = 0; i < this.inFeatures; i++) {
+            const val = x[i] + 0.5 * h2Raw[i];
+            z[i] = val;
+            sumSq += val * val;
+        }
+        const rms = Math.sqrt(sumSq / (this.inFeatures || 1)) + 1e-6;
+        const invRms = 1.0 / rms;
+        for (let i = 0; i < this.inFeatures; i++) {
+            z[i] *= invRms;
+        }
+        return { z, h1Act, h2Raw, invRms };
+    }
+
     backwardSTE(x, h1Act, gz, lr = 0.04) {
         const step = lr * 0.4;
         const gh2 = new Float32Array(this.inFeatures);
@@ -2509,6 +2850,11 @@ export class BitResidualBlock {
         this.mlp1.quantizeAndPack();
         this.mlp2.quantizeAndPack();
     }
+
+    disposeGPU() {
+        if (this.mlp1) this.mlp1.disposeGPU();
+        if (this.mlp2) this.mlp2.disposeGPU();
+    }
 }
 
 /**
@@ -2546,9 +2892,28 @@ export class GeneralizedBitClassifier extends BitLinearLayer {
         return { attended, z: current, blockIntermediates };
     }
 
+    async _forwardHiddenStateGPU(inputFloat) {
+        const attended = this.attention ? this.attention.forward(inputFloat) : inputFloat;
+        let current = attended;
+        const blockIntermediates = [];
+
+        for (let b = 0; b < this.blocks.length; b++) {
+            const blockRes = await this.blocks[b].forwardGPU(current);
+            blockIntermediates.push({ input: current, ...blockRes });
+            current = blockRes.z;
+        }
+
+        return { attended, z: current, blockIntermediates };
+    }
+
     forwardFloat(inputFloat, zeroMean = true) {
         const { z } = this._forwardHiddenState(inputFloat);
         return super.forwardFloat(z, zeroMean);
+    }
+
+    async forwardFloatGPU(inputFloat, zeroMean = true, batchSize = 1) {
+        const { z } = await this._forwardHiddenStateGPU(inputFloat);
+        return super.forwardFloatGPU(z, zeroMean, batchSize);
     }
 
     trainStepCrossEntropy(inputFloat, targetClassIdx, lr = 0.02) {
@@ -2737,6 +3102,13 @@ export class GeneralizedBitClassifier extends BitLinearLayer {
             for (const b of this.blocks) b.quantizeAndPack();
         }
         if (this.attention) this.attention.quantizeAndPack();
+    }
+
+    disposeGPU() {
+        super.disposeGPU();
+        if (this.blocks) {
+            for (const b of this.blocks) b.disposeGPU();
+        }
     }
 }
 
@@ -3033,11 +3405,7 @@ export class BitGenerativeLM {
         return vec;
     }
 
-    predictNextWord(contextTokens, temperature = 0.0, allowEos = true, repetitionPenalty = 1.25, step = 3) {
-        const inputVector = this.buildContextVector(contextTokens);
-        const logits = this.classifier.forwardFloat(inputVector, true);
-
-        // Verrouillage Anti-Salade de N-Grams et empilement de mots fonctionnels
+    _processLogitsAndSample(logits, contextTokens, temperature = 0.0, allowEos = true, repetitionPenalty = 1.25, step = 3, inputVector = null) {
         if (Array.isArray(contextTokens) && contextTokens.length > 0) {
             const prevWord = String(contextTokens[contextTokens.length - 1]).toLowerCase().split('_').pop();
             const functionalStopWords = new Set([
@@ -3045,7 +3413,6 @@ export class BitGenerativeLM {
                 'le', 'la', 'les', 'de', 'des', 'du', 'un', 'une', 'et', 'en', 'dans', 'par', 'pour', 'sur'
             ]);
 
-            // Interdiction formelle : deux mots-outils/prépositions consécutifs (ex: "the at", "of the on")
             if (functionalStopWords.has(prevWord)) {
                 for (const badFollower of functionalStopWords) {
                     const bId = this.wordToId.get(badFollower);
@@ -3056,7 +3423,6 @@ export class BitGenerativeLM {
             }
         }
 
-        // Négation native des liaisons impossibles (ex: "des" + singulier)
         if (Array.isArray(contextTokens) && contextTokens.length > 0) {
             const prevWord = contextTokens[contextTokens.length - 1];
             const prevLast = String(prevWord).toLowerCase().split('_').pop();
@@ -3077,7 +3443,6 @@ export class BitGenerativeLM {
             logits[this.wordToId.get("<eos>")] = -Infinity;
         }
 
-        // Neutralisation absolue des tokens système
         for (const special of ["<pad>", "<unk>"]) {
             const sId = this.wordToId.get(special);
             if (sId !== undefined && sId < logits.length) {
@@ -3085,7 +3450,6 @@ export class BitGenerativeLM {
             }
         }
 
-        // Interdiction des ponctuations parasites en tout début de génération
         if (step < 3) {
             for (const punct of ['.', ',', ';', ':', '!', '?', "l'", "d'", "s'", "c'", "n'"]) {
                 const pId = this.wordToId.get(punct);
@@ -3095,7 +3459,6 @@ export class BitGenerativeLM {
             }
         }
 
-        // Neutralisation des artefacts phonétiques et dictionnaires
         for (const badToken of ["a]'shun", "'shun", "shun", "]", "[", "—", "–", "--", "-"]) {
             const badId = this.wordToId.get(badToken);
             if (badId !== undefined && badId < logits.length) {
@@ -3103,22 +3466,21 @@ export class BitGenerativeLM {
             }
         }
 
-        // Pénalité de répétition pour éviter les boucles locales
         if (repetitionPenalty > 1.0 && Array.isArray(contextTokens)) {
             const recent = contextTokens.slice(-6);
             const decay = Math.max(1.1, repetitionPenalty);
             for (const t of recent) {
                 const id = this.wordToId.get(t);
                 if (id !== undefined) {
-                    logits[id] -= 3.0; // Pénalité additive directe sur les logits 1-bit
+                    logits[id] -= 3.0;
                     if (logits[id] > 0) logits[id] /= repetitionPenalty;
                     else logits[id] *= repetitionPenalty;
                 }
             }
         }
 
-        // Résonance Épisodique (Fast-Weights Boost) appliquée après la pénalité pour immuniser le verbatim
-        const resonance = this.episodicMemory.query(inputVector);
+        const queryVector = inputVector || this.buildContextVector(contextTokens);
+        const resonance = this.episodicMemory.query(queryVector);
         if (resonance && resonance.size > 0) {
             for (const [targetId, strength] of resonance) {
                 if (targetId < logits.length) {
@@ -3130,7 +3492,6 @@ export class BitGenerativeLM {
         if (temperature > 0.05) {
             const probs = BitDistillationEngine.softmax(logits, Math.max(0.15, temperature));
             
-            // Filtrage Top-K & Top-P (Nucleus) pour éliminer le bruit de fond et tokens parasites
             const topK = Math.min(24, probs.length);
             const topP = 0.9;
             const indexed = [];
@@ -3165,6 +3526,18 @@ export class BitGenerativeLM {
             }
         }
         return this.idToWord.get(bestId) || "<eos>";
+    }
+
+    predictNextWord(contextTokens, temperature = 0.0, allowEos = true, repetitionPenalty = 1.25, step = 3) {
+        const inputVector = this.buildContextVector(contextTokens);
+        const logits = this.classifier.forwardFloat(inputVector, true);
+        return this._processLogitsAndSample(logits, contextTokens, temperature, allowEos, repetitionPenalty, step, inputVector);
+    }
+
+    async predictNextWordGPU(contextTokens, temperature = 0.0, allowEos = true, repetitionPenalty = 1.25, step = 3) {
+        const inputVector = this.buildContextVector(contextTokens);
+        const logits = await this.classifier.forwardFloatGPU(inputVector, true);
+        return this._processLogitsAndSample(logits, contextTokens, temperature, allowEos, repetitionPenalty, step, inputVector);
     }
 
     /**
@@ -3851,6 +4224,42 @@ export class BitGenerativeLM {
         return generated.join(" ");
     }
 
+    async generateSentenceGPU(seedPrompt, maxWords = 12, temperature = 0.0, tokenizer = null, repetitionPenalty = 1.25) {
+        let tokens;
+        if (Array.isArray(seedPrompt)) {
+            tokens = [...seedPrompt];
+        } else {
+            tokens = tokenizer && typeof tokenizer.tokenize === 'function'
+                ? tokenizer.tokenize(seedPrompt)
+                : (String(seedPrompt).toLowerCase().match(/[a-z0-9àâäéèêëïîôöùûüç_']+/gi) || []);
+        }
+        const generated = [...tokens];
+        const initialLen = tokens.length;
+
+        for (let i = 0; i < maxWords; i++) {
+            const currentStep = generated.length - initialLen;
+            const allowEos = currentStep >= 3;
+            const next = await this.predictNextWordGPU(generated, temperature, allowEos, repetitionPenalty, currentStep);
+            if (!next || next === "<eos>") {
+                break;
+            }
+            if (next === "<pad>" || next === "<unk>") {
+                continue;
+            }
+            generated.push(next);
+
+            const isPunctStop = next === "." || next === "!" || next === "?" ||
+                               next.endsWith(".") || next.endsWith("!") || next.endsWith("?");
+            if (isPunctStop && (generated.length - initialLen) >= 3) {
+                break;
+            }
+        }
+        if (tokenizer && typeof tokenizer.detokenize === 'function') {
+            return tokenizer.detokenize(generated);
+        }
+        return generated.join(" ");
+    }
+
     exportState() {
         return {
             vocab: this.vocab,
@@ -3873,6 +4282,12 @@ export class BitGenerativeLM {
         if (state.episodic) this.episodicMemory.importState(state.episodic);
         if (this.vocabSize > this.classifier.outFeatures) {
             this._expandClassifier(this.vocabSize);
+        }
+    }
+
+    disposeGPU() {
+        if (this.classifier && typeof this.classifier.disposeGPU === 'function') {
+            this.classifier.disposeGPU();
         }
     }
 }

@@ -243,6 +243,7 @@ async function main() {
     const isTestMode = args.includes('--test') || args.includes('--once');
     const isOffline = args.includes('--offline');
     const shouldPurge = args.includes('--purge-first') || args.includes('--purge');
+    const useGPU = args.includes('--gpu') || args.includes('--webgpu');
     const cyclesArg = args.find(a => a.startsWith('--cycles='));
     const lrArg = args.find(a => a.startsWith('--lr='));
     const delayArg = args.find(a => a.startsWith('--delay='));
@@ -261,14 +262,15 @@ async function main() {
     const forceSource = sourceArg ? sourceArg.split('=')[1].toLowerCase() : 'books';
 
     // Profils Pareto pré-calibrés
-    let defaultLR = 0.045;
-    let defaultEpochs = 2;
-    let defaultBatchSize = 20;
+    let defaultLR = 0.05;
+    let defaultEpochs = 1;
+    let defaultBatchSize = 50;
     let defaultContextDim = 256;
     let defaultMergeThreshold = 5;
     let defaultGrammarInterval = 15;
     let defaultMaxTrainPerBatch = 8;
     let defaultMaxTokensPerSeq = 14;
+    let defaultNumBlocks = 1;
 
     if (profileArg) {
         const prof = profileArg.split('=')[1].toLowerCase();
@@ -310,6 +312,21 @@ async function main() {
         }
     }
 
+    let gpuActive = false;
+    if (useGPU) {
+        try {
+            const dev = await neuro.WebGPUBitGEMMEngine.getDevice();
+            if (dev) {
+                gpuActive = true;
+                console.log("⚡ [WebGPU] Compute Shader actif : Inférence BitGEMM accélérée sur GPU.");
+            } else {
+                console.warn("⚠️ [WebGPU] Périphérique WebGPU indisponible, exécution CPU par repli.");
+            }
+        } catch (e) {
+            console.warn("⚠️ [WebGPU] Erreur détection périphérique:", e.message);
+        }
+    }
+
     // 0. Tokenizer adaptatif à fusion progressive
     adaptiveTokenizer = new neuro.AdaptiveMergeTokenizer({ mergeThreshold, maxVocabSize });
     if (fs.existsSync(TOKENIZER_FILE)) {
@@ -323,7 +340,7 @@ async function main() {
 
     // 1. Initialisation du modèle de langage 1-bit
     const initialVocab = ["les", "la", "le", "des", "un", "une", "dans", "avec", "pour", "<eos>"];
-    const bitLM = new neuro.BitGenerativeLM(initialVocab, contextDim, 4);
+    const bitLM = new neuro.BitGenerativeLM(initialVocab, contextDim, 4, contextDim, defaultNumBlocks);
     const bakBitgemm = `${BITGEMM_FILE}.bak`;
     if (fs.existsSync(BITGEMM_FILE)) {
         try {
@@ -445,7 +462,6 @@ const MAX_REPLAY_BUFFER = 60;
                     });
 
                     // Entraînement symbolique direct O(N) sans clôture transitive coûteuse
-                    brain.learnTokens(tokens, false, 1.0);
                     preTokenizedBatch.push(tokens);
 
                     // Enregistrement dans la mémoire de replay à long terme
@@ -468,6 +484,11 @@ const MAX_REPLAY_BUFFER = 60;
                 }
                 const consolidatedTrainBatch = [...freshSubset, ...replaySample];
 
+                // Ingestion symbolique ciblée sur l'échantillon consolidé (évite 50x les tris BigInt quadgrammes)
+                for (const tokens of consolidatedTrainBatch) {
+                    brain.learnTokens(tokens, false, 1.0);
+                }
+
                 // Consolidation multi-passes avec fenêtrage causal continu
                 for (const tokens of consolidatedTrainBatch) {
                     const activeTokens = causalTruncate(tokens, maxTokensPerSeq);
@@ -477,8 +498,8 @@ const MAX_REPLAY_BUFFER = 60;
                     totalSteps += r.steps;
                 }
 
-                // Évolution récursive allégée (cadencée un cycle sur deux, 1 graine, rollout court)
-                if (cycleCount % 2 === 0 && preTokenizedBatch.length > 0) {
+                // Évolution récursive allégée (cadencée tous les 6 cycles pour fluidifier l'ingestion)
+                if (cycleCount % 6 === 0 && preTokenizedBatch.length > 0) {
                     const evoSeeds = [preTokenizedBatch[0]];
                     const evoResult = bitLM.evolveRecursiveGeneralities(evoSeeds, {
                         formalGrammar,
@@ -568,12 +589,16 @@ const MAX_REPLAY_BUFFER = 60;
                 }
             }
 
-            // Génération autorégressive en direct (Inférence BitGEMM 100% binaire)
-            const matchedTokens = adaptiveTokenizer.tokenize(batch[0] || FALLBACK_SENTENCES[0]);
-            const seedPrompt = matchedTokens.slice(0, 2).join(' ');
-            const bitGenerated = bitLM.generateSentence(seedPrompt, 10, genTemperature || 0.4, adaptiveTokenizer, 1.35);
-            console.log(`🤖 Génération 1-Bit (BitGEMM) : "${bitGenerated}"`);
-            console.log(`   (Décodé sans '_')         : "${adaptiveTokenizer.detokenize(bitGenerated.split(' '))}"`);
+            // Génération autorégressive allégée (génération tous les 2 cycles ou au save cycle)
+            if (cycleCount % 2 === 0 || isSaveCycle) {
+                const matchedTokens = adaptiveTokenizer.tokenize(batch[0] || FALLBACK_SENTENCES[0]);
+                const seedPrompt = matchedTokens.slice(0, 2).join(' ');
+                const bitGenerated = gpuActive
+                    ? await bitLM.generateSentenceGPU(seedPrompt, 8, genTemperature || 0.4, adaptiveTokenizer, 1.35)
+                    : bitLM.generateSentence(seedPrompt, 8, genTemperature || 0.4, adaptiveTokenizer, 1.35);
+                console.log(`🤖 Génération 1-Bit (${gpuActive ? 'GPU BitGEMM' : 'CPU BitGEMM'}) : "${bitGenerated}"`);
+                console.log(`   (Décodé sans '_')         : "${adaptiveTokenizer.detokenize(bitGenerated.split(' '))}"`);
+            }
 
             if (formalGrammar) {
                 const sample = generateSample(brain, miner, formalGrammar.neuron, formalGrammar.threshold, seedPrompt, adaptiveTokenizer);
@@ -590,7 +615,8 @@ const MAX_REPLAY_BUFFER = 60;
             console.log(`• Poids BitGEMM 1-bit : ${fs.statSync(BITGEMM_FILE).size} octets (${BITGEMM_FILE})`);
             console.log(`• Vocabulaire BitGEMM : ${bitLM.vocabSize} tokens`);
             console.log(`• Fusions Tokenizer  : ${adaptiveTokenizer.merges.size} super-tokens appris`);
-            console.log(`• Mode d'inférence    : XNOR + Popcount 32-bit (sans FPU)`);
+            console.log(`• Mode d'inférence    : XNOR + Popcount 32-bit (${gpuActive ? 'WebGPU Compute Shader' : 'CPU Natif'})`);
+            if (gpuActive) bitLM.disposeGPU();
             break;
         }
 

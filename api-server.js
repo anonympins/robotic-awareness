@@ -35,6 +35,16 @@ let formalGrammar = null;
 const initialVocab = ["les", "la", "le", "des", "un", "une", "dans", "avec", "pour", "<eos>"];
 let bitLM = new neuro.BitGenerativeLM(initialVocab, 512, 8, 2048, 4);
 let isTraining = false;
+let saveScheduled = false;
+
+function scheduleModelSave(delayMs = 2000) {
+    if (saveScheduled) return;
+    saveScheduled = true;
+    setTimeout(() => {
+        saveModel();
+        saveScheduled = false;
+    }, delayMs);
+}
 let adaptiveTokenizer = new neuro.AdaptiveMergeTokenizer({ mergeThreshold: 5, maxVocabSize: 4096 });
 
 // Cache mémoire pour les évaluations polynomiales
@@ -661,7 +671,7 @@ app.post('/ingest', async (req, res) => {
     const { text, weight = 1.0, lr = 0.045, epochs = 3, retrain_grammar = false } = req.body;
     
     if (isTraining) {
-        return res.status(409).json({ error: "Une session d'entraînement est déjà en cours." });
+        return res.status(429).json({ error: "Entraînement en cours. La requête a été différée." });
     }
 
     if (!text || typeof text !== 'string' || text.trim().length < 5) {
@@ -702,6 +712,11 @@ app.post('/ingest', async (req, res) => {
             const r = bitLM.trainTokens(tokens, effectiveLr, numEpochs, 0.0);
             totalLoss += r.avgLoss;
             totalAcc += r.accuracy;
+
+            // Rend la main à l'Event Loop toutes les 4 phrases pour ne pas figer Express
+            if (i % 4 === 0) {
+                await new Promise(resolve => setImmediate(resolve));
+            }
         }
 
         // 4. Apprentissage explicite des JONCTIONS INTER-PHRASES (Discourse Bridges)
@@ -714,6 +729,7 @@ app.post('/ingest', async (req, res) => {
                 brain.learnTokens(bridgeTokens, false, weight * 0.8);
                 bitLM.trainTokens(bridgeTokens, effectiveLr * 0.75, 1, 0.0);
             }
+            if (i % 10 === 0) await new Promise(resolve => setImmediate(resolve));
         }
 
         // 5. Induction récursive par mutation combinatoire 1-bit (1 seule passe globale sur les amorces du batch)
@@ -737,7 +753,8 @@ app.post('/ingest', async (req, res) => {
             polyScoreCache.clear();
         }
 
-        saveModel();
+        // Sauvegarde asynchrone temporisée pour ne pas bloquer la réponse HTTP
+        scheduleModelSave(1500);
 
         res.json({
             success: true,
