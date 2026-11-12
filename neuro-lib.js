@@ -2070,13 +2070,151 @@ export class BitLinearLayer {
         return { loss, correct: best === targetClassIdx, probs };
     }
 
+    /**
+     * Entraînement 1-bit natif ultra-rapide par contraste bipolaire (Perceptron / Hebbian Winner-Take-All).
+     * Au lieu d'un Softmax et gradient dense O(V * D) flottant avec recalcul complet des poids,
+     * cette méthode met à jour uniquement la classe cible et le rival dominant en O(D).
+     * Les bascules de bits packés sont effectuées in-place en O(1) sans re-quantification globale.
+     * @param {Array<number>|Float32Array} inputFloat
+     * @param {number} targetClassIdx
+     * @param {number} lr
+     * @param {number} margin
+     * @returns {{loss: number, correct: boolean, margin: number}}
+     */
+    trainStepFast1Bit(inputFloat, targetClassIdx, lr = 0.05, margin = 1.0) {
+        const packedIn = BitLinearLayer.packBits(inputFloat, true);
+        const logits = this.forward(packedIn);
+
+        let bestIdx = 0;
+        let bestLogit = -Infinity;
+        let secondIdx = -1;
+        let secondLogit = -Infinity;
+
+        for (let i = 0; i < this.outFeatures; i++) {
+            const l = logits[i];
+            if (l > bestLogit) {
+                secondLogit = bestLogit;
+                secondIdx = bestIdx;
+                bestLogit = l;
+                bestIdx = i;
+            } else if (l > secondLogit) {
+                secondLogit = l;
+                secondIdx = i;
+            }
+        }
+
+        const targetLogit = logits[targetClassIdx];
+        const isCorrect = bestIdx === targetClassIdx;
+        const rivalIdx = isCorrect ? (secondIdx >= 0 ? secondIdx : (targetClassIdx === 0 ? 1 : 0)) : bestIdx;
+        const rivalLogit = logits[rivalIdx];
+        const diff = targetLogit - rivalLogit;
+        const loss = Math.max(0, margin - diff);
+
+        // Si la classe cible mène déjà avec une marge confortable, court-circuit immédiat
+        if (isCorrect && diff >= margin) {
+            return { loss: 0, correct: true, margin: diff };
+        }
+
+        const step = lr * 0.8;
+        const inFeat = this.inFeatures;
+        const wCount = this.wordsPerInput;
+
+        // Ajustement discret des biais
+        this.biases[targetClassIdx] += step * 0.4;
+        this.biases[rivalIdx] -= step * 0.4;
+
+        const targetPackedOffset = targetClassIdx * wCount;
+        const targetLatentOffset = targetClassIdx * inFeat;
+        const rivalPackedOffset = rivalIdx * wCount;
+        const rivalLatentOffset = rivalIdx * inFeat;
+
+        // Mise à jour ciblée uniquement sur les 2 lignes discriminantes en O(D)
+        for (let i = 0; i < inFeat; i++) {
+            const inBit = (packedIn[i >>> 5] >>> (i & 31)) & 1;
+            const x_bipolar = inBit ? 1 : -1;
+            const wordIdx = i >>> 5;
+            const bitMask = 1 << (i & 31);
+
+            // Renforcement classe cible
+            const tIdx = targetLatentOffset + i;
+            const oldT = this.latentWeights[tIdx];
+            const newT = Math.max(-2.0, Math.min(2.0, oldT + step * x_bipolar));
+            this.latentWeights[tIdx] = newT;
+            if ((oldT >= 0) !== (newT >= 0)) {
+                this.packedWeights[targetPackedOffset + wordIdx] ^= bitMask;
+            }
+
+            // Répulsion rival
+            const rIdx = rivalLatentOffset + i;
+            const oldR = this.latentWeights[rIdx];
+            const newR = Math.max(-2.0, Math.min(2.0, oldR - step * x_bipolar));
+            this.latentWeights[rIdx] = newR;
+            if ((oldR >= 0) !== (newR >= 0)) {
+                this.packedWeights[rivalPackedOffset + wordIdx] ^= bitMask;
+            }
+        }
+
+        return { loss, correct: isCorrect, margin: diff };
+    }
+
+    /**
+     * Sauvegarde rapide de l'état des poids binaires pour rollback évolutif sans allocation lourde
+     */
+    backupWeights() {
+        return {
+            packedWeights: new Uint32Array(this.packedWeights.subarray(0, this.outFeatures * this.wordsPerInput)),
+            latentWeights: new Float32Array(this.latentWeights.subarray(0, this.outFeatures * this.inFeatures)),
+            biases: new Float32Array(this.biases.subarray(0, this.outFeatures))
+        };
+    }
+
+    /**
+     * Restaure l'état des poids sauvegardés
+     */
+    restoreWeights(backup) {
+        if (!backup) return;
+        if (backup.packedWeights) this.packedWeights.set(backup.packedWeights);
+        if (backup.latentWeights) this.latentWeights.set(backup.latentWeights);
+        if (backup.biases) this.biases.set(backup.biases);
+    }
+
+    /**
+     * Mutation discrète native par bit-flips sur les poids binaires packés.
+     * En cas de catastrophe évolutive, une fraction de bits est inversée pour
+     * franchir les barrières de potentiel dans l'espace de Hamming.
+     * @param {number} mutationRate Probabilité de bascule par bit (défaut: 0.004)
+     * @param {number} catastropheProb Probabilité d'un sursaut évolutif (défaut: 0.015)
+     * @returns {{flippedCount: number, catastrophe: boolean}}
+     */
+    mutateBits(mutationRate = 0.004, catastropheProb = 0.015) {
+        const isCatastrophe = Math.random() < catastropheProb;
+        const effectiveRate = isCatastrophe ? Math.min(0.08, mutationRate * 12) : mutationRate;
+        let flippedCount = 0;
+
+        for (let o = 0; o < this.outFeatures; o++) {
+            const packedOffset = o * this.wordsPerInput;
+            const latentOffset = o * this.inFeatures;
+
+            for (let i = 0; i < this.inFeatures; i++) {
+                if (Math.random() < effectiveRate) {
+                    const wordIdx = packedOffset + (i >>> 5);
+                    this.packedWeights[wordIdx] ^= (1 << (i & 31));
+                    this.latentWeights[latentOffset + i] = -this.latentWeights[latentOffset + i];
+                    flippedCount++;
+                }
+            }
+        }
+        return { flippedCount, catastrophe: isCatastrophe };
+    }
+
     exportState() {
         return {
             inFeatures: this.inFeatures,
             outFeatures: this.outFeatures,
-            packedWeights: Array.from(this.packedWeights),
-            latentWeights: Array.from(this.latentWeights),
-            biases: Array.from(this.biases)
+            wordsPerInput: this.wordsPerInput,
+            packedWeights: Array.from(this.packedWeights.subarray(0, this.outFeatures * this.wordsPerInput)),
+            latentWeights: Array.from(this.latentWeights.subarray(0, this.outFeatures * this.inFeatures)),
+            biases: Array.from(this.biases.subarray(0, this.outFeatures))
         };
     }
 
@@ -2084,7 +2222,10 @@ export class BitLinearLayer {
         if (!state) return;
         if (state.inFeatures) this.inFeatures = state.inFeatures;
         if (state.outFeatures) this.outFeatures = state.outFeatures;
-        if (state.wordsPerInput) this.wordsPerInput = Math.ceil(this.inFeatures / 32);
+        this.wordsPerInput = Math.ceil(this.inFeatures / 32);
+        const remainder = this.inFeatures % 32;
+        this.lastWordMask = remainder === 0 ? 0xFFFFFFFF : (1 << remainder) - 1;
+        this.outputScale = 1.0 / Math.sqrt(this.inFeatures || 1);
         if (state.packedWeights) this.packedWeights = new Uint32Array(state.packedWeights);
         if (state.latentWeights) this.latentWeights = new Float32Array(state.latentWeights);
         if (state.biases) this.biases = new Float32Array(state.biases);
@@ -2200,15 +2341,8 @@ export class GeneralizedBitAttention {
             // Concordance normalisée sur la partition
             const normScore = (2 * matches - part.len) / (part.len || 1);
 
-            // Calibrage dynamique de la frontière de gating via Dichotomy.findBoundary
-            const boundaryIdx = Dichotomy.findBoundary(
-                GeneralizedBitAttention.CALIBRATION_SPECTRUM,
-                (threshold) => (threshold + this.biases[h]) >= 0
-            );
-            const boundaryVal = (boundaryIdx < GeneralizedBitAttention.CALIBRATION_SPECTRUM.length)
-                ? GeneralizedBitAttention.CALIBRATION_SPECTRUM[boundaryIdx]
-                : 0.0;
-
+            // Frontière de gating sans recherche dichotomique redondante
+            const boundaryVal = -this.biases[h];
             const effectiveMargin = normScore - boundaryVal;
             // Modulation à dualité de signe : résonance pour polarité +1, inhibition pour -1
             const gate = Math.max(0.1, 1.0 + 0.4 * part.polarity * Math.tanh(effectiveMargin * 2.0));
@@ -2263,43 +2397,296 @@ export class GeneralizedBitAttention {
 }
 
 /**
- * CLASSIFIEUR 1-BIT GÉNÉRALISÉ AVEC ATTENTION SÉMANTIQUE
+ * BLOC RÉSIDUEL 1-BIT (BitResidualBlock)
+ * Bloc FFN 1-bit empilable avec ratio d'expansion 4x (d_model -> d_ff -> d_model) :
+ * 1. MLP1 1-bit : inFeatures -> hiddenDim (ex: 512 -> 2048)
+ * 2. Non-linéarité : tanh
+ * 3. MLP2 1-bit : hiddenDim -> inFeatures (ex: 2048 -> 512)
+ * 4. Connexion résiduelle + RMSNorm
+ */
+export class BitResidualBlock {
+    constructor(inFeatures, hiddenDim = null) {
+        this.inFeatures = inFeatures;
+        this.hiddenDim = hiddenDim || (inFeatures * 4);
+        this.mlp1 = new BitLinearLayer(this.inFeatures, this.hiddenDim);
+        this.mlp2 = new BitLinearLayer(this.hiddenDim, this.inFeatures);
+    }
+
+    forward(x) {
+        const h1Raw = this.mlp1.forwardFloat(x, true);
+        const h1Act = new Float32Array(this.hiddenDim);
+        for (let i = 0; i < this.hiddenDim; i++) {
+            h1Act[i] = Math.tanh(h1Raw[i]);
+        }
+        const h2Raw = this.mlp2.forwardFloat(h1Act, true);
+
+        const z = new Float32Array(this.inFeatures);
+        let sumSq = 0;
+        for (let i = 0; i < this.inFeatures; i++) {
+            const val = x[i] + 0.5 * h2Raw[i];
+            z[i] = val;
+            sumSq += val * val;
+        }
+        const rms = Math.sqrt(sumSq / (this.inFeatures || 1)) + 1e-6;
+        const invRms = 1.0 / rms;
+        for (let i = 0; i < this.inFeatures; i++) {
+            z[i] *= invRms;
+        }
+        return { z, h1Act, h2Raw, invRms };
+    }
+
+    backwardSTE(x, h1Act, gz, lr = 0.04) {
+        const step = lr * 0.4;
+        const gh2 = new Float32Array(this.inFeatures);
+        for (let i = 0; i < this.inFeatures; i++) {
+            gh2[i] = gz[i] * 0.5;
+        }
+
+        const gh1Act = new Float32Array(this.hiddenDim);
+        const wCount2 = this.mlp2.wordsPerInput;
+        for (let o = 0; o < this.inFeatures; o++) {
+            const err = gh2[o];
+            if (Math.abs(err) < 1e-6) continue;
+            this.mlp2.biases[o] -= step * err * 0.2;
+            const latentOffset = o * this.hiddenDim;
+            const packedOffset = o * wCount2;
+            for (let j = 0; j < this.hiddenDim; j++) {
+                const xBin = h1Act[j] >= 0 ? 1 : -1;
+                const wLat = this.mlp2.latentWeights[latentOffset + j];
+                const ste = Math.abs(wLat) <= 1.5 ? 1 : 0;
+                const newLat = Math.max(-2.0, Math.min(2.0, wLat - step * err * xBin * ste));
+                this.mlp2.latentWeights[latentOffset + j] = newLat;
+                // Bascule de bit directe in-place en O(1) sans balayage global
+                if ((wLat >= 0) !== (newLat >= 0)) {
+                    this.mlp2.packedWeights[packedOffset + (j >>> 5)] ^= (1 << (j & 31));
+                }
+                gh1Act[j] += err * (wLat >= 0 ? 1 : -1);
+            }
+        }
+
+        const gh1Raw = new Float32Array(this.hiddenDim);
+        for (let j = 0; j < this.hiddenDim; j++) {
+            gh1Raw[j] = gh1Act[j] * (1.0 - h1Act[j] * h1Act[j]);
+        }
+
+        const gx = new Float32Array(this.inFeatures);
+        for (let i = 0; i < this.inFeatures; i++) {
+            gx[i] = gz[i]; // Skip connection gradient
+        }
+
+        const wCount1 = this.mlp1.wordsPerInput;
+        for (let o = 0; o < this.hiddenDim; o++) {
+            const err = gh1Raw[o];
+            if (Math.abs(err) < 1e-6) continue;
+            this.mlp1.biases[o] -= step * err * 0.2;
+            const latentOffset = o * this.inFeatures;
+            const packedOffset = o * wCount1;
+            for (let i = 0; i < this.inFeatures; i++) {
+                const xBin = x[i] >= 0 ? 1 : -1;
+                const wLat = this.mlp1.latentWeights[latentOffset + i];
+                const ste = Math.abs(wLat) <= 1.5 ? 1 : 0;
+                const newLat = Math.max(-2.0, Math.min(2.0, wLat - step * err * xBin * ste));
+                this.mlp1.latentWeights[latentOffset + i] = newLat;
+                if ((wLat >= 0) !== (newLat >= 0)) {
+                    this.mlp1.packedWeights[packedOffset + (i >>> 5)] ^= (1 << (i & 31));
+                }
+                gx[i] += err * (wLat >= 0 ? 1 : -1) * 0.5;
+            }
+        }
+        return gx;
+    }
+
+    mutateBits(mutationRate = 0.004, catastropheProb = 0.015) {
+        const m1 = this.mlp1.mutateBits(mutationRate, catastropheProb);
+        const m2 = this.mlp2.mutateBits(mutationRate, catastropheProb);
+        return {
+            flippedCount: m1.flippedCount + m2.flippedCount,
+            catastrophe: m1.catastrophe || m2.catastrophe
+        };
+    }
+
+    quantizeAndPack() {
+        this.mlp1.quantizeAndPack();
+        this.mlp2.quantizeAndPack();
+    }
+}
+
+/**
+ * CLASSIFIEUR 1-BIT PROFOND (DeepBitClassifier)
+ * 1. Attention dyadique sémantique multi-têtes (GeneralizedBitAttention)
+ * 2. N Blocs Résiduels 1-bit empilés (BitResidualBlock) à ratio 4x (ex: 4 blocs = 8 sous-couches)
+ * 4. Tête de projection 1-bit vers le vocabulaire avec rétropropagation STE complète
  */
 export class GeneralizedBitClassifier extends BitLinearLayer {
-    constructor(inFeatures, outFeatures, numHeads = 4) {
+    constructor(inFeatures, outFeatures, numHeads = 8, hiddenDim = null, numBlocks = 4) {
         super(inFeatures, outFeatures);
         this.attention = new GeneralizedBitAttention(inFeatures, numHeads);
+        this.hiddenDim = hiddenDim || (inFeatures * 4);
+        this.numBlocks = Math.max(1, numBlocks);
+        this.blocks = Array.from({ length: this.numBlocks }, () =>
+            new BitResidualBlock(inFeatures, this.hiddenDim)
+        );
+    }
+
+    /**
+     * Passe avant profonde à N blocs :
+     * Attention -> [BitResidualBlock x N] -> Tête 1-bit
+     */
+    _forwardHiddenState(inputFloat) {
+        const attended = this.attention ? this.attention.forward(inputFloat) : inputFloat;
+        let current = attended;
+        const blockIntermediates = [];
+
+        for (let b = 0; b < this.blocks.length; b++) {
+            const blockRes = this.blocks[b].forward(current);
+            blockIntermediates.push({ input: current, ...blockRes });
+            current = blockRes.z;
+        }
+
+        return { attended, z: current, blockIntermediates };
     }
 
     forwardFloat(inputFloat, zeroMean = true) {
-        const attended = this.attention ? this.attention.forward(inputFloat) : inputFloat;
-        return super.forwardFloat(attended, zeroMean);
+        const { z } = this._forwardHiddenState(inputFloat);
+        return super.forwardFloat(z, zeroMean);
     }
 
     trainStepCrossEntropy(inputFloat, targetClassIdx, lr = 0.02) {
-        const attended = this.attention ? this.attention.forward(inputFloat) : inputFloat;
-        const res = super.trainStepCrossEntropy(attended, targetClassIdx, lr);
+        const { z } = this._forwardHiddenState(inputFloat);
+        const res = super.trainStepCrossEntropy(z, targetClassIdx, lr);
         if (this.attention && !res.correct) {
             this.attention.backwardBatch([{ inputFloat }], lr * 0.2);
         }
         return res;
     }
 
+    trainStepFast1Bit(inputFloat, targetClassIdx, lr = 0.04, margin = 1.0) {
+        const { attended, z, blockIntermediates } = this._forwardHiddenState(inputFloat);
+
+        // 1. Mise à jour contrastive locale de la tête 1-bit
+        const res = super.trainStepFast1Bit(z, targetClassIdx, lr, margin);
+
+        // 2. Rétropropagation STE dans les couches cachées (MLP2 et MLP1) si correction requise
+        if (!res.correct || res.loss > 0) {
+            const step = lr * 0.4;
+            const wCount = this.wordsPerInput;
+            const targetPackedOffset = targetClassIdx * wCount;
+            const rivalIdx = targetClassIdx === 0 ? 1 : 0;
+            const rivalPackedOffset = rivalIdx * wCount;
+
+            // Gradient contrastif rétropropagé au vecteur résiduel z : (W_rival - W_target)
+            const gz = new Float32Array(this.inFeatures);
+            for (let i = 0; i < this.inFeatures; i++) {
+                const wordIdx = i >>> 5;
+                const bitShift = i & 31;
+                const tBit = (this.packedWeights[targetPackedOffset + wordIdx] >>> bitShift) & 1;
+                const rBit = (this.packedWeights[rivalPackedOffset + wordIdx] >>> bitShift) & 1;
+                const wT = tBit ? 1 : -1;
+                const wR = rBit ? 1 : -1;
+                gz[i] = (wR - wT) * this.outputScale;
+            }
+
+            // Rétropropagation récursive à travers les N blocs résiduels
+            let currentGrad = gz;
+            for (let b = this.blocks.length - 1; b >= 0; b--) {
+                const inter = blockIntermediates[b];
+                currentGrad = this.blocks[b].backwardSTE(inter.input, inter.h1Act, currentGrad, lr);
+            }
+        }
+
+        if (this.attention && !res.correct && Math.random() < 0.2) {
+            this.attention.backwardBatch([{ inputFloat }], lr * 0.1);
+        }
+        return res;
+    }
+
+    mutateBits(mutationRate = 0.004, catastropheProb = 0.015) {
+        const headMut = super.mutateBits(mutationRate, catastropheProb);
+        const mlp1Mut = this.mlp1 ? this.mlp1.mutateBits(mutationRate, catastropheProb) : { flippedCount: 0, catastrophe: false };
+        let blockFlipped = 0;
+        let blockCat = false;
+        if (this.blocks) {
+            for (const blk of this.blocks) {
+                const m = blk.mutateBits(mutationRate, catastropheProb);
+                blockFlipped += m.flippedCount;
+                if (m.catastrophe) blockCat = true;
+            }
+        }
+        return {
+            flippedCount: headMut.flippedCount + mlp1Mut.flippedCount + blockFlipped,
+            catastrophe: headMut.catastrophe || mlp1Mut.catastrophe || blockCat
+        };
+    }
+
     exportState() {
         return {
             ...super.exportState(),
+            hiddenDim: this.hiddenDim,
+            numBlocks: this.numBlocks,
             attention: this.attention ? {
                 latentKeys: Array.from(this.attention.latentKeys),
                 packedKeys: Array.from(this.attention.packedKeys),
                 biases: Array.from(this.attention.biases)
-            } : null
+            } : null,
+            blocks: this.blocks.map(b => ({
+                mlp1: b.mlp1.exportState(),
+                mlp2: b.mlp2.exportState()
+            }))
         };
+    }
+
+    backupWeights() {
+        const base = super.backupWeights();
+        base.blocks = this.blocks.map(b => ({
+            mlp1: b.mlp1.backupWeights(),
+            mlp2: b.mlp2.backupWeights()
+        }));
+        if (this.attention) {
+            base.attention = {
+                latentKeys: new Float32Array(this.attention.latentKeys),
+                packedKeys: new Uint32Array(this.attention.packedKeys),
+                biases: new Float32Array(this.attention.biases)
+            };
+        }
+        return base;
+    }
+
+    restoreWeights(backup) {
+        super.restoreWeights(backup);
+        if (backup?.blocks && this.blocks) {
+            for (let i = 0; i < Math.min(this.blocks.length, backup.blocks.length); i++) {
+                this.blocks[i].mlp1.restoreWeights(backup.blocks[i].mlp1);
+                this.blocks[i].mlp2.restoreWeights(backup.blocks[i].mlp2);
+            }
+        }
+        if (this.attention && backup?.attention) {
+            if (backup.attention.latentKeys) this.attention.latentKeys.set(backup.attention.latentKeys);
+            if (backup.attention.packedKeys) this.attention.packedKeys.set(backup.attention.packedKeys);
+            if (backup.attention.biases) this.attention.biases.set(backup.attention.biases);
+        }
     }
 
     importState(state) {
         if (!state) return;
+        if (state.hiddenDim) this.hiddenDim = state.hiddenDim;
+        if (state.numBlocks) this.numBlocks = state.numBlocks;
+        if (state.blocks && Array.isArray(state.blocks)) {
+            if (this.blocks.length !== state.blocks.length) {
+                this.numBlocks = state.blocks.length;
+                this.blocks = Array.from({ length: this.numBlocks }, () =>
+                    new BitResidualBlock(this.inFeatures, this.hiddenDim)
+                );
+            }
+            for (let i = 0; i < this.blocks.length; i++) {
+                if (state.blocks[i]?.mlp1) this.blocks[i].mlp1.importState(state.blocks[i].mlp1);
+                if (state.blocks[i]?.mlp2) this.blocks[i].mlp2.importState(state.blocks[i].mlp2);
+            }
+        }
         super.importState(state);
         if (this.attention && state.attention) {
+            if (this.attention.features !== this.inFeatures) {
+                this.attention = new GeneralizedBitAttention(this.inFeatures, this.attention.numHeads);
+            }
             if (state.attention.latentKeys) this.attention.latentKeys = new Float32Array(state.attention.latentKeys);
             if (state.attention.packedKeys) this.attention.packedKeys = new Uint32Array(state.attention.packedKeys);
             if (state.attention.biases) {
@@ -2346,6 +2733,9 @@ export class GeneralizedBitClassifier extends BitLinearLayer {
 
     quantizeAndPack() {
         super.quantizeAndPack();
+        if (this.blocks) {
+            for (const b of this.blocks) b.quantizeAndPack();
+        }
         if (this.attention) this.attention.quantizeAndPack();
     }
 }
@@ -2355,75 +2745,178 @@ export class GeneralizedBitClassifier extends BitLinearLayer {
  */
 const FNV_PRIME_TABLE = [
     0x01000193, 0x0100045b, 0x010001b3, 0x010002ab,
-    0x0100031f, 0x010003cd, 0x01000499, 0x01000575
+    0x0100031f, 0x010003cd, 0x01000499, 0x01000575,
+    0x010005a3, 0x0100062b, 0x01000681, 0x0100072f,
+    0x0100078d, 0x01000805, 0x01000843, 0x010008a9
 ];
 
 /**
  * MÉMOIRE ÉPISODIQUE RAPIDE (Fast-Weights / Resonant Memory)
- * Stocke les signatures exactes de contexte pour la restitution haute fidélité (verbatim).
+ * Stocke les signatures de contexte de dimension dynamique (256 bits = 8 mots, 512 bits = 16 mots)
+ * avec LSH multi-index et résonance par distance de Hamming.
  */
 export class EpisodicResonanceMemory {
-    constructor(capacity = 32768) {
+    constructor(capacity = 32768, dim = 512) {
         this.capacity = capacity;
-        this.episodes = new Map(); // contextKey (string/bigint) -> Map<tokenId, weight>
+        this.dim = dim;
+        this.numWords = Math.ceil(dim / 32);
+        this.episodes = new Map();
+        this.keyToWords = new Map();
+        this.lshBuckets = Array.from({ length: this.numWords }, () => new Map());
     }
 
-    static computeContextKey(contextVector) {
-        // Encodage binaire exact 256-bit sans aucune collision (8 mots de 32 bits en hex)
-        let key = "";
-        for (let w = 0; w < 8; w++) {
+    vectorToPackedWords(contextVector) {
+        const words = new Uint32Array(this.numWords);
+        for (let w = 0; w < this.numWords; w++) {
             let word = 0;
             const base = w << 5;
-            for (let b = 0; b < 32; b++) {
+            for (let b = 0; b < 32 && (base + b) < contextVector.length; b++) {
                 if (contextVector[base + b] >= 0) {
                     word |= (1 << b);
                 }
             }
-            key += (word >>> 0).toString(16).padStart(8, '0');
+            words[w] = word >>> 0;
+        }
+        return words;
+    }
+
+    static wordsToKey(words) {
+        let key = "";
+        for (let w = 0; w < words.length; w++) {
+            key += (words[w] >>> 0).toString(16).padStart(8, '0');
         }
         return key;
     }
 
+    computeContextKey(contextVector) {
+        return EpisodicResonanceMemory.wordsToKey(this.vectorToPackedWords(contextVector));
+    }
+
+    static hammingDistance(wordsA, wordsB) {
+        let dist = 0;
+        const len = Math.min(wordsA.length, wordsB.length);
+        for (let w = 0; w < len; w++) {
+            dist += BitLinearLayer.popcnt32(wordsA[w] ^ wordsB[w]);
+        }
+        return dist;
+    }
+
     record(contextVector, targetTokenId, weight = 1.0) {
-        const key = EpisodicResonanceMemory.computeContextKey(contextVector);
+        const words = this.vectorToPackedWords(contextVector);
+        const key = EpisodicResonanceMemory.wordsToKey(words);
         if (!this.episodes.has(key)) {
             if (this.episodes.size >= this.capacity) {
                 const firstKey = this.episodes.keys().next().value;
+                const oldWords = this.keyToWords.get(firstKey);
+                if (oldWords) {
+                    for (let w = 0; w < this.numWords; w++) {
+                        this.lshBuckets[w].get(oldWords[w])?.delete(firstKey);
+                    }
+                    this.keyToWords.delete(firstKey);
+                }
                 this.episodes.delete(firstKey);
             }
             this.episodes.set(key, new Map());
+            this.keyToWords.set(key, words);
+            for (let w = 0; w < this.numWords; w++) {
+                if (!this.lshBuckets[w].has(words[w])) {
+                    this.lshBuckets[w].set(words[w], new Set());
+                }
+                this.lshBuckets[w].get(words[w]).add(key);
+            }
         }
         const targets = this.episodes.get(key);
         targets.set(targetTokenId, (targets.get(targetTokenId) || 0) + weight);
     }
 
-    query(contextVector) {
-        const key = EpisodicResonanceMemory.computeContextKey(contextVector);
-        return this.episodes.get(key) || null;
+    query(contextVector, allowAssociative = true) {
+        const words = this.vectorToPackedWords(contextVector);
+        const exactKey = EpisodicResonanceMemory.wordsToKey(words);
+        const exact = this.episodes.get(exactKey);
+        if (exact) return exact;
+
+        if (!allowAssociative || this.episodes.size === 0) return null;
+
+        const candidateKeys = new Set();
+        for (let b = 0; b < this.numWords; b++) {
+            const bucket = this.lshBuckets[b].get(words[b]);
+            if (bucket) {
+                for (const k of bucket) {
+                    candidateKeys.add(k);
+                    if (candidateKeys.size >= 48) break;
+                }
+            }
+            if (candidateKeys.size >= 48) break;
+        }
+
+        if (candidateKeys.size === 0) return null;
+
+        const aggregated = new Map();
+        const totalBits = this.numWords * 32;
+        const MAX_HAMMING = Math.floor(totalBits * 0.25); // >= 75% similarité
+
+        for (const candKey of candidateKeys) {
+            const candWords = this.keyToWords.get(candKey);
+            if (!candWords) continue;
+            const dist = EpisodicResonanceMemory.hammingDistance(words, candWords);
+            if (dist <= MAX_HAMMING) {
+                const simRatio = (totalBits - dist) / totalBits;
+                const simWeight = simRatio * simRatio;
+                const targets = this.episodes.get(candKey);
+                if (targets) {
+                    for (const [targetId, strength] of targets) {
+                        aggregated.set(targetId, (aggregated.get(targetId) || 0) + strength * simWeight);
+                    }
+                }
+            }
+        }
+
+        return aggregated.size > 0 ? aggregated : null;
     }
 
     exportState() {
-        return Array.from(this.episodes.entries()).map(([k, map]) => [k, Array.from(map.entries())]);
+        return {
+            dim: this.dim,
+            capacity: this.capacity,
+            episodes: Array.from(this.episodes.entries()).map(([k, map]) => [k, Array.from(map.entries())])
+        };
     }
 
     importState(state) {
-        if (!Array.isArray(state)) return;
-        this.episodes = new Map(state.map(([k, entries]) => [k, new Map(entries)]));
+        if (!state) return;
+        const entries = Array.isArray(state) ? state : state.episodes;
+        if (!Array.isArray(entries)) return;
+        if (state.dim) {
+            this.dim = state.dim;
+            this.numWords = Math.ceil(this.dim / 32);
+        }
+        this.episodes.clear();
+        this.keyToWords.clear();
+        this.lshBuckets = Array.from({ length: this.numWords }, () => new Map());
+        this.episodes = new Map(entries.map(([k, list]) => [k, new Map(list)]));
+        for (const key of this.episodes.keys()) {
+            const words = new Uint32Array(this.numWords);
+            for (let w = 0; w < this.numWords; w++) {
+                const chunk = key.slice(w * 8, (w + 1) * 8);
+                words[w] = chunk ? (parseInt(chunk, 16) >>> 0) : 0;
+            }
+            this.keyToWords.set(key, words);
+            for (let w = 0; w < this.numWords; w++) {
+                if (!this.lshBuckets[w].has(words[w])) {
+                    this.lshBuckets[w].set(words[w], new Set());
+                }
+                this.lshBuckets[w].get(words[w]).add(key);
+            }
+        }
     }
 }
 
 /**
- * MODÈLE DE LANGAGE GÉNÉRATIF 1-BIT (BitGenerativeLM)
- * Génère des phrases mot à mot en pure logique bit-à-bit (XNOR + Popcount).
- * Équipé d'une mémoire rapide holographique (Fast-Weights) pour garantir une restitution à ~100%.
+ * MODÈLE DE LANGAGE GÉNÉRATIF 1-BIT ÉTALONNÉ (BitGenerativeLM)
+ * Modèle de poche profond : d_model=512, d_ff=2048, 4 blocs résiduels (8 sous-couches) + attention dyadique 8 têtes.
  */
 export class BitGenerativeLM {
-    /**
-     * @param {string[]} vocabulary Liste ordonnée des mots connus
-     * @param {number} contextDim Dimension de contexte (256 par défaut selon Cover)
-     * @param {number} numHeads Nombre de têtes d'attention
-     */
-    constructor(vocabulary, contextDim = 256, numHeads = 4) {
+    constructor(vocabulary, contextDim = 512, numHeads = 8, hiddenDim = 2048, numBlocks = 4) {
         this.vocab = [...vocabulary];
         if (!this.vocab.includes("<eos>")) this.vocab.push("<eos>");
         this.wordToId = new Map(this.vocab.map((w, idx) => [w, idx]));
@@ -2431,44 +2924,108 @@ export class BitGenerativeLM {
         this.vocabSize = this.vocab.length;
         this.contextDim = contextDim;
 
-        // Classifieur autorégressif 1-bit : Contexte -> Distribution sur le Vocabulaire
-        this.classifier = new GeneralizedBitClassifier(contextDim, this.vocabSize, numHeads);
-        // Mémoire de résonance épisodique pour restitution verbatim
-        this.episodicMemory = new EpisodicResonanceMemory();
+        // Cache mémoire pour l'encodage morphologique SimHash (token + pos)
+        this._wordEmbedCache = new Map();
+        this._maxWordEmbedCache = 8192;
+
+        this.classifier = new GeneralizedBitClassifier(contextDim, this.vocabSize, numHeads, hiddenDim, numBlocks);
+        this.classifier.allocatedCapacity = this.vocabSize;
+        this.episodicMemory = new EpisodicResonanceMemory(32768, contextDim);
     }
 
+    /**
+     * Encodage morphologique généralisant par SimHash de sous-mots (Char 3-grams)
+     * Préserve la similarité de chaîne : les mots proches partagent la majorité de leurs bits.
+     */
     encodeWord(word, pos = 0, out = new Float32Array(this.contextDim)) {
+        const cacheKey = `${word}\x1f${pos}`;
+        if (this._wordEmbedCache.has(cacheKey)) {
+            out.set(this._wordEmbedCache.get(cacheKey));
+            return out;
+        }
+
         out.fill(0);
-        const clean = String(word).toLowerCase();
+        const clean = `_${String(word).toLowerCase()}_`;
         const wordsCount = Math.ceil(this.contextDim / 32);
-        
-        for (let w = 0; w < wordsCount; w++) {
-            const prime = FNV_PRIME_TABLE[w % FNV_PRIME_TABLE.length];
-            let h = (0x811c9dc5 ^ Math.imul(pos + 1 + w * 17, 0x45d9f3b)) >>> 0;
-            for (let i = 0; i < clean.length; i++) {
-                const c = clean.charCodeAt(i);
-                h = Math.imul(h ^ c, prime);
-            }
-            const baseD = w * 32;
-            for (let b = 0; b < 32 && (baseD + b) < this.contextDim; b++) {
-                out[baseD + b] = (((h >>> b) & 1) === 1) ? 1.0 : -1.0;
+        const accumulator = new Int16Array(this.contextDim);
+
+        // Permutation circulaire (Roll) selon la position pour détruire la commutativité A+B = B+A
+        const shift = ((pos * 13) % this.contextDim);
+        const wordShift = shift >>> 5;
+        const bitShift = shift & 31;
+
+        // Extraction des trigrammes de caractères pour capture morphologique
+        const ngrams = [];
+        if (clean.length <= 3) {
+            ngrams.push(clean);
+        } else {
+            for (let i = 0; i <= clean.length - 3; i++) {
+                ngrams.push(clean.substring(i, i + 3));
             }
         }
+
+        for (const gram of ngrams) {
+            for (let w = 0; w < wordsCount; w++) {
+                const prime = FNV_PRIME_TABLE[w % FNV_PRIME_TABLE.length];
+                let h = (0x811c9dc5 ^ Math.imul(w + 1, 0x45d9f3b)) >>> 0;
+                for (let i = 0; i < gram.length; i++) {
+                    h = Math.imul(h ^ gram.charCodeAt(i), prime);
+                }
+                // Application de la permutation circulaire
+                const targetW = (w + wordShift) % wordsCount;
+                const rolledH = (h << bitShift) | (h >>> (32 - bitShift));
+                const baseD = targetW * 32;
+
+                for (let b = 0; b < 32 && (baseD + b) < this.contextDim; b++) {
+                    accumulator[baseD + b] += ((rolledH >>> b) & 1) ? 1 : -1;
+                }
+            }
+        }
+
+        // Encodage positionnel circulaire (Fourier / Phase shift discret)
+        const posAngle = (pos * 1.61803398875); // Nombre d'or pour décorrélation spatiale
+        for (let d = 0; d < this.contextDim; d++) {
+            const posModulation = Math.sin(posAngle + d * 0.392699) > 0 ? 1 : -1;
+            out[d] = (accumulator[d] + posModulation >= 0) ? 1.0 : -1.0;
+        }
+
+        if (this._wordEmbedCache.size >= this._maxWordEmbedCache) {
+            this._wordEmbedCache.clear();
+        }
+        this._wordEmbedCache.set(cacheKey, new Float32Array(out));
         return out;
     }
 
     buildContextVector(tokens) {
         const vec = new Float32Array(this.contextDim);
-        const recent = tokens.slice(-4);
-        const len = recent.length;
-        for (let t = 0; t < len; t++) {
-            const relPos = len - 1 - t; // 0 = prédécesseur immédiat, 1 = 2 crans en arrière...
-            const wordVec = this.encodeWord(recent[t], relPos);
-            const recencyWeight = (t + 1) / len;
+        const len = tokens.length;
+        if (len === 0) return vec;
+
+        // 1. Échelle locale fine (jusqu'à 16 tokens récents) : priorité à la grammaire immédiate
+        const localTokens = tokens.slice(-16);
+        const localLen = localTokens.length;
+        for (let t = 0; t < localLen; t++) {
+            const relPos = localLen - 1 - t;
+            const wordVec = this.encodeWord(localTokens[t], relPos);
+            const recencyWeight = Math.pow(1.35, t);
             for (let d = 0; d < this.contextDim; d++) {
                 vec[d] += wordVec[d] * recencyWeight;
             }
         }
+
+        // 2. Échelle macro-sémantique (jusqu'aux 32 tokens précédents) : ancrage thématique
+        if (len > 4) {
+            const macroTokens = tokens.slice(Math.max(0, len - 32), Math.max(0, len - 4));
+            const macroLen = macroTokens.length;
+            const macroWeight = 0.35 / (macroLen || 1);
+            for (let t = 0; t < macroLen; t++) {
+                const wordVec = this.encodeWord(macroTokens[t], 7);
+                for (let d = 0; d < this.contextDim; d++) {
+                    vec[d] += wordVec[d] * macroWeight;
+                }
+            }
+        }
+
         let norm = 0;
         for (let d = 0; d < this.contextDim; d++) norm += vec[d] * vec[d];
         norm = Math.sqrt(norm) || 1.0;
@@ -2476,12 +3033,74 @@ export class BitGenerativeLM {
         return vec;
     }
 
-    predictNextWord(contextTokens, temperature = 0.0, allowEos = true, repetitionPenalty = 1.25) {
+    predictNextWord(contextTokens, temperature = 0.0, allowEos = true, repetitionPenalty = 1.25, step = 3) {
         const inputVector = this.buildContextVector(contextTokens);
         const logits = this.classifier.forwardFloat(inputVector, true);
 
+        // Verrouillage Anti-Salade de N-Grams et empilement de mots fonctionnels
+        if (Array.isArray(contextTokens) && contextTokens.length > 0) {
+            const prevWord = String(contextTokens[contextTokens.length - 1]).toLowerCase().split('_').pop();
+            const functionalStopWords = new Set([
+                'the', 'a', 'an', 'at', 'of', 'on', 'in', 'and', 'or', 'to', 'for', 'with', 'by', 'from',
+                'le', 'la', 'les', 'de', 'des', 'du', 'un', 'une', 'et', 'en', 'dans', 'par', 'pour', 'sur'
+            ]);
+
+            // Interdiction formelle : deux mots-outils/prépositions consécutifs (ex: "the at", "of the on")
+            if (functionalStopWords.has(prevWord)) {
+                for (const badFollower of functionalStopWords) {
+                    const bId = this.wordToId.get(badFollower);
+                    if (bId !== undefined && bId < logits.length) {
+                        logits[bId] = -Infinity;
+                    }
+                }
+            }
+        }
+
+        // Négation native des liaisons impossibles (ex: "des" + singulier)
+        if (Array.isArray(contextTokens) && contextTokens.length > 0) {
+            const prevWord = contextTokens[contextTokens.length - 1];
+            const prevLast = String(prevWord).toLowerCase().split('_').pop();
+            if (BitGenerativeLM.isDeterminer(prevLast)) {
+                for (let i = 0; i < logits.length; i++) {
+                    if (logits[i] === -Infinity) continue;
+                    const candWord = this.idToWord.get(i);
+                    if (!candWord) continue;
+                    const clash = BitGenerativeLM.checkSyntacticClash(prevWord, candWord, null);
+                    if (clash.clash) {
+                        logits[i] += clash.penalty;
+                    }
+                }
+            }
+        }
+
         if (!allowEos && this.wordToId.has("<eos>")) {
             logits[this.wordToId.get("<eos>")] = -Infinity;
+        }
+
+        // Neutralisation absolue des tokens système
+        for (const special of ["<pad>", "<unk>"]) {
+            const sId = this.wordToId.get(special);
+            if (sId !== undefined && sId < logits.length) {
+                logits[sId] = -Infinity;
+            }
+        }
+
+        // Interdiction des ponctuations parasites en tout début de génération
+        if (step < 3) {
+            for (const punct of ['.', ',', ';', ':', '!', '?', "l'", "d'", "s'", "c'", "n'"]) {
+                const pId = this.wordToId.get(punct);
+                if (pId !== undefined && pId < logits.length) {
+                    logits[pId] = -Infinity;
+                }
+            }
+        }
+
+        // Neutralisation des artefacts phonétiques et dictionnaires
+        for (const badToken of ["a]'shun", "'shun", "shun", "]", "[", "—", "–", "--", "-"]) {
+            const badId = this.wordToId.get(badToken);
+            if (badId !== undefined && badId < logits.length) {
+                logits[badId] = -Infinity;
+            }
         }
 
         // Pénalité de répétition pour éviter les boucles locales
@@ -2549,6 +3168,150 @@ export class BitGenerativeLM {
     }
 
     /**
+     * Exporte les meilleurs candidats avec leurs probabilités Softmax pour la fusion hybride.
+     * @param {string[]} contextTokens
+     * @param {number} [topK=24]
+     * @param {number} [temperature=0.7]
+     * @param {boolean} [allowEos=true]
+     * @param {number} [repetitionPenalty=1.25]
+     * @param {number} [step=3]
+     * @returns {{candidates: Array<{token: string, prob: number, score: number}>, entropy: number, confidence: number}}
+     */
+    getTopCandidates(contextTokens, topK = 24, temperature = 0.7, allowEos = true, repetitionPenalty = 1.25, step = 3) {
+        const inputVector = this.buildContextVector(contextTokens);
+        const logits = this.classifier.forwardFloat(inputVector, true);
+
+        // Négation native des liaisons impossibles (ex: "des" + singulier)
+        if (Array.isArray(contextTokens) && contextTokens.length > 0) {
+            const prevWord = contextTokens[contextTokens.length - 1];
+            const prevLast = String(prevWord).toLowerCase().split('_').pop();
+            if (BitGenerativeLM.isDeterminer(prevLast)) {
+                for (let i = 0; i < logits.length; i++) {
+                    if (logits[i] === -Infinity) continue;
+                    const candWord = this.idToWord.get(i);
+                    if (!candWord) continue;
+                    const clash = BitGenerativeLM.checkSyntacticClash(prevWord, candWord, null);
+                    if (clash.clash) {
+                        logits[i] += clash.penalty;
+                    }
+                }
+            }
+        }
+
+        if (!allowEos && this.wordToId.has("<eos>")) {
+            logits[this.wordToId.get("<eos>")] = -Infinity;
+        }
+
+        for (const special of ["<pad>", "<unk>"]) {
+            const sId = this.wordToId.get(special);
+            if (sId !== undefined && sId < logits.length) {
+                logits[sId] = -Infinity;
+            }
+        }
+
+        // Pénalité ponctuation précoce
+        if (step < 3) {
+            for (const punct of ['.', ',', ';', ':', '!', '?', "l'", "d'", "s'", "c'", "n'"]) {
+                const pId = this.wordToId.get(punct);
+                if (pId !== undefined && pId < logits.length) {
+                    logits[pId] = -Infinity;
+                }
+            }
+        }
+
+        for (const badToken of ["a]'shun", "'shun", "shun", "]", "[", "—", "–", "--", "-"]) {
+            const badId = this.wordToId.get(badToken);
+            if (badId !== undefined && badId < logits.length) {
+                logits[badId] = -Infinity;
+            }
+        }
+
+        if (repetitionPenalty > 1.0 && Array.isArray(contextTokens)) {
+            const recent = contextTokens.slice(-6);
+            for (const t of recent) {
+                const id = this.wordToId.get(t);
+                if (id !== undefined) {
+                    logits[id] -= 3.0;
+                    if (logits[id] > 0) logits[id] /= repetitionPenalty;
+                    else logits[id] *= repetitionPenalty;
+                }
+            }
+        }
+
+        const resonance = this.episodicMemory.query(inputVector);
+        if (resonance && resonance.size > 0) {
+            for (const [targetId, strength] of resonance) {
+                if (targetId < logits.length) {
+                    logits[targetId] += Math.min(30.0, 10.0 + strength * 5.0);
+                }
+            }
+        }
+
+        const probs = BitDistillationEngine.softmax(logits, Math.max(0.1, temperature));
+        const candidates = [];
+        for (let i = 0; i < probs.length; i++) {
+            if (probs[i] > 1e-5) {
+                candidates.push({
+                    token: this.idToWord.get(i) || "<unk>",
+                    prob: probs[i],
+                    score: logits[i]
+                });
+            }
+        }
+        candidates.sort((a, b) => b.prob - a.prob);
+        const topItems = candidates.slice(0, topK);
+
+        // Calcul de l'entropie de Shannon sur les candidats
+        let entropy = 0;
+        let sumP = 0;
+        for (const item of topItems) sumP += item.prob;
+        if (sumP > 0) {
+            for (const item of topItems) {
+                const normP = item.prob / sumP;
+                if (normP > 1e-12) {
+                    entropy -= normP * Math.log2(normP);
+                }
+            }
+        }
+        const maxEntropy = topItems.length > 1 ? Math.log2(topItems.length) : 1.0;
+        const normEntropy = maxEntropy > 0 ? (entropy / maxEntropy) : 1.0;
+        const confidence = Math.max(0.0, 1.0 - normEntropy);
+
+        return {
+            candidates: topItems,
+            entropy: normEntropy,
+            confidence
+        };
+    }
+
+    /**
+     * Score de log-vraisemblance d'une séquence candidate (Reranker 1-bit)
+     * @param {string[]} contextTokens 
+     * @param {string[]} candidateTokens 
+     * @returns {number} Score moyen de log-probabilité
+     */
+    scoreSequence(contextTokens, candidateTokens) {
+        if (!candidateTokens || candidateTokens.length === 0) return 0;
+        let totalLogProb = 0;
+        const running = [...contextTokens];
+
+        for (const token of candidateTokens) {
+            const targetId = this.wordToId.get(token);
+            if (targetId === undefined) {
+                totalLogProb -= 8.0;
+                running.push(token);
+                continue;
+            }
+            const inputVector = this.buildContextVector(running);
+            const logits = this.classifier.forwardFloat(inputVector, true);
+            const probs = BitDistillationEngine.softmax(logits, 1.0);
+            totalLogProb += Math.log(Math.max(1e-8, probs[targetId]));
+            running.push(token);
+        }
+        return totalLogProb / candidateTokens.length;
+    }
+
+    /**
      * Ajoute dynamiquement un mot et étend la matrice BitGEMM
      */
     addWord(word) {
@@ -2567,27 +3330,58 @@ export class BitGenerativeLM {
         const oldOut = this.classifier.outFeatures;
         if (newOutFeatures <= oldOut) return;
         const inFeat = this.classifier.inFeatures;
-        const wordsPerInput = this.classifier.wordsPerInput;
+        const wordsPerInput = Math.ceil(inFeat / 32);
+        this.classifier.wordsPerInput = wordsPerInput;
+        const currentCapacity = this.classifier.allocatedCapacity || oldOut;
 
-        const newPacked = new Uint32Array(newOutFeatures * wordsPerInput);
-        newPacked.set(this.classifier.packedWeights);
+        if (newOutFeatures > currentCapacity) {
+            const nextCapacity = Math.max(newOutFeatures, Math.ceil(currentCapacity * 1.5) + 64);
+            const newPacked = new Uint32Array(nextCapacity * wordsPerInput);
+            if (this.classifier.packedWeights) {
+                const copyLen = Math.min(newPacked.length, oldOut * wordsPerInput);
+                newPacked.set(this.classifier.packedWeights.subarray(0, copyLen));
+            }
 
-        const newLatent = new Float32Array(newOutFeatures * inFeat);
-        newLatent.set(this.classifier.latentWeights);
+            const newLatent = new Float32Array(nextCapacity * inFeat);
+            if (this.classifier.latentWeights) {
+                const copyLen = Math.min(newLatent.length, oldOut * inFeat);
+                newLatent.set(this.classifier.latentWeights.subarray(0, copyLen));
+            }
 
-        const newBiases = new Float32Array(newOutFeatures);
-        newBiases.set(this.classifier.biases);
+            const newBiases = new Float32Array(nextCapacity);
+            if (this.classifier.biases) {
+                const copyLen = Math.min(newBiases.length, oldOut);
+                newBiases.set(this.classifier.biases.subarray(0, copyLen));
+            }
 
+            this.classifier.packedWeights = newPacked;
+            this.classifier.latentWeights = newLatent;
+            this.classifier.biases = newBiases;
+            this.classifier.allocatedCapacity = nextCapacity;
+        }
+
+        // Initialisation Xavier ciblée uniquement sur les nouvelles lignes
         const scale = Math.sqrt(2 / (inFeat + newOutFeatures));
-        for (let i = oldOut * inFeat; i < newLatent.length; i++) {
-            newLatent[i] = (Math.random() * 2 - 1) * scale;
+        for (let i = oldOut * inFeat; i < newOutFeatures * inFeat; i++) {
+            this.classifier.latentWeights[i] = (Math.random() * 2 - 1) * scale;
+        }
+
+        // Quantification bitwise in-place ciblée sans repack global
+        for (let o = oldOut; o < newOutFeatures; o++) {
+            this.classifier.biases[o] = 0.0;
+            const latentOffset = o * inFeat;
+            const packedOffset = o * wordsPerInput;
+            for (let w = 0; w < wordsPerInput; w++) {
+                this.classifier.packedWeights[packedOffset + w] = 0;
+            }
+            for (let i = 0; i < inFeat; i++) {
+                if (this.classifier.latentWeights[latentOffset + i] >= 0) {
+                    this.classifier.packedWeights[packedOffset + (i >>> 5)] |= (1 << (i & 31));
+                }
+            }
         }
 
         this.classifier.outFeatures = newOutFeatures;
-        this.classifier.packedWeights = newPacked;
-        this.classifier.latentWeights = newLatent;
-        this.classifier.biases = newBiases;
-        this.classifier.quantizeAndPack();
     }
 
     /**
@@ -2597,7 +3391,7 @@ export class BitGenerativeLM {
      * @returns {{steps: number, avgLoss: number, accuracy: number}}
      */
     trainTokens(tokens, lr = 0.04, epochs = 1, selfInductionRate = 0.0) {
-        const cleanTokens = (tokens || []).filter(t => t && t.length > 0);
+        const cleanTokens = (tokens || []).filter(t => t && t.length > 0 && t !== '<pad>' && t !== '<unk>');
         if (cleanTokens.length < 2) return { steps: 0, avgLoss: 0, accuracy: 0 };
 
         if (cleanTokens[cleanTokens.length - 1] !== "<eos>") {
@@ -2639,10 +3433,12 @@ export class BitGenerativeLM {
                     }
                 }
 
-                const stepRes = this.classifier.trainStepCrossEntropy(inputVector, targetIdx, currentLr);
+                const stepRes = this.classifier.trainStepFast1Bit
+                    ? this.classifier.trainStepFast1Bit(inputVector, targetIdx, currentLr)
+                    : this.classifier.trainStepCrossEntropy(inputVector, targetIdx, currentLr);
 
                 // Évaluation combinée du modèle hybride complet (Slow Weights + Fast Episodic Memory)
-                const resonance = this.episodicMemory.query(inputVector);
+                const resonance = this.episodicMemory.query(inputVector, false);
                 const isMemorized = resonance && resonance.has(targetIdx);
                 const effectiveCorrect = isMemorized || stepRes.correct;
                 
@@ -2695,6 +3491,315 @@ export class BitGenerativeLM {
     }
 
     /**
+     * Détecte si un token correspond à un déterminant strict (gestion des super-tokens avec '_').
+     * @param {string} word
+     * @returns {boolean}
+     */
+    static isDeterminer(word) {
+        if (!word) return false;
+        const w = String(word).toLowerCase().split('_').pop();
+        return ['des', 'les', 'ces', 'mes', 'tes', 'ses', 'nos', 'vos', 'leurs', 'plusieurs', 'quelques',
+                'le', 'la', 'un', 'une', 'ce', 'cette', 'mon', 'ton', 'son', 'notre', 'votre',
+                'these', 'those', 'several', 'many', 'this', 'that', 'each', 'every'].includes(w);
+    }
+
+    /**
+     * Évalue et pénalise les incompatibilités syntaxiques dures et de zéro co-occurrence
+     * (ex: "des" suivi d'un singulier comme "rationnelle", ou déterminant suivi de ponctuation).
+     */
+    static checkSyntacticClash(prevWord, candWord, brain = null) {
+        if (!prevWord || !candWord) return { clash: false, penalty: 0, reason: null };
+        const prev = prevWord.toLowerCase().split('_').pop();
+        const cand = candWord.toLowerCase().split('_')[0];
+
+        const pluralDets = new Set(['des', 'les', 'ces', 'mes', 'tes', 'ses', 'nos', 'vos', 'leurs', 'plusieurs', 'quelques', 'these', 'those', 'several', 'many']);
+        const singularDets = new Set(['le', 'la', 'un', 'une', 'ce', 'cette', 'mon', 'ton', 'son', 'notre', 'votre', 'this', 'that', 'each', 'every']);
+        const invariantSingulars = new Set(['pas', 'plus', 'temps', 'corps', 'mois', 'pays', 'fois', 'cours', 'sens', 'bras', 'poids', 'voix', 'choix']);
+
+        const prevId = brain?.vocabulary?.get(prev);
+        const candId = brain?.vocabulary?.get(cand);
+        const directTransitionExists = prevId !== undefined && candId !== undefined && brain?.grammarMap?.get(prevId)?.has(candId);
+
+        // 1. Clash Accord Pluriel : "des" + singulier non marqué (ex: "des rationnelle")
+        if (pluralDets.has(prev)) {
+            const hasPluralEnding = cand.endsWith('s') || cand.endsWith('x');
+            if (!hasPluralEnding && !directTransitionExists) {
+                return { clash: true, penalty: -35.0, reason: `accord_pluriel_rompu (${prev} + ${cand})` };
+            }
+        }
+
+        // 2. Clash Accord Singulier : "une" + pluriel (ex: "une galaxies")
+        if (singularDets.has(prev)) {
+            const hasPluralEnding = (cand.endsWith('s') || cand.endsWith('x')) && !invariantSingulars.has(cand);
+            if (hasPluralEnding && !directTransitionExists) {
+                return { clash: true, penalty: -35.0, reason: `accord_singulier_rompu (${prev} + ${cand})` };
+            }
+        }
+
+        // 3. Répulsion de Zéro Co-occurrence sur mots fonctionnels stricts
+        if (prevId !== undefined && candId !== undefined && brain?.isStructural?.(prevId)) {
+            const transitions = brain.grammarMap.get(prevId);
+            if (transitions && transitions.size >= 5 && !transitions.has(candId)) {
+                return { clash: true, penalty: -18.0, reason: `zero_cooccurrence_structurelle (${prev} -> ${cand})` };
+            }
+        }
+
+        return { clash: false, penalty: 0, reason: null };
+    }
+
+    /**
+     * PHASE DE DÉLIBÉRATION & RECOMPOSITION RÉFLÉCHIE (2e Niveau de Tokenisation).
+     * Explore ses pensées internes via des micro-projections, isole les "tokens revenants"
+     * (attracteurs de sens), instancie un schéma conceptuel formel (macro-tokens)
+     * et recompose une phrase finalisée respectant la structure réfléchie.
+     *
+     * @param {string|string[]} seedPrompt Amorce de pensée
+     * @param {object} [options={}] Options (formalGrammar, miner, brain, branches, depth)
+     * @returns {{thoughtTokens: string[], conceptStructure: Array<{role: string, clusterId: number, token: string}>, finalSentence: string, polyHarmonic: boolean}}
+     */
+    deliberateAndRecompose(seedPrompt, options = {}) {
+        const {
+            formalGrammar = null,
+            miner = null,
+            brain = null,
+            branches = 4,
+            thoughtDepth = 5,
+            finalLength = 12,
+            temperature = 0.45
+        } = options;
+
+        const initialTokens = Array.isArray(seedPrompt)
+            ? [...seedPrompt]
+            : (String(seedPrompt).toLowerCase().match(/[a-z0-9àâäéèêëïîôöùûüç_']+/gi) || ['les']);
+
+        // --- ÉTAPE 1 : ÉCOUTE DES PENSÉES LATENTES & TOKENS REVENANTS ---
+        const recurrenceMap = new Map();
+        const exploredTrajectories = [];
+
+        for (let b = 0; b < branches; b++) {
+            const traj = [...initialTokens];
+            for (let step = 0; step < thoughtDepth; step++) {
+                const next = this.predictNextWord(traj, temperature + (b * 0.1), false, 1.25, step + 1);
+                if (!next || next === '<eos>' || next === '<pad>' || next === '<unk>') break;
+                traj.push(next);
+                recurrenceMap.set(next, (recurrenceMap.get(next) || 0) + 1);
+            }
+            exploredTrajectories.push(traj);
+        }
+
+        // Tri des concepts revenants par résonance (attracteurs de pensée)
+        const recurringTokens = Array.from(recurrenceMap.entries())
+            .filter(([token, count]) => count >= 2 && token.length > 2)
+            .sort((a, b) => b[1] - a[1])
+            .map(e => e[0]);
+
+        // --- ÉTAPE 2 : DEUXIÈME NIVEAU DE TOKENISATION (STRUCTURE CONCEPTUELLE) ---
+        const conceptStructure = [];
+        const selectedConcepts = new Set([...initialTokens, ...recurringTokens.slice(0, 4)]);
+
+        for (const token of selectedConcepts) {
+            const id = brain?.vocabulary?.get(token) ?? this.wordToId.get(token);
+            const clusterId = (id !== undefined && brain?.wordToCluster?.has(id))
+                ? brain.wordToCluster.get(id)
+                : (id !== undefined ? (id % 12) : 0);
+
+            const isConnector = brain?.isStructural ? brain.isStructural(id) : token.length <= 3;
+            const role = isConnector ? 'PIVOT' : (conceptStructure.length === 0 ? 'ACTEUR' : 'RELATION_CIBLE');
+
+            conceptStructure.push({
+                role,
+                clusterId,
+                token
+            });
+        }
+
+        // --- ÉTAPE 3 : RECOMPOSITION SOUS CONTRAINTE CONCEPTUELLE & FORMELLE ---
+        const recomposed = [...initialTokens];
+        const targetTokens = new Set(conceptStructure.map(c => c.token));
+        const threshold = formalGrammar?.threshold ?? 1;
+        const neuron = formalGrammar?.neuron ?? null;
+
+        for (let step = 0; step < finalLength; step++) {
+            const candidates = this.getTopCandidates(recomposed.slice(-10), 16, temperature, step >= 3, 1.35, step).candidates || [];
+            if (candidates.length === 0) break;
+
+            let bestCand = null;
+            let bestScore = -Infinity;
+
+            for (const cand of candidates) {
+                if (cand.token === '<pad>' || cand.token === '<unk>') continue;
+                if (cand.token === '<eos>' && recomposed.length < initialTokens.length + 3) continue;
+
+                let score = cand.score;
+
+                // Veto et répulsion négative des éléments incompatibles (ex: "des rationnelle")
+                const prevWord = recomposed[recomposed.length - 1];
+                const clashCheck = BitGenerativeLM.checkSyntacticClash(prevWord, cand.token, brain);
+                if (clashCheck.clash) {
+                    score += clashCheck.penalty;
+                    if (clashCheck.penalty <= -30.0) continue; // Élimination directe
+                }
+
+                // Bonus structurel : favorise l'intégration des concepts instanciés planifiés
+                if (targetTokens.has(cand.token) && !recomposed.includes(cand.token)) {
+                    score += 6.5;
+                }
+
+                // Évaluation de l'harmonie polynomiale de Zhegalkin
+                if (neuron && miner) {
+                    const testWin = [...recomposed.slice(-(miner.windowSize - 1)), cand.token];
+                    while (testWin.length < miner.windowSize) testWin.unshift('les');
+                    const polyScore = neuron.evaluateScore(miner.encodeSequence(testWin));
+                    if (polyScore >= threshold) {
+                        score += 3.0 + (polyScore - threshold);
+                    } else {
+                        score -= 2.0;
+                    }
+                }
+
+                // Pénalité d'anti-bégaiement
+                if (recomposed[recomposed.length - 1] === cand.token) {
+                    score -= 12.0;
+                }
+
+                if (score > bestScore) {
+                    bestScore = score;
+                    bestCand = cand.token;
+                }
+            }
+
+            if (!bestCand || bestCand === '<eos>') break;
+            recomposed.push(bestCand);
+            if (['.', '!', '?'].includes(bestCand) && recomposed.length >= initialTokens.length + 3) break;
+        }
+
+        // Vérification de l'harmonie finale
+        let isHarmonic = true;
+        if (neuron && miner && recomposed.length >= miner.windowSize) {
+            const finalWin = recomposed.slice(-miner.windowSize);
+            isHarmonic = neuron.evaluateScore(miner.encodeSequence(finalWin)) >= threshold;
+        }
+
+        const detok = (tokens) => tokens.map(t => String(t).replace(/_/g, ' ')).join(' ')
+            .replace(/,\s*,+/g, ', ')
+            .replace(/\s+([.,!?;:])/g, '$1').trim();
+
+        return {
+            thoughtTokens: recurringTokens,
+            conceptStructure,
+            finalSentence: detok(recomposed),
+            polyHarmonic: isHarmonic
+        };
+    }
+
+    /**
+     * Apprentissage récursif de masse par mutation combinatoire (Stratégie 1-Bit Autonome).
+     * Le réseau produit ses propres rollouts autorégressifs en boucle, mesure la cohérence
+     * structurelle via les invariants polynomiaux et applique des mutations par bit-flips
+     * pour converger vers des hyperplans de généralisation stables sans dérive chaotique.
+     * @param {Array<string|string[]>} seedPrompts Amorces pour les rollouts
+     * @param {object} [options={}]
+     * @returns {{rolloutsCount: number, mutationsAccepted: number, catastrophesCount: number, harmonicRate: number, acceptedRollouts: string[][]}}
+     */
+    evolveRecursiveGeneralities(seedPrompts = [], options = {}) {
+        const {
+            formalGrammar = null,
+            miner = null,
+            rolloutLen = 4,
+            mutationRate = 0.003,
+            catastropheProb = 0.02,
+            temperature = 0.35,
+            lr = 0.025
+        } = options;
+
+        if (!seedPrompts || seedPrompts.length === 0) {
+            return { rolloutsCount: 0, mutationsAccepted: 0, catastrophesCount: 0, harmonicRate: 0, acceptedRollouts: [] };
+        }
+
+        const seeds = seedPrompts.map(p => {
+            if (Array.isArray(p)) return p.filter(t => t && t.length > 0 && t !== '<pad>' && t !== '<unk>');
+            return (String(p).toLowerCase().match(/[a-z0-9àâäéèêëïîôöùûüç_']+/gi) || []);
+        }).filter(p => p.length > 0);
+
+        if (seeds.length === 0) {
+            return { rolloutsCount: 0, mutationsAccepted: 0, catastrophesCount: 0, harmonicRate: 0, acceptedRollouts: [] };
+        }
+
+        let rolloutsCount = 0;
+        let mutationsAccepted = 0;
+        let catastrophesCount = 0;
+        let harmonicCount = 0;
+        const acceptedRollouts = [];
+
+        const evaluateSequenceHarmonics = (seq) => {
+            if (!formalGrammar?.neuron || !miner || seq.length < miner.windowSize) return 1.0;
+            let scoreSum = 0;
+            let windows = 0;
+            for (let i = 0; i <= seq.length - miner.windowSize; i++) {
+                const win = seq.slice(i, i + miner.windowSize);
+                const vec = miner.encodeSequence(win);
+                const s = formalGrammar.neuron.evaluateScore(vec);
+                if (s >= (formalGrammar.threshold ?? 0)) scoreSum++;
+                windows++;
+            }
+            return windows > 0 ? (scoreSum / windows) : 1.0;
+        };
+
+        for (const seed of seeds) {
+            const current = [...seed.slice(-4)];
+            const trajectory = [...current];
+
+            for (let step = 0; step < rolloutLen; step++) {
+                const next = this.predictNextWord(trajectory, temperature, false, 1.35, step + 1);
+                if (!next || next === "<eos>" || next === "<pad>" || next === "<unk>") break;
+                if (trajectory.length >= 2 && trajectory[trajectory.length - 1] === next) break;
+                trajectory.push(next);
+            }
+
+            if (trajectory.length <= current.length) continue;
+            rolloutsCount++;
+
+            const baselineHarmony = evaluateSequenceHarmonics(trajectory);
+            if (baselineHarmony >= 0.5) harmonicCount++;
+
+            // Mutation stochastique par bit-flips
+            const backup = this.classifier.backupWeights();
+            const { flippedCount, catastrophe } = this.classifier.mutateBits(mutationRate, catastropheProb);
+            if (catastrophe) catastrophesCount++;
+
+            const mutatedTrajectory = [...current];
+            for (let step = 0; step < rolloutLen; step++) {
+                const nextMut = this.predictNextWord(mutatedTrajectory, temperature, false, 1.35, step + 1);
+                if (!nextMut || nextMut === "<eos>") break;
+                mutatedTrajectory.push(nextMut);
+            }
+
+            const mutatedHarmony = evaluateSequenceHarmonics(mutatedTrajectory);
+            const accepted = mutatedHarmony >= baselineHarmony && mutatedTrajectory.length >= trajectory.length;
+
+            if (accepted && flippedCount > 0) {
+                mutationsAccepted++;
+                acceptedRollouts.push(mutatedTrajectory);
+                this.trainTokens(mutatedTrajectory, lr, 1, 0.0);
+            } else {
+                this.classifier.restoreWeights(backup);
+                if (baselineHarmony >= 0.6) {
+                    acceptedRollouts.push(trajectory);
+                    this.trainTokens(trajectory, lr, 1, 0.0);
+                }
+            }
+        }
+
+        return {
+            rolloutsCount,
+            mutationsAccepted,
+            catastrophesCount,
+            harmonicRate: rolloutsCount > 0 ? (harmonicCount / rolloutsCount) : 0,
+            acceptedRollouts
+        };
+    }
+
+    /**
      * Entraîne le modèle BitGEMM sur une phrase brute ou un tableau de tokens
      * @param {string|string[]} sentence
      * @param {number} lr
@@ -2713,19 +3818,23 @@ export class BitGenerativeLM {
         let tokens;
         if (Array.isArray(seedPrompt)) {
             tokens = [...seedPrompt];
-        } else if (tokenizer && typeof tokenizer.tokenize === 'function') {
-            tokens = tokenizer.tokenize(seedPrompt);
         } else {
-            tokens = String(seedPrompt).toLowerCase().match(/[a-z0-9àâäéèêëïîôöùûüç_']+/gi) || [];
+            tokens = tokenizer && typeof tokenizer.tokenize === 'function'
+                ? tokenizer.tokenize(seedPrompt)
+                : (String(seedPrompt).toLowerCase().match(/[a-z0-9àâäéèêëïîôöùûüç_']+/gi) || []);
         }
         const generated = [...tokens];
         const initialLen = tokens.length;
 
         for (let i = 0; i < maxWords; i++) {
-            const allowEos = i >= 3;
-            const next = this.predictNextWord(generated, temperature, allowEos, repetitionPenalty);
+            const currentStep = generated.length - initialLen;
+            const allowEos = currentStep >= 3;
+            const next = this.predictNextWord(generated, temperature, allowEos, repetitionPenalty, currentStep);
             if (!next || next === "<eos>") {
                 break;
+            }
+            if (next === "<pad>" || next === "<unk>") {
+                continue;
             }
             generated.push(next);
 
@@ -2735,6 +3844,9 @@ export class BitGenerativeLM {
             if (isPunctStop && (generated.length - initialLen) >= 3) {
                 break;
             }
+        }
+        if (tokenizer && typeof tokenizer.detokenize === 'function') {
+            return tokenizer.detokenize(generated);
         }
         return generated.join(" ");
     }
@@ -2759,6 +3871,9 @@ export class BitGenerativeLM {
         if (state.contextDim) this.contextDim = state.contextDim;
         if (state.classifier) this.classifier.importState(state.classifier);
         if (state.episodic) this.episodicMemory.importState(state.episodic);
+        if (this.vocabSize > this.classifier.outFeatures) {
+            this._expandClassifier(this.vocabSize);
+        }
     }
 }
 
@@ -2853,7 +3968,16 @@ export class AdaptiveMergeTokenizer {
 
     detokenize(tokens) {
         if (!tokens || tokens.length === 0) return "";
-        return tokens.map(t => String(t).replace(/_/g, ' ')).join(' ');
+        return tokens.map(t => String(t).replace(/_/g, ' ')).join(' ')
+            .replace(/[\u2014\u2013—–]|--+/g, ', ')
+            .replace(/,\s*,+/g, ', ')
+            .replace(/\s*'\s*/g, "'")
+            .replace(/\s+([.,!?;:])/g, '$1')
+            .replace(/([«"“])\s+/g, '$1')
+            .replace(/\s+([»"”])/g, '$1')
+            .replace(/([(\[{])\s+/g, '$1')
+            .replace(/\s{2,}/g, ' ')
+            .trim();
     }
 
     exportState() {
@@ -4697,6 +5821,18 @@ export class PolynomialFormalismMiner {
                 test: (w) => /^[^\w\sàâäéèêëïîôöùûüç]$/i.test(w)
             },
             {
+                name: "marque_determinant_pluriel",
+                test: (w) => ['des', 'les', 'ces', 'mes', 'tes', 'ses', 'nos', 'vos', 'leurs'].includes(w)
+            },
+            {
+                name: "marque_determinant_singulier",
+                test: (w) => ['le', 'la', 'un', 'une', 'ce', 'cette'].includes(w)
+            },
+            {
+                name: "marque_pluriel",
+                test: (w) => (w.endsWith('s') || w.endsWith('x')) && w.length >= 3
+            },
+            {
                 name: "frequent_fonctionnel",
                 test: (w) => highFreqWords.has(w) || (this.brain?.isStructural ? this.brain.isStructural(w) : false)
             },
@@ -4840,6 +5976,19 @@ export class PolynomialFormalismMiner {
 
                 const negVec = this.encodeSequence(corrupted);
                 dataset.push([negVec, 0]);
+
+                // Contre-exemple contrastif d'accord rompu (ex: déterminant pluriel + mot singulier)
+                const agreementCorrupted = [...validWindow];
+                for (let k = 0; k < agreementCorrupted.length - 1; k++) {
+                    const w = agreementCorrupted[k].toLowerCase();
+                    if (['des', 'les', 'ces'].includes(w) && agreementCorrupted[k + 1].endsWith('s')) {
+                        // On retire la marque du pluriel pour fabriquer l'interdiction
+                        agreementCorrupted[k + 1] = agreementCorrupted[k + 1].slice(0, -1);
+                        const negAgrVec = this.encodeSequence(agreementCorrupted);
+                        dataset.push([negAgrVec, 0]);
+                        break;
+                    }
+                }
             }
         }
         return dataset;
@@ -4990,7 +6139,7 @@ export class SemanticRelationalMemory {
         if (this.wordCounts.size === 0) return;
 
         const sortedWords = Array.from(this.wordCounts.entries())
-            .filter(([id, _]) => !this.isStructural(id)) // On exclut les mots-outils pour des débuts plus intéressants
+            .filter(([id, _]) => id > 2 && !this.isStructural(id)) // On exclut les tokens système (<pad>, <unk>, <eos>) et mots-outils
             .sort((a, b) => b[1] - a[1]);
 
         this.frequentWordsCache = sortedWords.slice(0, 100).map(([id, _]) => id);
@@ -5387,27 +6536,43 @@ export class SemanticRelationalMemory {
         };
     }
     /**
-     * Transforme une phrase en unités de sens avant de les mémoriser
-     * @param {string} sentence La phrase à apprendre
+     * Mémorise directement une séquence de tokens pré-découpés sans ré-évaluation de regex
+     * @param {string[]} tokens Tableau de tokens
+     * @param {boolean} resetContext Si vrai, oublie le contexte précédent (défaut: true)
+     * @param {number} weight Poids de l'apprentissage
+     * @param {SemanticAttentionLayer|null} sharedAttention
+     */
+    learnTokens(tokens, resetContext = true, weight = 1, sharedAttention = null) {
+        if (!tokens || tokens.length === 0) return;
+
+        const effectiveTokens = [...tokens];
+        if (effectiveTokens[effectiveTokens.length - 1] !== "<eos>") {
+            effectiveTokens.push("<eos>");
+        }
+
+        if (resetContext) this.bitEngine.resetContext();
+        const ids = [];
+
+        this._ingestTokens(effectiveTokens, ids, weight);
+
+        const attentionLayer = sharedAttention || this.attention;
+        if (attentionLayer) attentionLayer.correlate(ids, weight);
+    }
+
+    /**
+     * Transforme une phrase ou un tableau de tokens en unités de sens avant de les mémoriser
+     * @param {string|string[]} sentenceOrTokens La phrase ou tokens à apprendre
      * @param {boolean} resetContext Si vrai, oublie le contexte précédent (défaut: true)
      * @param {number} weight Poids de l'apprentissage
      */
-    learnSense(sentence, resetContext = true, weight = 1, sharedAttention = null) {
-        let tokens = sentence.match(this.tokenizer) || [];
-
-        if (tokens.length === 0) return;
-
-        // Ajout du jeton de fin pour que le réseau apprenne à "fermer" la phrase
-        tokens.push("<eos>");
-        
-        if (resetContext) this.bitEngine.resetContext();
-        const ids = [];
-        
-        this._ingestTokens(tokens, ids, weight);
-
-        // Automatisation : On corrèle tous les IDs de la phrase entre eux dans la matrice
-        const attentionLayer = sharedAttention || this.attention;
-        if (attentionLayer) attentionLayer.correlate(ids, weight);
+    learnSense(sentenceOrTokens, resetContext = true, weight = 1, sharedAttention = null) {
+        if (Array.isArray(sentenceOrTokens)) {
+            return this.learnTokens(sentenceOrTokens, resetContext, weight, sharedAttention);
+        }
+        const tokens = typeof sentenceOrTokens === 'string'
+            ? (sentenceOrTokens.match(this.tokenizer) || [])
+            : [];
+        return this.learnTokens(tokens, resetContext, weight, sharedAttention);
     }
 
     /**
@@ -5463,7 +6628,7 @@ export class SemanticRelationalMemory {
             // pour capturer les dépendances à longue portée.
             const isFirstOfAll = (index === 0);
             const shouldReset = isFirstOfAll || !continuous;
-            this.learnSense(cleanS, shouldReset, weight);
+            this.learnTokens(tokens, shouldReset, weight);
         });
     }
 
@@ -5835,18 +7000,6 @@ export class SemanticRelationalMemory {
                         const contentSteps = Array.isArray(content) ? content : [content];
                         parsed.push(...parseSteps(contentSteps));
                         parsed.push({ type: 'WRAP_END', value: this._getWordId(end) });
-                    } else if (step.generate_phrase !== undefined) {
-                        parsed.push({ type: 'GENERATE_PHRASE', value: step.generate_phrase });
-                    } else if (step.WRAP) {
-                        // Décomposition de l'instruction WRAP en 3 étapes distinctes
-                        const { start, content, end } = step.WRAP;
-                        if (!start || !content || !end) continue;
-
-                        parsed.push({ type: 'WRAP_START', value: this._getWordId(start) });
-                        // Le contenu du WRAP est lui-même une séquence d'étapes à parser
-                        const contentSteps = Array.isArray(content) ? content : [content];
-                        parsed.push(...parseSteps(contentSteps));
-                        parsed.push({ type: 'WRAP_END', value: this._getWordId(end) });
                     } else if (step.fromSlot) {
                         parsed.push({ type: 'FROM_SLOT', value: step.fromSlot });
                     } else {
@@ -6094,11 +7247,16 @@ export class SemanticRelationalMemory {
         if (!tokens || tokens.length === 0) {
             return "";
         }
+        // Découpage propre de tout super-token contenant des underscores
+        const flatTokens = tokens
+            .flatMap(t => String(t).split('_'))
+            .filter(t => t.length > 0 && t !== '<pad>' && t !== '<unk>' && !/^[—–-]+$/.test(t));
 
-        let result = tokens[0];
-        for (let i = 1; i < tokens.length; i++) {
-            const currentToken = tokens[i];
-            const prevToken = tokens[i - 1];
+        if (flatTokens.length === 0) return "";
+        let result = flatTokens[0];
+        for (let i = 1; i < flatTokens.length; i++) {
+            const currentToken = flatTokens[i];
+            const prevToken = flatTokens[i - 1];
 
             // Si le token courant est une ponctuation simple, on ne met pas d'espace avant.
             if ([',', '.', ';', ':', ')', ']'].includes(currentToken)) {
@@ -6111,13 +7269,15 @@ export class SemanticRelationalMemory {
             // Gère l'élision pour l'apostrophe (ex: l'arbre)
             else if (currentToken.startsWith("'")) {
                 result += currentToken;
+            } else if (prevToken.endsWith("'")) {
+                result += currentToken;
             }
             // Cas général : on ajoute un espace.
             else {
                 result += ' ' + currentToken;
             }
         }
-        return result;
+        return result.replace(/\s{2,}/g, ' ').trim();
     }
     /**
      * Prédit la suite non pas par lettre, mais par concept
@@ -6229,7 +7389,7 @@ export class SemanticRelationalMemory {
                 const bestCandidate = beams[0];
                 const word = this.reverseVocab.get(bestCandidate.id);
 
-                if (word && word !== "<eos>" && word !== "<unk>" && bestCandidate.score > 1e-9) {
+                if (word && word !== "<eos>" && word !== "<unk>" && word !== "<pad>" && bestCandidate.score > 1e-9) {
                     this.bitEngine.context = bestCandidate.context;
                     generatedIds.push(bestCandidate.id);
                     activeIds.push(bestCandidate.id);
@@ -6366,28 +7526,21 @@ export class SemanticRelationalMemory {
                     coreBigramCache.forEach(c => candidateIds.add(c.token));
                 }
 
-                if (candidateIds.size === 0) {
-                    // Repli sur les amorces de phrase (<eos>)
-                    const eosContext = this.grammarMap.get(2);
-                    if (eosContext && eosContext.size > 0) {
-                        eosContext.forEach((_, id) => candidateIds.add(id));
+            // Créativité encadrée : uniquement des termes relatifs du même cluster syntaxique
+            if (candidateIds.size === 0 && creativity >= 0.2 && activeIds.length > 0) {
+                const prevCluster = this.wordToCluster.get(activeIds[activeIds.length - 1]);
+                if (prevCluster !== undefined && this.clusters.has(prevCluster)) {
+                    const peers = this.clusters.get(prevCluster);
+                    for (const pid of peers) {
+                        candidateIds.add(pid);
+                        if (candidateIds.size >= 8) break;
                     }
                 }
+            }
 
-                // 2. Si toujours rien, on utilise les mots les plus fréquents comme base
+            // Si aucune réf directe ni terme relatif valide : ON NE MET RIEN (arrêt net)
                 if (candidateIds.size === 0) {
-                    if (this.frequentWordsCache.length === 0) {
-                        this._updateFrequentWordsCache();
-                    }
-                    const frequent = this.frequentWordsCache.length > 0 ? this.frequentWordsCache : options.coreBrain?.frequentWordsCache;
-                    if (frequent?.length > 0) {
-                        frequent.forEach(id => candidateIds.add(id));
-                    } else if (this.vocabulary.size > 3) {
-                        for (const [_, id] of this.vocabulary) {
-                            if (id > 2) candidateIds.add(id);
-                            if (candidateIds.size >= 40) break;
-                        }
-                    }
+                return false;
                 }
             }
 
@@ -6403,7 +7556,14 @@ export class SemanticRelationalMemory {
 
                     const word = this.reverseVocab.get(id);
 
-                    if (id === 0) continue;
+                    // Négation des liaisons impossibles dans la génération symbolique
+                    if (activeIds.length > 0) {
+                        const prevWord = this.reverseVocab.get(activeIds[activeIds.length - 1]);
+                        const clash = BitGenerativeLM.checkSyntacticClash(prevWord, word, this);
+                        if (clash.clash && clash.penalty <= -30.0) continue;
+                    }
+
+                    if (id <= 1 || word === "<pad>" || word === "<unk>") continue;
 
                 const isConnector = this.isStructural(id) || [',', ';', 'et', 'mais', 'car', 'puis', 'donc', 'ou', 'si', 'or', 'ni'].includes(word);
                 // Est-ce un mot qui débute souvent une phrase ? (Suit <eos> id:2)
@@ -6572,6 +7732,7 @@ export class SemanticRelationalMemory {
                 // 4. Filtre de bruit sémantique (Heuristique)
                 // On pénalise les balises HTML communes et les identifiants techniques (mixte lettres/chiffres)
                 if (['<unk>', 'div', 'span', 'class', 'id', 'href', 'width', 'height', 'style', 'mw', 'parser', 'output', 'ch', 'sc', 'sc2', 'sc3', 'en', 'http', 'www', 'oldid', 'news', 'title', 'index', 'php'].includes(word)) score *= 0.000001;
+                if (/[\[\]{}|\\]/.test(word) || /'shun\b|a\]'shun/i.test(word)) score *= 0.0000001;
                 if (word === "<unk>") score *= 0.00001; // Penalty for unknown token during generation
                 if (word.length > 20) score *= 0.1; // Mots anormalement longs
                 
@@ -6733,10 +7894,7 @@ export class SemanticRelationalMemory {
             generatedIds.push(selectedId);
             activeIds.push(selectedId);
             if (activeIds.length > 2) activeIds.shift(); // Maintient la fenêtre de 2 IDs pour le trigramme
-            this._shiftId(selectedId);
-            return true; // On signale le succès
-
-            // --- NOUVEAU : Mise à jour de la mémoire d'activation ---
+            // --- Mise à jour de la mémoire d'activation ---
             // 1. Dégradation de l'énergie de tous les concepts actifs
             for (const [memId, energy] of activationMemory.entries()) {
                 const newEnergy = energy * ACTIVATION_DECAY;
@@ -6745,6 +7903,8 @@ export class SemanticRelationalMemory {
             }
             // 2. Le concept sélectionné est réactivé au maximum
             activationMemory.set(selectedId, 1.0);
+            this._shiftId(selectedId);
+            return true; // On signale le succès
         };
 
         // --- Main generation loop ---
@@ -6838,25 +7998,20 @@ export class SemanticRelationalMemory {
                 const coreBigramCache = coreBrain.topTransitionsCache.get(bigramKey) || [];
                 coreBigramCache.forEach(c => candidateIds.add(c.token));
             }
-            if (candidateIds.size === 0) {
-                const eosContext = this.grammarMap.get(2);
-                if (eosContext && eosContext.size > 0) {
-                    eosContext.forEach((_, id) => candidateIds.add(id));
-                }
-            }
-            if (candidateIds.size === 0) {
-                if (this.frequentWordsCache.length === 0) {
-                    this._updateFrequentWordsCache();
-                }
-                const frequent = this.frequentWordsCache.length > 0 ? this.frequentWordsCache : coreBrain?.frequentWordsCache;
-                if (frequent?.length > 0) {
-                    frequent.slice(0, 50).forEach(id => candidateIds.add(id));
-                } else if (this.vocabulary.size > 3) {
-                    for (const [_, id] of this.vocabulary) {
-                        if (id > 2) candidateIds.add(id);
-                        if (candidateIds.size >= 40) break;
+            // Terme relatif connu (analogie de cluster syntaxique) uniquement si créativité active
+            if (candidateIds.size === 0 && creativity >= 0.2 && activeIds.length > 0) {
+                const prevCluster = this.wordToCluster.get(activeIds[activeIds.length - 1]);
+                if (prevCluster !== undefined && this.clusters.has(prevCluster)) {
+                    const peers = this.clusters.get(prevCluster);
+                    for (const pid of peers) {
+                        candidateIds.add(pid);
+                        if (candidateIds.size >= 12) break;
                     }
                 }
+            }
+            // Sinon : arrêt net, aucun remplissage artificiel
+            if (candidateIds.size === 0) {
+                return [];
             }
         }
 
@@ -6864,20 +8019,20 @@ export class SemanticRelationalMemory {
         // Si un ou plusieurs candidats ont une probabilité binaire extrêmement élevée,
         // on considère que c'est une séquence apprise par cœur. On élimine alors
         // tous les autres candidats pour forcer la restitution fidèle.
-        const VERBATIM_THRESHOLD = 0.98; // Seuil de certitude binaire
-        let verbatimCandidates = [];
-
-        for (const id of candidateIds) {
-            const prob = this.bitEngine.scoreId(id);
-            if (prob >= VERBATIM_THRESHOLD) {
-                verbatimCandidates.push(id);
+        // ACTIVÉ UNIQUEMENT EN CRÉATIVITÉ TRÈS BASSE (< 0.05) pour préserver la variété
+        if (creativity < 0.05) {
+            const VERBATIM_THRESHOLD = 0.98;
+            let verbatimCandidates = [];
+            for (const id of candidateIds) {
+                const prob = this.bitEngine.scoreId(id);
+                if (prob >= VERBATIM_THRESHOLD) {
+                    verbatimCandidates.push(id);
+                }
             }
-        }
-
-        // Si on a trouvé des candidats "verbatim", on ne garde que ceux-là.
-        if (verbatimCandidates.length > 0) {
-            candidateIds.clear();
-            verbatimCandidates.forEach(id => candidateIds.add(id));
+            if (verbatimCandidates.length > 0) {
+                candidateIds.clear();
+                verbatimCandidates.forEach(id => candidateIds.add(id));
+            }
         }
 
         const candidates = [];
@@ -6885,7 +8040,14 @@ export class SemanticRelationalMemory {
 
         for (const id of candidateIds) {
             const word = this.reverseVocab.get(id);
-            if (id === 0 || !word) continue;
+            if (id <= 1 || !word || word === "<pad>" || word === "<unk>") continue;
+
+            // Négation des liaisons impossibles
+            if (activeIds.length > 0) {
+                const prevWord = this.reverseVocab.get(activeIds[activeIds.length - 1]);
+                const clash = BitGenerativeLM.checkSyntacticClash(prevWord, word, this);
+                if (clash.clash && clash.penalty <= -30.0) continue;
+            }
 
             const isConnector = this.isStructural(id);
             const isStarter = this.grammarMap.get(2)?.has(id);
@@ -6987,13 +8149,13 @@ export class SemanticRelationalMemory {
             let score = structuralScore + bitwiseScore + semanticScore + attentionScore + bridgingScore + connectivityScore + clusterScore;
 
             if (word === "<eos>") {
-                // On favorise fortement la fin de phrase si la structure grammaticale le suggère.
-                // Cela aide à produire des phrases complètes et bien formées.
-                if (isStructureHit) score *= 20.0;
-                else if (!structureReconnue && transitionProb > 0.8) score *= 5.0;
+                // Favorisation mesurée de la fin de phrase sans écraser les continuations réelles
+                if (isStructureHit) score *= 2.5;
+                else if (!structureReconnue && transitionProb > 0.8) score *= 1.2;
             }
 
             if (['<unk>', 'div', 'span', 'class', 'id', 'href', 'width', 'height', 'style', 'mw', 'parser', 'output', 'ch', 'sc', 'sc2', 'sc3', 'en', 'http', 'www', 'oldid', 'news', 'title', 'index', 'php'].includes(word)) score *= 0.000001;
+            if (/[\[\]{}|\\]/.test(word) || /'shun\b|a\]'shun/i.test(word)) score *= 0.0000001;
             if (word === "<unk>") score *= 0.00001;
             if (word.length > 20) score *= 0.1;
             if (/[0-9]/.test(word)) score *= 0.0000001;
@@ -7509,6 +8671,33 @@ export class DataWrapper {
     // Très efficace pour les neurones majoritaires
     static numberToBits(value, thresholds = [0.2, 0.4, 0.6, 0.8]) {
         return thresholds.map(t => (value >= t ? 1 : 0));
+    }
+
+    /**
+     * Encodage CMAC (Champs récepteurs recouvrants multi-échelles)
+     * Permet aux réseaux majoritaires d'interpoler continûment entre valeurs proches.
+     * @param {number} value Valeur continue normalisée [minVal, maxVal]
+     * @param {number} numTiles Nombre de grilles décalées (résolution d'interpolation)
+     * @param {number} binsPerTile Nombre de divisions par grille
+     */
+    static receptiveFieldEncoding(value, numTiles = 4, binsPerTile = 8, minVal = 0, maxVal = 1) {
+        const norm = Math.max(0, Math.min(1, (value - minVal) / (maxVal - minVal || 1)));
+        const totalBits = numTiles * binsPerTile;
+        const bits = new Uint8Array(totalBits);
+
+        for (let t = 0; t < numTiles; t++) {
+            // Décalage dyadique progressif de chaque grille
+            const offset = t / (numTiles * binsPerTile);
+            const shiftedVal = norm + offset;
+            const binIndex = Math.min(binsPerTile - 1, Math.floor(shiftedVal * binsPerTile));
+            
+            // Thermomètre local sur la tuile courante
+            const tileBase = t * binsPerTile;
+            for (let b = 0; b <= binIndex; b++) {
+                bits[tileBase + b] = 1;
+            }
+        }
+        return bits;
     }
 
     // One-hot encoding pour les catégories
@@ -10581,7 +11770,7 @@ export class GNeuroMoE {
                 }
 
                 const learningWeight = (domain === bestDomain) ? weight : secondary_weight;
-                expert.learnSense(sentence, true, learningWeight, this.sharedState.attention);
+                expert.learnTokens(tokens, true, learningWeight, this.sharedState.attention);
                 ingestionReport[domain].sentences++;
                 modifiedExperts.add(domain);
             }

@@ -27,6 +27,19 @@ const TOKEN_BITS = 12;
 let adaptiveTokenizer = null;
 let localCorpusCursor = 0;
 
+function writeFileSyncAtomic(filePath, data) {
+    const dir = path.dirname(filePath);
+    const tempPath = path.join(dir, `.${path.basename(filePath)}.${Date.now()}.${Math.random().toString(36).slice(2, 6)}.tmp`);
+    fs.writeFileSync(tempPath, data);
+    const bakPath = `${filePath}.bak`;
+    if (fs.existsSync(filePath)) {
+        try {
+            fs.copyFileSync(filePath, bakPath);
+        } catch (_) {}
+    }
+    fs.renameSync(tempPath, filePath);
+}
+
 const FALLBACK_SENTENCES = [
     "les astronomes observent les galaxies lointaines avec des télescopes géants.",
     "la théorie scientifique explique les phénomènes physiques de manière rationnelle.",
@@ -38,19 +51,30 @@ const FALLBACK_SENTENCES = [
     "la structure moléculaire détermine les propriétés chimiques de chaque élément."
 ];
 
+function sanitizeSentence(raw) {
+    if (!raw || typeof raw !== 'string') return '';
+    return raw
+        .replace(/\[.*?\]/g, '') // Élimine toutes les transcriptions phonétiques [a'-shun]
+        .replace(/\(.*?\)/g, '')
+        .replace(/["«»“”]/g, '')
+        .replace(/[-–—]?\s*modifier(?:\s+le\s+code)?/gi, '')
+        .replace(/\b(?:voir aussi|liens externes|articles connexes|notes et références)\b/gi, '')
+        // Normalisation des tirets cadratins (—, –) et doubles tirets (--) en séparateur valide (, )
+        .replace(/[\u2014\u2013—–]|--+/g, ', ')
+        .replace(/\s+-\s+/g, ', ')
+        .replace(/,\s*,+/g, ', ')
+        .replace(/,\s*\./g, '.')
+        .replace(/\s+/g, ' ')
+        .replace(/^[\s,;:–—-]+|[\s,;:–—-]+$/g, '')
+        .trim();
+}
+
 function extractCleanSentences(blocks, minWords = 5) {
     const sentences = [];
     for (const block of blocks) {
         const rawSentences = block.split(/(?<=[.!?])\s+/);
         for (const raw of rawSentences) {
-            const cleaned = raw
-                .replace(/\[\d+\]/g, '')
-                .replace(/\(.*?\)/g, '')
-                .replace(/["«»]/g, '')
-                .replace(/[-–—]?\s*modifier(?:\s+le\s+code)?/gi, '')
-                .replace(/\b(?:voir aussi|liens externes|articles connexes|notes et références)\b/gi, '')
-                .replace(/\s+/g, ' ')
-                .trim();
+            const cleaned = sanitizeSentence(raw);
 
             const words = cleaned.match(tokenizer) || [];
             if (words.length >= minWords && words.length <= 30 && /[a-zàâäéèêëïîôöùûüç]/i.test(cleaned)) {
@@ -62,14 +86,25 @@ function extractCleanSentences(blocks, minWords = 5) {
 }
 
 function isValidTrainingSentence(sentence, minWords = 5) {
+    if (!sentence || typeof sentence !== 'string') return false;
     // Élimine les notes de bas de page [X], références de versets isolées et fragments
     if (/^\[\d+\]\s*[a-zàâäéèêëïîôöùûüç0-9_.]*$/i.test(sentence)) return false;
     if (/\b(?:psa|cap|ver|deu|gen|exo|lev|num|matt|luc|act)\.\b/i.test(sentence) && sentence.length < 25) return false;
+    // Élimine les artefacts de dictionnaires (ex: -, a]'shun, n. ou notations phonétiques)
+    if (/[\[\]{}|\\]/.test(sentence)) return false;
+    if (/[-–—]{2,}|^\s*[-–—]/.test(sentence)) return false;
+    // Élimine les notes de transcription et errata de Project Gutenberg
+    if (/\b(?:transcriber'?s?\s+notes?|project\s+gutenberg|table\s+of\s+contents|illustrations?\b)/i.test(sentence)) return false;
+    if (/\bon\s+page\s+\d+.*(?:replaced|corrected|amended|omitted)\b/i.test(sentence)) return false;
+    if (/\b(?:was|were)\s+replaced\s+with\b/i.test(sentence)) return false;
+    if (/^chapter\s+[0-9ivxlcdm]+/i.test(sentence.trim())) return false;
+    if (/\b(?:shun|ation|ition|sion)\]|\b[a-z]+\]'[a-z]+/i.test(sentence)) return false;
+    if (/,\s*[nva]\.\s*$/i.test(sentence) || /\b(?:adj|adv|pron|prep|conj|interj|obs|pl)\./i.test(sentence)) return false;
     const words = sentence.match(tokenizer) || [];
     return words.length >= minWords && words.length <= 30 && /[a-zàâäéèêëïîôöùûüç]/i.test(sentence);
 }
 
-async function getBatchFromLocalCorpus(chunkSize = 1024 * 64) {
+async function getBatchFromLocalCorpus(targetCount = 50, chunkSize = 1024 * 64) {
     if (!fs.existsSync(CORPUS_PATH)) return { sentences: [], done: true };
     const stats = await fs.promises.stat(CORPUS_PATH);
     if (localCorpusCursor >= stats.size) {
@@ -86,18 +121,19 @@ async function getBatchFromLocalCorpus(chunkSize = 1024 * 64) {
     localCorpusCursor += bytesRead;
 
     const text = buffer.toString('utf8');
-    const lines = text.split(/(?<=[.!?])\s+/).map(s => s.trim().toLowerCase());
+    const lines = text.split(/(?<=[.!?])\s+/).map(s => sanitizeSentence(s).toLowerCase());
     const sentences = lines.filter(s => {
         const w = s.match(tokenizer) || [];
         return w.length >= 5 && w.length <= 30;
     });
-    return { sentences, done: localCorpusCursor >= stats.size };
+    return { sentences: sentences.slice(0, targetCount), done: localCorpusCursor >= stats.size };
 }
 
-async function getBatchFromWikipedia(targetCount = 12) {
+async function getBatchFromWikipedia(targetCount = 50) {
     const sentences = [];
     let attempts = 0;
-    while (sentences.length < targetCount && attempts < 2) {
+    const maxAttempts = Math.max(5, Math.ceil(targetCount / 8));
+    while (sentences.length < targetCount && attempts < maxAttempts) {
         attempts++;
         try {
             const page = await scrapeRandomWikipediaContent();
@@ -113,7 +149,7 @@ async function getBatchFromWikipedia(targetCount = 12) {
     return sentences;
 }
 
-async function getMultiSourceBatch(cycleIndex, targetCount = 12, forceSource = 'books') {
+async function getMultiSourceBatch(cycleIndex, targetCount = 50, forceSource = 'books') {
     const primarySource = forceSource || 'books';
 
     let sentences = [];
@@ -139,7 +175,7 @@ async function getMultiSourceBatch(cycleIndex, targetCount = 12, forceSource = '
 const batchPrefetchQueue = [];
 let isPrefetching = false;
 
-async function replenishPrefetchBuffer(cycleIndex, forceSource, targetCount = 10, minBuffered = 3) {
+async function replenishPrefetchBuffer(cycleIndex, forceSource, targetCount = 50, minBuffered = 2) {
     if (isPrefetching || batchPrefetchQueue.length >= minBuffered) return;
     isPrefetching = true;
     try {
@@ -170,6 +206,8 @@ function generateSample(brain, miner, neuron, threshold, prompt, adaptiveTokeniz
 
         for (const cand of candidates) {
             if (cand.token === '<eos>' && generated.length < tokens.length + 2) continue;
+            if (cand.token === '<pad>' || cand.token === '<unk>' || /^[—–-]+$/.test(cand.token)) continue;
+            if (/[\[\]{}|\\]/.test(cand.token) || /'shun\b|a\]'shun/i.test(cand.token)) continue;
 
             // Pénalité de répétition pour éviter les boucles attractrices
             const recentTokens = generated.slice(-6);
@@ -204,6 +242,7 @@ async function main() {
     let useLocal = args.includes('--local');
     const isTestMode = args.includes('--test') || args.includes('--once');
     const isOffline = args.includes('--offline');
+    const shouldPurge = args.includes('--purge-first') || args.includes('--purge');
     const cyclesArg = args.find(a => a.startsWith('--cycles='));
     const lrArg = args.find(a => a.startsWith('--lr='));
     const delayArg = args.find(a => a.startsWith('--delay='));
@@ -222,21 +261,23 @@ async function main() {
     const forceSource = sourceArg ? sourceArg.split('=')[1].toLowerCase() : 'books';
 
     // Profils Pareto pré-calibrés
-    let defaultLR = 0.03;
-    let defaultEpochs = 3;
-    let defaultBatchSize = 10;
-    let defaultContextDim = 64;
+    let defaultLR = 0.045;
+    let defaultEpochs = 2;
+    let defaultBatchSize = 20;
+    let defaultContextDim = 256;
     let defaultMergeThreshold = 5;
-    let defaultGrammarInterval = 10;
+    let defaultGrammarInterval = 15;
+    let defaultMaxTrainPerBatch = 8;
+    let defaultMaxTokensPerSeq = 14;
 
     if (profileArg) {
         const prof = profileArg.split('=')[1].toLowerCase();
         if (prof === 'fast') {
-            defaultLR = 0.055; defaultEpochs = 1; defaultBatchSize = 6; defaultGrammarInterval = 16;
+            defaultLR = 0.055; defaultEpochs = 1; defaultBatchSize = 35; defaultGrammarInterval = 16;
         } else if (prof === 'quality') {
-            defaultLR = 0.022; defaultEpochs = 4; defaultBatchSize = 14; defaultGrammarInterval = 6; defaultContextDim = 96;
+            defaultLR = 0.022; defaultEpochs = 4; defaultBatchSize = 50; defaultGrammarInterval = 6; defaultContextDim = 96;
         } else if (prof === 'balanced') {
-            defaultLR = 0.035; defaultEpochs = 2; defaultBatchSize = 10; defaultGrammarInterval = 10;
+            defaultLR = 0.035; defaultEpochs = 2; defaultBatchSize = 50; defaultGrammarInterval = 10;
         }
         console.log(`[PARETO] Profil sélectionné: "${prof}" (LR: ${defaultLR}, Epochs: ${defaultEpochs}, Batch: ${defaultBatchSize}, Gram. Interval: ${defaultGrammarInterval})`);
     }
@@ -250,12 +291,24 @@ async function main() {
     const mergeThreshold = mergeThresholdArg ? parseInt(mergeThresholdArg.split('=')[1], 10) : defaultMergeThreshold;
     const maxVocabSize = maxVocabArg ? parseInt(maxVocabArg.split('=')[1], 10) : 4096;
     const windowSize = windowSizeArg ? parseInt(windowSizeArg.split('=')[1], 10) : 4;
+    const trainLimitArg = args.find(a => a.startsWith('--train-limit='));
+    const maxTrainPerBatch = trainLimitArg ? parseInt(trainLimitArg.split('=')[1], 10) : defaultMaxTrainPerBatch;
+    const maxTokensPerSeq = defaultMaxTokensPerSeq;
     const genTemperature = tempArg ? parseFloat(tempArg.split('=')[1]) : 0.0;
     const cycleDelay = delayArg ? parseInt(delayArg.split('=')[1], 10) : 0;
 
     console.log("\x1b[35m=== ENTRAÎNEUR CONTINU : BITGEMM 1-BIT & NEURO-SYMBOLIQUE ===\x1b[0m");
     console.log(`[CONFIG] LR: ${learningRate} | Epochs: ${localEpochs} | Batch: ${batchTargetCount} | Dim: ${contextDim} | Fenêtre: ${windowSize}`);
     if (!fs.existsSync(MODEL_DIR)) fs.mkdirSync(MODEL_DIR, { recursive: true });
+
+    if (shouldPurge) {
+        console.log("🧹 [--purge-first] Purge des anciens modèles et réinitialisation complète...");
+        for (const f of [BRAIN_FILE, RULES_FILE, BITGEMM_FILE, TOKENIZER_FILE, `${BITGEMM_FILE}.bak`, `${TOKENIZER_FILE}.bak`]) {
+            if (fs.existsSync(f)) {
+                try { fs.unlinkSync(f); } catch (_) {}
+            }
+        }
+    }
 
     // 0. Tokenizer adaptatif à fusion progressive
     adaptiveTokenizer = new neuro.AdaptiveMergeTokenizer({ mergeThreshold, maxVocabSize });
@@ -271,12 +324,19 @@ async function main() {
     // 1. Initialisation du modèle de langage 1-bit
     const initialVocab = ["les", "la", "le", "des", "un", "une", "dans", "avec", "pour", "<eos>"];
     const bitLM = new neuro.BitGenerativeLM(initialVocab, contextDim, 4);
+    const bakBitgemm = `${BITGEMM_FILE}.bak`;
     if (fs.existsSync(BITGEMM_FILE)) {
         try {
             bitLM.importState(JSON.parse(fs.readFileSync(BITGEMM_FILE, 'utf8')));
             console.log(`[INIT] Modèle BitGEMM chargé (${bitLM.vocabSize} tokens).`);
         } catch (e) {
             console.warn("[INIT] Erreur lecture BitGEMM:", e.message);
+            if (fs.existsSync(bakBitgemm)) {
+                try {
+                    bitLM.importState(JSON.parse(fs.readFileSync(bakBitgemm, 'utf8')));
+                    console.log(`[INIT] Restauration depuis ${bakBitgemm} réussie (${bitLM.vocabSize} tokens).`);
+                } catch (_) {}
+            }
         }
     }
 
@@ -325,7 +385,21 @@ async function main() {
         replenishPrefetchBuffer(cycleCount, forceSource, batchTargetCount);
     }
 
+/**
+ * Borne la longueur de séquence tout en préservant l'intégrité causale continue.
+ * Évite de casser les transitions locales de n-grammes tout en bornant le temps de calcul.
+ */
+function causalTruncate(tokens, maxLen = 14) {
+    if (tokens.length <= maxLen) return tokens;
+    return tokens.slice(0, maxLen);
+}
+
+// Buffer de relecture anti-oubli (Experience Replay)
+const replayMemory = [];
+const MAX_REPLAY_BUFFER = 60;
+
     while (true) {
+        const cycleStartTime = Date.now();
         console.log(`\n\x1b[7m CYCLE #${cycleCount} \x1b[0m (BitGEMM Vocab: ${bitLM.vocabSize} | Merges: ${adaptiveTokenizer.merges.size} | Symbol Vocab: ${brain.vocabulary.size})`);
         let batch = [];
 
@@ -334,7 +408,7 @@ async function main() {
                 batch = [...FALLBACK_SENTENCES];
                 console.log("📴 [Source : Hors-ligne] Utilisation des phrases de secours.");
             } else if (useLocal) {
-                const res = await getBatchFromLocalCorpus(1024 * 64);
+                const res = await getBatchFromLocalCorpus(batchTargetCount, 1024 * 64);
                 batch = res.sentences;
                 console.log(`📁 [Source : Corpus local] Ingestion de ${batch.length} phrases.`);
                 if (res.done) {
@@ -351,7 +425,9 @@ async function main() {
             }
 
             // Filtrage des références marginales et artefacts de segmentation
-            batch = batch.filter(s => isValidTrainingSentence(s, 5));
+            batch = batch
+                .map(s => sanitizeSentence(s))
+                .filter(s => isValidTrainingSentence(s, 5));
 
             if (batch.length > 0) {
                 console.log(`📥 Ingestion de ${batch.length} phrases...`);
@@ -368,20 +444,53 @@ async function main() {
                         bitLM.addWord(newToken);
                     });
 
-                    // Entraînement symbolique avec les super-tokens
-                    brain.learnSense(tokens.join(' '), true, 2);
+                    // Entraînement symbolique direct O(N) sans clôture transitive coûteuse
+                    brain.learnTokens(tokens, false, 1.0);
                     preTokenizedBatch.push(tokens);
+
+                    // Enregistrement dans la mémoire de replay à long terme
+                    if (tokens.length >= 4) {
+                        replayMemory.push(tokens);
+                        if (replayMemory.length > MAX_REPLAY_BUFFER) {
+                            replayMemory.splice(0, replayMemory.length - MAX_REPLAY_BUFFER);
+                        }
+                    }
                 }
 
-                // Consolidation multi-passes pour stabiliser le gradient STE 1-bit
-                for (let ep = 0; ep < localEpochs; ep++) {
-                    for (const tokens of preTokenizedBatch) {
-                        const r = bitLM.trainTokens(tokens, learningRate);
-                        if (ep === localEpochs - 1) {
-                            totalLoss += r.avgLoss;
-                            totalAcc += r.accuracy;
-                            totalSteps += r.steps;
-                        }
+                // Sélection ciblée : phrases fraîches représentatives + injection de replay
+                const freshSubset = preTokenizedBatch.slice(0, maxTrainPerBatch);
+                const replaySample = [];
+                if (replayMemory.length > 8) {
+                    for (let k = 0; k < 2; k++) {
+                        const rIdx = Math.floor(Math.random() * (replayMemory.length - 4));
+                        replaySample.push(replayMemory[rIdx]);
+                    }
+                }
+                const consolidatedTrainBatch = [...freshSubset, ...replaySample];
+
+                // Consolidation multi-passes avec fenêtrage causal continu
+                for (const tokens of consolidatedTrainBatch) {
+                    const activeTokens = causalTruncate(tokens, maxTokensPerSeq);
+                    const r = bitLM.trainTokens(activeTokens, learningRate, localEpochs);
+                    totalLoss += r.avgLoss;
+                    totalAcc += r.accuracy;
+                    totalSteps += r.steps;
+                }
+
+                // Évolution récursive allégée (cadencée un cycle sur deux, 1 graine, rollout court)
+                if (cycleCount % 2 === 0 && preTokenizedBatch.length > 0) {
+                    const evoSeeds = [preTokenizedBatch[0]];
+                    const evoResult = bitLM.evolveRecursiveGeneralities(evoSeeds, {
+                        formalGrammar,
+                        miner,
+                        rolloutLen: 2,
+                        mutationRate: 0.003,
+                        catastropheProb: 0.01,
+                        temperature: genTemperature || 0.35,
+                        lr: learningRate * 0.5
+                    });
+                    if (evoResult.rolloutsCount > 0) {
+                        console.log(`🧬 [Évolution 1-Bit] Rollouts: ${evoResult.rolloutsCount} | Mut. acceptées: ${evoResult.mutationsAccepted} | Harmonie: ${(evoResult.harmonicRate * 100).toFixed(1)}%`);
                     }
                 }
 
@@ -409,14 +518,17 @@ async function main() {
                         });
                 }
 
-                const avgLoss = (totalLoss / batch.length).toFixed(3);
-                const avgAcc = ((totalAcc / batch.length) * 100).toFixed(1);
+                const trainedCount = Math.max(1, consolidatedTrainBatch.length);
+                const avgLoss = (totalLoss / trainedCount).toFixed(3);
+                const avgAcc = ((totalAcc / trainedCount) * 100).toFixed(1);
                 const perplexity = Math.exp(parseFloat(avgLoss)).toFixed(2);
-                console.log(`⚡ [BitGEMM 1-Bit STE] Loss: ${avgLoss} | Top-1: ${avgAcc}% | PPL: ${perplexity} | Pas: ${totalSteps} | Nouvelles fusions: ${newMergesCount}`);
+                const memSize = bitLM.episodicMemory.episodes.size;
+                const elapsedCycle = ((Date.now() - cycleStartTime) / 1000).toFixed(2);
+                console.log(`⚡ [BitGEMM 1-Bit STE] Loss: ${avgLoss} | Top-1: ${avgAcc}% | PPL: ${perplexity} | Pas: ${totalSteps} | Fusions: ${newMergesCount} | ⏱️ ${elapsedCycle}s`);
 
                 memoryBufferSentences.push(...batch);
-                if (memoryBufferSentences.length > 60) {
-                    memoryBufferSentences.splice(0, memoryBufferSentences.length - 60);
+                if (memoryBufferSentences.length > 200) {
+                    memoryBufferSentences.splice(0, memoryBufferSentences.length - 200);
                 }
             }
 
@@ -438,20 +550,22 @@ async function main() {
             // Sauvegarde périodique (tous les 5 cycles ou au dernier cycle) sans bloquer les I/O
             const isSaveCycle = (cycleCount % 5 === 0) || (cycleCount >= maxCycles);
             if (isSaveCycle) {
-                const saves = [
-                    fs.promises.writeFile(BITGEMM_FILE, JSON.stringify(bitLM.exportState())),
-                    fs.promises.writeFile(TOKENIZER_FILE, JSON.stringify(adaptiveTokenizer.exportState())),
-                    fs.promises.writeFile(BRAIN_FILE, brain.exportBinary())
-                ];
-                if (formalGrammar) saves.push(fs.promises.writeFile(RULES_FILE, JSON.stringify({
-                    threshold: formalGrammar.threshold,
-                    accuracy: formalGrammar.accuracy,
-                    terms: formalGrammar.terms,
-                    decodedRules: formalGrammar.decodedRules,
-                    updatedAt: new Date().toISOString()
-                })));
-                // Enregistrement non-bloquant
-                Promise.all(saves).catch(e => console.warn("Erreur sauvegarde asynchrone:", e.message));
+                try {
+                    writeFileSyncAtomic(BITGEMM_FILE, JSON.stringify(bitLM.exportState()));
+                    writeFileSyncAtomic(TOKENIZER_FILE, JSON.stringify(adaptiveTokenizer.exportState()));
+                    writeFileSyncAtomic(BRAIN_FILE, brain.exportBinary());
+                    if (formalGrammar) {
+                        writeFileSyncAtomic(RULES_FILE, JSON.stringify({
+                            threshold: formalGrammar.threshold,
+                            accuracy: formalGrammar.accuracy,
+                            terms: formalGrammar.terms,
+                            decodedRules: formalGrammar.decodedRules,
+                            updatedAt: new Date().toISOString()
+                        }));
+                    }
+                } catch (e) {
+                    console.warn("[SAVE] Erreur sauvegarde atomique:", e.message);
+                }
             }
 
             // Génération autorégressive en direct (Inférence BitGEMM 100% binaire)
