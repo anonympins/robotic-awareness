@@ -9,6 +9,18 @@ import fs from 'node:fs';
 import path from 'node:path';
 import {Optimization, Dichotomy} from "./problemSolver/library.js";
 
+/**
+ * Détecte si un token est constitué exclusivement de signes de ponctuation.
+ * @param {string} token
+ * @returns {boolean}
+ */
+export function isPunctuationToken(token) {
+    if (!token || typeof token !== 'string') return false;
+    const clean = token.trim();
+    if (clean.length === 0) return false;
+    return /^[.,;:!?…—–\-\(\)\[\]{}"'«»/\\~^`*+=<>|]+$/.test(clean);
+}
+
 // ---------- Noyau Mathématique : Quaternions ----------
 export class Quaternion {
     constructor(w = 1, x = 0, y = 0, z = 0) {
@@ -3373,6 +3385,7 @@ export class BitGenerativeLM {
         const len = tokens.length;
         if (len === 0) return vec;
 
+        // Pour passer un cap, remplacer cette boucle de superposition additive
         // 1. Échelle locale fine (jusqu'à 16 tokens récents) : priorité à la grammaire immédiate
         const localTokens = tokens.slice(-16);
         const localLen = localTokens.length;
@@ -3382,6 +3395,19 @@ export class BitGenerativeLM {
             const recencyWeight = Math.pow(1.35, t);
             for (let d = 0; d < this.contextDim; d++) {
                 vec[d] += wordVec[d] * recencyWeight;
+            }
+        }
+
+        // 2. Empreinte relationnelle (Binding bipolaire des transitions locales A -> B)
+        // Permet au réseau 1-bit d'encoder la signature directe de la relation entre tokens consécutifs
+        for (let t = 1; t < localLen; t++) {
+            const relPosPrev = localLen - t;
+            const relPosCurr = localLen - 1 - t;
+            const prevVec = this.encodeWord(localTokens[t - 1], relPosPrev);
+            const currVec = this.encodeWord(localTokens[t], relPosCurr);
+            const pairRecency = Math.pow(1.35, t) * 0.8;
+            for (let d = 0; d < this.contextDim; d++) {
+                vec[d] += (prevVec[d] * currVec[d]) * pairRecency;
             }
         }
 
@@ -3405,7 +3431,7 @@ export class BitGenerativeLM {
         return vec;
     }
 
-    _processLogitsAndSample(logits, contextTokens, temperature = 0.0, allowEos = true, repetitionPenalty = 1.25, step = 3, inputVector = null) {
+    _processLogitsAndSample(logits, contextTokens, temperature = 0.0, allowEos = true, repetitionPenalty = 1.25, step = 3, inputVector = null, relationalHook = null) {
         if (Array.isArray(contextTokens) && contextTokens.length > 0) {
             const prevWord = String(contextTokens[contextTokens.length - 1]).toLowerCase().split('_').pop();
             const functionalStopWords = new Set([
@@ -3450,7 +3476,16 @@ export class BitGenerativeLM {
             }
         }
 
-        if (step < 3) {
+        // Interdiction absolue de ponctuation en premier token généré (step === 0)
+        if (step === 0) {
+            for (let i = 0; i < logits.length; i++) {
+                if (logits[i] === -Infinity) continue;
+                const candWord = this.idToWord.get(i);
+                if (candWord && isPunctuationToken(candWord)) {
+                    logits[i] = -Infinity;
+                }
+            }
+        } else if (step < 3) {
             for (const punct of ['.', ',', ';', ':', '!', '?', "l'", "d'", "s'", "c'", "n'"]) {
                 const pId = this.wordToId.get(punct);
                 if (pId !== undefined && pId < logits.length) {
@@ -3485,6 +3520,18 @@ export class BitGenerativeLM {
             for (const [targetId, strength] of resonance) {
                 if (targetId < logits.length) {
                     logits[targetId] += Math.min(30.0, 10.0 + strength * 5.0);
+                }
+            }
+        }
+
+        // Modulation par empreinte relationnelle issue de la mémoire symbolique
+        if (typeof relationalHook === 'function' && Array.isArray(contextTokens) && contextTokens.length > 0) {
+            for (let i = 0; i < logits.length; i++) {
+                if (logits[i] === -Infinity) continue;
+                const candWord = this.idToWord.get(i);
+                if (candWord) {
+                    const rScore = relationalHook(candWord, contextTokens);
+                    if (rScore > 0) logits[i] += rScore * 12.0;
                 }
             }
         }
@@ -3528,16 +3575,16 @@ export class BitGenerativeLM {
         return this.idToWord.get(bestId) || "<eos>";
     }
 
-    predictNextWord(contextTokens, temperature = 0.0, allowEos = true, repetitionPenalty = 1.25, step = 3) {
+    predictNextWord(contextTokens, temperature = 0.0, allowEos = true, repetitionPenalty = 1.25, step = 3, relationalHook = null) {
         const inputVector = this.buildContextVector(contextTokens);
         const logits = this.classifier.forwardFloat(inputVector, true);
-        return this._processLogitsAndSample(logits, contextTokens, temperature, allowEos, repetitionPenalty, step, inputVector);
+        return this._processLogitsAndSample(logits, contextTokens, temperature, allowEos, repetitionPenalty, step, inputVector, relationalHook);
     }
 
-    async predictNextWordGPU(contextTokens, temperature = 0.0, allowEos = true, repetitionPenalty = 1.25, step = 3) {
+    async predictNextWordGPU(contextTokens, temperature = 0.0, allowEos = true, repetitionPenalty = 1.25, step = 3, relationalHook = null) {
         const inputVector = this.buildContextVector(contextTokens);
         const logits = await this.classifier.forwardFloatGPU(inputVector, true);
-        return this._processLogitsAndSample(logits, contextTokens, temperature, allowEos, repetitionPenalty, step, inputVector);
+        return this._processLogitsAndSample(logits, contextTokens, temperature, allowEos, repetitionPenalty, step, inputVector, relationalHook);
     }
 
     /**
@@ -3550,7 +3597,7 @@ export class BitGenerativeLM {
      * @param {number} [step=3]
      * @returns {{candidates: Array<{token: string, prob: number, score: number}>, entropy: number, confidence: number}}
      */
-    getTopCandidates(contextTokens, topK = 24, temperature = 0.7, allowEos = true, repetitionPenalty = 1.25, step = 3) {
+    getTopCandidates(contextTokens, topK = 24, temperature = 0.7, allowEos = true, repetitionPenalty = 1.25, step = 3, relationalHook = null) {
         const inputVector = this.buildContextVector(contextTokens);
         const logits = this.classifier.forwardFloat(inputVector, true);
 
@@ -3583,7 +3630,15 @@ export class BitGenerativeLM {
         }
 
         // Pénalité ponctuation précoce
-        if (step < 3) {
+        if (step === 0) {
+            for (let i = 0; i < logits.length; i++) {
+                if (logits[i] === -Infinity) continue;
+                const candWord = this.idToWord.get(i);
+                if (candWord && isPunctuationToken(candWord)) {
+                    logits[i] = -Infinity;
+                }
+            }
+        } else if (step < 3) {
             for (const punct of ['.', ',', ';', ':', '!', '?', "l'", "d'", "s'", "c'", "n'"]) {
                 const pId = this.wordToId.get(punct);
                 if (pId !== undefined && pId < logits.length) {
@@ -3616,6 +3671,17 @@ export class BitGenerativeLM {
             for (const [targetId, strength] of resonance) {
                 if (targetId < logits.length) {
                     logits[targetId] += Math.min(30.0, 10.0 + strength * 5.0);
+                }
+            }
+        }
+
+        if (typeof relationalHook === 'function' && Array.isArray(contextTokens) && contextTokens.length > 0) {
+            for (let i = 0; i < logits.length; i++) {
+                if (logits[i] === -Infinity) continue;
+                const candWord = this.idToWord.get(i);
+                if (candWord) {
+                    const rScore = relationalHook(candWord, contextTokens);
+                    if (rScore > 0) logits[i] += rScore * 12.0;
                 }
             }
         }
@@ -4002,6 +4068,7 @@ export class BitGenerativeLM {
             for (const cand of candidates) {
                 if (cand.token === '<pad>' || cand.token === '<unk>') continue;
                 if (cand.token === '<eos>' && recomposed.length < initialTokens.length + 3) continue;
+                if (recomposed.length === initialTokens.length && isPunctuationToken(cand.token)) continue;
 
                 let score = cand.score;
 
@@ -4062,6 +4129,99 @@ export class BitGenerativeLM {
             conceptStructure,
             finalSentence: detok(recomposed),
             polyHarmonic: isHarmonic
+        };
+    }
+
+    /**
+     * DÉBRUITAGE PAR DIFFUSION DISCRÈTE (Discrete Energy-Guided Diffusion)
+     * Raffine itérativement un brouillon initial : plus 'diffusionSteps' est élevé,
+     * plus les incohérences, répétitions et violations polynomiales sont éliminées.
+     *
+     * @param {string|string[]} promptOrDraft Amorce ou première ébauche
+     * @param {object} [options={}] Options de diffusion (diffusionSteps, formalGrammar, miner, brain)
+     * @returns {{finalSentence: string, initialDraft: string, energyTrace: number[], stepsCompleted: number}}
+     */
+    diffusiveRefine(promptOrDraft, options = {}) {
+        const {
+            diffusionSteps = 15,
+            targetLength = 12,
+            formalGrammar = null,
+            miner = null,
+            brain = null,
+            temperature = 0.3
+        } = options;
+
+        // 1. Initialisation : ébauche brute autorégressive rapide
+        let currentTokens = Array.isArray(promptOrDraft)
+            ? [...promptOrDraft]
+            : (String(promptOrDraft).toLowerCase().match(/[a-z0-9àâäéèêëïîôöùûüç_']+/gi) || ['les']);
+        const initialPromptLen = currentTokens.length;
+
+        while (currentTokens.length < targetLength) {
+            const genStep = currentTokens.length - initialPromptLen;
+            const nxt = this.predictNextWord(currentTokens, 0.6, true, 1.2, genStep);
+            if (!nxt || nxt === '<eos>') break;
+            currentTokens.push(nxt);
+        }
+
+        const initialDraft = currentTokens.join(' ');
+        const energyTrace = [];
+        const threshold = formalGrammar?.threshold ?? 0;
+        const neuron = formalGrammar?.neuron ?? null;
+
+        // Fonction d'énergie : pénalise violations grammaticales, répétitions et disharmonie polynomiale
+        const computeEnergy = (seq) => {
+            let energy = 0;
+            for (let i = 1; i < seq.length; i++) {
+                const clash = BitGenerativeLM.checkSyntacticClash(seq[i - 1], seq[i], brain);
+                if (clash.clash) energy += Math.abs(clash.penalty);
+                if (seq[i] === seq[i - 1]) energy += 20; // Anti-bégaiement
+            }
+            if (neuron && miner && seq.length >= miner.windowSize) {
+                for (let i = 0; i <= seq.length - miner.windowSize; i++) {
+                    const win = seq.slice(i, i + miner.windowSize);
+                    const sc = neuron.evaluateScore(miner.encodeSequence(win));
+                    if (sc < threshold) energy += (threshold - sc) * 4.0;
+                }
+            }
+            return energy;
+        };
+
+        // 2. Boucle de débruitage progressif (Diffusion / Recuit)
+        for (let step = 0; step < diffusionSteps; step++) {
+            const currentEnergy = computeEnergy(currentTokens);
+            energyTrace.push(currentEnergy);
+            if (currentEnergy === 0 && step >= 3) break; // Convergence parfaite
+
+            // Taux de mutation qui décroît avec le temps (refroidissement)
+            const progress = step / diffusionSteps;
+            const currentTemp = Math.max(0.05, temperature * (1.0 - progress));
+
+            // Sélection d'une position à débruiter (en évitant l'amorce de départ)
+            const targetIdx = 1 + Math.floor(Math.random() * (currentTokens.length - 1));
+            const localContext = currentTokens.slice(0, targetIdx);
+            const candidates = this.getTopCandidates(localContext, 8, currentTemp, true, 1.3, targetIdx).candidates || [];
+
+            for (const cand of candidates) {
+                if (cand.token === '<pad>' || cand.token === '<unk>') continue;
+                if (targetIdx === initialPromptLen && isPunctuationToken(cand.token)) continue;
+                const candidateSeq = [...currentTokens];
+                candidateSeq[targetIdx] = cand.token;
+                const candEnergy = computeEnergy(candidateSeq);
+
+                // Transition acceptée si elle diminue l'énergie
+                if (candEnergy < currentEnergy) {
+                    currentTokens = candidateSeq;
+                    break;
+                }
+            }
+        }
+
+        return {
+            initialDraft,
+            finalSentence: currentTokens.map(t => t.replace(/_/g, ' ')).join(' ').trim(),
+            energyTrace,
+            stepsCompleted: energyTrace.length
         };
     }
 
@@ -4187,7 +4347,7 @@ export class BitGenerativeLM {
     /**
      * Génère une phrase complète mot après mot à partir d'une amorce
      */
-    generateSentence(seedPrompt, maxWords = 12, temperature = 0.0, tokenizer = null, repetitionPenalty = 1.25) {
+    generateSentence(seedPrompt, maxWords = 12, temperature = 0.0, tokenizer = null, repetitionPenalty = 1.25, relationalHook = null) {
         let tokens;
         if (Array.isArray(seedPrompt)) {
             tokens = [...seedPrompt];
@@ -4202,11 +4362,14 @@ export class BitGenerativeLM {
         for (let i = 0; i < maxWords; i++) {
             const currentStep = generated.length - initialLen;
             const allowEos = currentStep >= 3;
-            const next = this.predictNextWord(generated, temperature, allowEos, repetitionPenalty, currentStep);
+            const next = this.predictNextWord(generated, temperature, allowEos, repetitionPenalty, currentStep, relationalHook);
             if (!next || next === "<eos>") {
                 break;
             }
             if (next === "<pad>" || next === "<unk>") {
+                continue;
+            }
+            if (currentStep === 0 && isPunctuationToken(next)) {
                 continue;
             }
             generated.push(next);
@@ -4224,7 +4387,7 @@ export class BitGenerativeLM {
         return generated.join(" ");
     }
 
-    async generateSentenceGPU(seedPrompt, maxWords = 12, temperature = 0.0, tokenizer = null, repetitionPenalty = 1.25) {
+    async generateSentenceGPU(seedPrompt, maxWords = 12, temperature = 0.0, tokenizer = null, repetitionPenalty = 1.25, relationalHook = null) {
         let tokens;
         if (Array.isArray(seedPrompt)) {
             tokens = [...seedPrompt];
@@ -4239,11 +4402,14 @@ export class BitGenerativeLM {
         for (let i = 0; i < maxWords; i++) {
             const currentStep = generated.length - initialLen;
             const allowEos = currentStep >= 3;
-            const next = await this.predictNextWordGPU(generated, temperature, allowEos, repetitionPenalty, currentStep);
+            const next = await this.predictNextWordGPU(generated, temperature, allowEos, repetitionPenalty, currentStep, relationalHook);
             if (!next || next === "<eos>") {
                 break;
             }
             if (next === "<pad>" || next === "<unk>") {
+                continue;
+            }
+            if (currentStep === 0 && isPunctuationToken(next)) {
                 continue;
             }
             generated.push(next);
@@ -7591,6 +7757,54 @@ export class SemanticRelationalMemory {
     }
 
     /**
+     * Récupère le poids ou la probabilité de transition entre un contexte et un token suivant.
+     * @param {string|string[]|number} context - Contexte immédiat (tokens)
+     * @param {string|number} candidate - Mot suivant candidat
+     * @returns {number} Score de transition normalisé
+     */
+    getTransitionWeight(context, candidate) {
+        if (!context || !candidate) return 0.0;
+        const candId = typeof candidate === 'number' ? candidate : this.vocabulary.get(String(candidate).toLowerCase());
+        if (candId === undefined) return 0.0;
+
+        let tokens = [];
+        if (Array.isArray(context)) {
+            tokens = context;
+        } else if (typeof context === 'string') {
+            tokens = context.toLowerCase().match(this.tokenizer) || [context];
+        } else if (typeof context === 'number') {
+            const w = this.reverseVocab.get(context);
+            if (w) tokens = [w];
+        }
+        if (tokens.length === 0) return 0.0;
+
+        const ids = tokens.map(t => typeof t === 'number' ? t : this.vocabulary.get(String(t).toLowerCase()));
+        const lastId = ids[ids.length - 1];
+        if (lastId === undefined) return 0.0;
+
+        if (ids.length >= 2) {
+            const prevId = ids[ids.length - 2];
+            if (prevId !== undefined) {
+                const triKey = (BigInt(prevId) << 32n) | BigInt(lastId);
+                const triMap = this.grammarMap.get(triKey);
+                if (triMap && triMap.has(candId)) {
+                    let sum = 0;
+                    for (const w of triMap.values()) sum += w;
+                    return (triMap.get(candId) / (sum || 1)) * 1.5;
+                }
+            }
+        }
+
+        const biMap = this.grammarMap.get(lastId);
+        if (biMap && biMap.has(candId)) {
+            let sum = 0;
+            for (const w of biMap.values()) sum += w;
+            return biMap.get(candId) / (sum || 1);
+        }
+        return 0.0;
+    }
+
+    /**
      * Évalue la qualité d'une séquence d'IDs générée.
      * Retourne un score de confiance (0 à 1).
      * Un score faible indique une "hallucination" ou une erreur structurelle.
@@ -7964,7 +8178,9 @@ export class SemanticRelationalMemory {
             // Sinon, on utilise la grammaire habituelle.
             let candidates = [];
             if (schemaCandidates && schemaCandidates.size > 0) {
-                candidates = Array.from(schemaCandidates.entries()).map(([word, score]) => ({ word, score, id: this.vocabulary.get(word), isStructureHit: true }));
+                candidates = Array.from(schemaCandidates.entries())
+                    .filter(([word]) => !(generatedIds.length === 0 && isPunctuationToken(word)))
+                    .map(([word, score]) => ({ word, score, id: this.vocabulary.get(word), isStructureHit: true }));
             } else {
                 // On itère uniquement sur le set réduit de candidats pertinents
                 for (const id of candidateIds) {
@@ -7979,6 +8195,7 @@ export class SemanticRelationalMemory {
                     }
 
                     if (id <= 1 || word === "<pad>" || word === "<unk>") continue;
+                    if (generatedIds.length === 0 && isPunctuationToken(word)) continue;
 
                 const isConnector = this.isStructural(id) || [',', ';', 'et', 'mais', 'car', 'puis', 'donc', 'ou', 'si', 'or', 'ni'].includes(word);
                 // Est-ce un mot qui débute souvent une phrase ? (Suit <eos> id:2)
@@ -8456,6 +8673,7 @@ export class SemanticRelationalMemory {
         for (const id of candidateIds) {
             const word = this.reverseVocab.get(id);
             if (id <= 1 || !word || word === "<pad>" || word === "<unk>") continue;
+            if (options.forbidPunctuation && isPunctuationToken(word)) continue;
 
             // Négation des liaisons impossibles
             if (activeIds.length > 0) {
@@ -11664,6 +11882,7 @@ export class ProjectiveBrain {
 export class OBJParser {
     static parse(text) {
         const vertices = [];
+        const faces = [];
         const lines = text.split('\n');
         for (let line of lines) {
             line = line.trim();
@@ -11674,9 +11893,19 @@ export class OBJParser {
                     parseFloat(parts[2]),
                     parseFloat(parts[3])
                 ));
+            } else if (line.startsWith('f ')) {
+                const parts = line.split(/\s+/).slice(1);
+                const indices = parts.map(p => {
+                    const idxStr = p.split('/')[0];
+                    return parseInt(idxStr, 10) - 1;
+                }).filter(idx => !isNaN(idx) && idx >= 0);
+                if (indices.length >= 3) {
+                    faces.push(indices);
+                }
             }
         }
-        console.log(`[OBJParser] ${vertices.length} sommets extraits.`);
+        vertices.faces = faces;
+        console.log(`[OBJParser] ${vertices.length} sommets et ${faces.length} faces extraits.`);
         return vertices;
     }
 }
